@@ -17,6 +17,7 @@ venv/
 .env
 .env.*
 !.env.example
+.envrc
 x.env
 *.pem
 *.key
@@ -24,11 +25,17 @@ x.env
 *.pfx
 credentials.json
 secrets.json
+*.secret
+*.secrets
 
 # Local app data, camera credentials, databases
 data/
 cameras.json
 cameras.json.backup
+camera_credentials.*
+rtsp_urls.*
+site_config.local.*
+private_site_config.*
 *.sqlite
 *.sqlite3
 *.db
