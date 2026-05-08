@@ -11,8 +11,8 @@ This is early technical beta software. Use it for testing, demos, and feedback o
 ## Clone
 
 ```bash
-git clone https://github.com/PhillipAlexanderYoung/Knoxnet-VMS
-cd Knoxnet-VMS
+git clone https://github.com/PhillipAlexanderYoung/Knoxnet-vms-beta
+cd Knoxnet-vms-beta
 ```
 
 ## Linux Install And Start
@@ -31,8 +31,8 @@ Notes:
 ## Windows Install And Start
 
 ```powershell
-git clone https://github.com/PhillipAlexanderYoung/Knoxnet-VMS
-cd Knoxnet-VMS
+git clone https://github.com/PhillipAlexanderYoung/Knoxnet-vms-beta
+cd Knoxnet-vms-beta
 install.bat
 run.bat
 ```
@@ -68,15 +68,15 @@ The beta does not auto-update.
 Manual update process:
 
 1. Stop the app.
-2. Delete your local `Knoxnet-VMS` folder.
+2. Delete your local `Knoxnet-vms-beta` folder.
 3. Clone the latest repo again.
 4. Run the install and start commands again.
 
 Linux:
 
 ```bash
-git clone https://github.com/PhillipAlexanderYoung/Knoxnet-VMS
-cd Knoxnet-VMS
+git clone https://github.com/PhillipAlexanderYoung/Knoxnet-vms-beta
+cd Knoxnet-vms-beta
 ./install.sh
 ./run.sh
 ```
@@ -84,15 +84,15 @@ cd Knoxnet-VMS
 Windows:
 
 ```powershell
-git clone https://github.com/PhillipAlexanderYoung/Knoxnet-VMS
-cd Knoxnet-VMS
+git clone https://github.com/PhillipAlexanderYoung/Knoxnet-vms-beta
+cd Knoxnet-vms-beta
 install.bat
 run.bat
 ```
 
 ## Report Bugs
 
-Please report bugs through GitHub Issues: https://github.com/PhillipAlexanderYoung/Knoxnet-VMS/issues
+Please report bugs through GitHub Issues: https://github.com/PhillipAlexanderYoung/Knoxnet-vms-beta/issues
 
 Include:
 

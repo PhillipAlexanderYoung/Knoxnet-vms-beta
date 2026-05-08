@@ -10,7 +10,7 @@ import requests
 
 DEFAULT_CLOUD_API_BASE = "https://api.knoxnetvms.com"
 DEFAULT_CHANNEL = "beta"
-GITHUB_REPO_URL = "https://github.com/PhillipAlexanderYoung/Knoxnet-VMS"
+GITHUB_REPO_URL = "https://github.com/PhillipAlexanderYoung/Knoxnet-vms-beta"
 
 
 @dataclass(frozen=True)

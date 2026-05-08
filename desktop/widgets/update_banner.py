@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
-GITHUB_REPO_URL = "https://github.com/PhillipAlexanderYoung/Knoxnet-VMS"
+GITHUB_REPO_URL = "https://github.com/PhillipAlexanderYoung/Knoxnet-vms-beta"
 
 
 class UpdateAvailableDialog(QDialog):

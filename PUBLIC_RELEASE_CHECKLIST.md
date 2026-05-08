@@ -4,7 +4,7 @@ Run this before publishing a beta snapshot.
 
 ## Repository Shape
 
-- Public repo/folder is named `Knoxnet-VMS`.
+- Public repo/folder is named `Knoxnet-vms-beta`.
 - Private `Knoxnet-VMS-Collab` repo remains separate and private.
 - No `.git` history from the private repo was copied into the public tree.
 
@@ -34,4 +34,4 @@ Review matches manually. Example config placeholders are acceptable only when th
 - `core/entitlements.py` reports a 4-camera beta entitlement.
 - Startup update check points to the public beta endpoint only.
 - `install.sh`, `run.sh`, `install.ps1`, `run.ps1`, `install.bat`, and `run.bat` are present.
-- README manual update instructions point to `https://github.com/PhillipAlexanderYoung/Knoxnet-VMS`.
+- README manual update instructions point to `https://github.com/PhillipAlexanderYoung/Knoxnet-vms-beta`.
