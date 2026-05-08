@@ -1,0 +1,36 @@
+# Minimal, version-tolerant MediaMTX config for desktop/supervisor runs.
+# Keep this conservative so bundled binaries across versions can start.
+
+logLevel: info
+logDestinations: [stdout]
+
+# Control API used by backend health/probing and recording control.
+api: yes
+apiAddress: 127.0.0.1:9997
+apiEncryption: no
+
+# Playback server for serving recorded segments over HTTP.
+playback: yes
+playbackAddress: :9996
+
+# Core listeners used by Knoxnet components.
+rtsp: yes
+rtspAddress: :8554
+
+hls: yes
+hlsAddress: :8888
+
+webrtc: yes
+webrtcAddress: :8889
+
+pathDefaults:
+  record: no
+  recordPath: ../recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 10m
+  recordDeleteAfter: 720h
+
+paths:
+  all_others:
+    source: publisher

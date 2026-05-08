@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+.venv-linux/
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+x.env
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# Local app data, camera credentials, databases
+data/
+cameras.json
+cameras.json.backup
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Logs, captures, recordings, generated media
+logs/
+*.log
+captures/
+runs/
+recordings/
+mediamtx/recordings/
+test-media/
+test_media/
+customer-data/
+customer_data/
+
+# Downloaded models/caches/binaries
+.cache/
+models/llm_cache/
+models/vision/
+models/depth_anything/
+models/byo/
+models/*.pt
+models/*.onnx
+depth_anything_v2_repo/
+mediamtx/mediamtx
+mediamtx/mediamtx.exe
+
+# Node/build/release artifacts
+node_modules/
+dist/
+build/
+release/
+*.spec
+
+# IDE/tooling
+.cursor/
+.vscode/
+.wrangler/
