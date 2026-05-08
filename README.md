@@ -8,7 +8,72 @@ Current beta: v1.0.0-beta1
 
 ## Demo GIFs
 
-No demo GIF files are currently committed to this repository, so this README does not embed demo links yet. When real demo GIFs are added, they should be embedded here using their actual repository paths so visitors can immediately see the software working.
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/camera-grid-ui.gif" alt="Multi-camera desktop monitoring grid" />
+      <br />
+      <strong>Multi-camera desktop VMS</strong>
+      <br />
+      Monitor live camera grids with desktop controls, event panels, and responsive layouts.
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/live-overlays.gif" alt="Live camera overlays across a site map" />
+      <br />
+      <strong>Live overlays and site context</strong>
+      <br />
+      Review overlay experiments and site/context views where configured.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/depth-anything.gif" alt="Depth Anything V2 depth estimation view" />
+      <br />
+      <strong>Depth-aware analysis</strong>
+      <br />
+      Run depth estimation alongside regular camera views.
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/depth-object-motion.gif" alt="Depth, object, and motion visualization" />
+      <br />
+      <strong>Depth, objects, and motion</strong>
+      <br />
+      Combine depth maps, object boxes, and motion overlays for richer scene understanding.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/ptz-audio-controls.gif" alt="PTZ and audio controls for a camera" />
+      <br />
+      <strong>PTZ and camera controls</strong>
+      <br />
+      Use PTZ and audio controls where camera support and local configuration allow.
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/vehicle-detection.gif" alt="Vehicle detection demo on outdoor cameras" />
+      <br />
+      <strong>Object and vehicle detection</strong>
+      <br />
+      Test object and vehicle detection workflows on supported camera feeds.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/readme/local-vision-chat.gif" alt="Local vision model analyzing camera frames" />
+      <br />
+      <strong>Optional local vision workflows</strong>
+      <br />
+      Experiment with local vision tooling for frame inspection and summaries.
+    </td>
+    <td width="50%">
+      <img src="docs/assets/readme/night-monitoring.gif" alt="Night camera monitoring view" />
+      <br />
+      <strong>Night and low-light monitoring</strong>
+      <br />
+      Review low-light scenes and multi-camera night views from the same monitoring surface.
+    </td>
+  </tr>
+</table>
 
 ## What It Does
 
