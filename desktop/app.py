@@ -351,14 +351,22 @@ class KnoxnetDesktopApp(QApplication):
             from pathlib import Path
 
             if name == "MediaMTX":
-                from desktop.widgets.system_manager import _ensure_mediamtx_binary, _mediamtx_entrypoint
+                from desktop.widgets.system_manager import (
+                    _ensure_mediamtx_binary,
+                    _mediamtx_entrypoint,
+                    _terminate_existing_mediamtx,
+                )
                 entry_point = _mediamtx_entrypoint()
 
             if not entry_point:
                 return
 
             root = Path(__file__).resolve().parents[1]
-            ep = _ensure_mediamtx_binary(root) if name == "MediaMTX" else root / entry_point
+            if name == "MediaMTX":
+                _terminate_existing_mediamtx()
+                ep = _ensure_mediamtx_binary(root)
+            else:
+                ep = root / entry_point
 
             if name == "Backend":
                 import subprocess, sys as _sys

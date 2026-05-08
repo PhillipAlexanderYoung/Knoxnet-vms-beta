@@ -155,6 +155,36 @@ def _ensure_mediamtx_binary(repo_root: Path) -> Path:
     raise RuntimeError("MediaMTX binary not found after download")
 
 
+def _terminate_existing_mediamtx() -> bool:
+    """Stop stale MediaMTX processes before starting the beta-managed one."""
+    if not PSUTIL_AVAILABLE:
+        return False
+
+    found = False
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        try:
+            if proc.info.get("pid") == current_pid:
+                continue
+            name = str(proc.info.get("name") or "").lower()
+            exe = str(proc.info.get("exe") or "").lower()
+            cmdline = " ".join([str(x) for x in (proc.info.get("cmdline") or [])]).lower()
+            if "mediamtx" not in name and "mediamtx" not in exe and "mediamtx" not in cmdline:
+                continue
+
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+            found = True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+        except Exception:
+            continue
+    return found
+
+
 def _vision_entrypoint() -> str:
     if os.name == "nt":
         return "services/vision_local/start_service.bat"
@@ -1976,6 +2006,7 @@ class SystemManagerDialog(QDialog):
 
         if not frozen and name == "MediaMTX":
             try:
+                _terminate_existing_mediamtx()
                 entry_path = _ensure_mediamtx_binary(repo_root)
                 entry_point = str(entry_path.relative_to(repo_root))
             except Exception as exc:
@@ -2220,6 +2251,9 @@ class SystemManagerDialog(QDialog):
             target_ports = [port]
             if "Backend" in name:
                 target_ports.append(8765)
+            elif "MediaMTX" in name:
+                _terminate_existing_mediamtx()
+                target_ports.extend([8554, 8888, 8889, 9996])
 
             found = False
             for p in target_ports:

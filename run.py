@@ -170,6 +170,31 @@ class ServerManager:
         # Auto-download into ./mediamtx
         return self._download_and_install_mediamtx(Path("./mediamtx"))
 
+    def cleanup_stale_mediamtx(self):
+        """Stop existing MediaMTX processes before starting the managed one."""
+        try:
+            import psutil
+        except Exception:
+            return
+
+        current_pid = os.getpid()
+        for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+            try:
+                if proc.info.get("pid") == current_pid:
+                    continue
+                name = str(proc.info.get("name") or "").lower()
+                exe = str(proc.info.get("exe") or "").lower()
+                cmdline = " ".join([str(x) for x in (proc.info.get("cmdline") or [])]).lower()
+                if "mediamtx" not in name and "mediamtx" not in exe and "mediamtx" not in cmdline:
+                    continue
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+            except Exception:
+                continue
+
     def check_mediamtx_health(self):
         """Health check for MediaMTX API"""
         try:
@@ -256,14 +281,16 @@ class ServerManager:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             print(f"[{timestamp}] Starting MediaMTX server (CRITICAL SERVICE)...")
             print(f"   Using: {self.mediamtx_path}")
-            print(f"   Config: {self.mediamtx_path.parent / 'mediamtx.yml'}")
+            self.cleanup_stale_mediamtx()
 
             # Start MediaMTX process with explicit config to avoid wrong file being loaded
-            config_path = (
+            compat_path = self.mediamtx_path.parent / "mediamtx_compat.yml"
+            config_path = compat_path if compat_path.exists() else (
                 self.mediamtx_path.parent / 'mediamtx.yml'
                 if self.mediamtx_path.parent.name == 'mediamtx'
                 else Path('mediamtx.yml')
             )
+            print(f"   Config: {config_path}")
 
             exe_path = self.mediamtx_path.resolve()
             self.mediamtx_process = subprocess.Popen(
