@@ -351,14 +351,14 @@ class KnoxnetDesktopApp(QApplication):
             from pathlib import Path
 
             if name == "MediaMTX":
-                from desktop.widgets.system_manager import _mediamtx_entrypoint
+                from desktop.widgets.system_manager import _ensure_mediamtx_binary, _mediamtx_entrypoint
                 entry_point = _mediamtx_entrypoint()
 
             if not entry_point:
                 return
 
             root = Path(__file__).resolve().parents[1]
-            ep = root / entry_point
+            ep = _ensure_mediamtx_binary(root) if name == "MediaMTX" else root / entry_point
 
             if name == "Backend":
                 import subprocess, sys as _sys
@@ -379,8 +379,9 @@ class KnoxnetDesktopApp(QApplication):
                 compat = mtx_dir / "mediamtx_compat.yml"
                 cfg = compat if compat.exists() else mtx_dir / "mediamtx.yml"
                 subprocess.Popen(
-                    [str(ep), str(cfg)],
+                    [str(ep)],
                     cwd=str(mtx_dir),
+                    env={**os.environ, "MTX_CONFIG_PATH": str(cfg)},
                     stdout=open("/tmp/knoxnet_mediamtx.log", "a"),
                     stderr=subprocess.STDOUT,
                     start_new_session=True,

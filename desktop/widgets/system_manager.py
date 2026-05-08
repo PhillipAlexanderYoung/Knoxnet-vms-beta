@@ -7,6 +7,10 @@ import threading
 import time
 import requests
 import shutil
+import io
+import platform
+import tarfile
+import zipfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from pathlib import Path
@@ -81,6 +85,74 @@ def _mediamtx_entrypoint() -> str:
     if os.name == "nt":
         return "mediamtx/mediamtx.exe"
     return "mediamtx/mediamtx"
+
+
+def _mediamtx_release_url() -> str | None:
+    override_url = (os.environ.get("MEDIAMTX_DOWNLOAD_URL") or "").strip()
+    if override_url:
+        return override_url
+
+    version = (os.environ.get("MEDIAMTX_VERSION") or "v1.10.0").strip()
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if machine in {"x86_64", "amd64"}:
+        arch = "amd64"
+    elif machine in {"aarch64", "arm64"}:
+        arch = "arm64"
+    else:
+        return None
+
+    if system.startswith("win"):
+        os_id = "windows"
+        filename = f"mediamtx_{version}_{os_id}_{arch}.zip"
+    elif system == "darwin":
+        os_id = "darwin"
+        filename = f"mediamtx_{version}_{os_id}_{arch}.tar.gz"
+    elif system == "linux":
+        os_id = "linux"
+        filename = f"mediamtx_{version}_{os_id}_{arch}.tar.gz"
+    else:
+        return None
+
+    return f"https://github.com/bluenviron/mediamtx/releases/download/{version}/{filename}"
+
+
+def _ensure_mediamtx_binary(repo_root: Path) -> Path:
+    entry = repo_root / _mediamtx_entrypoint()
+    if entry.exists() and entry.is_file():
+        return entry
+
+    target_dir = repo_root / "mediamtx"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    url = _mediamtx_release_url()
+    if not url:
+        raise RuntimeError("Unsupported platform for automatic MediaMTX download")
+
+    resp = requests.get(url, timeout=45)
+    resp.raise_for_status()
+    data = resp.content
+
+    if url.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            zf.extractall(target_dir)
+    else:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            tf.extractall(target_dir)
+
+    candidates = [
+        target_dir / ("mediamtx.exe" if os.name == "nt" else "mediamtx"),
+        target_dir / "mediamtx",
+        target_dir / "mediamtx.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            if os.name != "nt":
+                candidate.chmod(candidate.stat().st_mode | 0o111)
+            return candidate
+
+    raise RuntimeError("MediaMTX binary not found after download")
 
 
 def _vision_entrypoint() -> str:
@@ -1902,7 +1974,15 @@ class SystemManagerDialog(QDialog):
             internal_root = repo_root / "_internal"
             entry_base = repo_root
 
-        entry_path = entry_base / entry_point
+        if not frozen and name == "MediaMTX":
+            try:
+                entry_path = _ensure_mediamtx_binary(repo_root)
+                entry_point = str(entry_path.relative_to(repo_root))
+            except Exception as exc:
+                QMessageBox.critical(self, "Error", f"Failed to prepare MediaMTX: {exc}")
+                return
+        else:
+            entry_path = entry_base / entry_point
         
         # In frozen builds, some "entry points" are logical (run via flags) rather than files.
         is_logical = frozen and entry_point in {"app.py"}
@@ -2012,7 +2092,7 @@ class SystemManagerDialog(QDialog):
                     compat = entry_path.parent / "mediamtx_compat.yml"
                     cfg = compat if compat.exists() else entry_path.parent / "mediamtx.yml"
                     env["MTX_CONFIG_PATH"] = str(cfg)
-                    cmd = [str(entry_path), str(cfg)]
+                    cmd = [str(entry_path)]
             elif entry_path.is_file():
                 # Allow running non-extension binaries on Linux (e.g., mediamtx)
                 cmd = [str(entry_path)]
@@ -2021,7 +2101,7 @@ class SystemManagerDialog(QDialog):
                     compat = entry_path.parent / "mediamtx_compat.yml"
                     cfg = compat if compat.exists() else entry_path.parent / "mediamtx.yml"
                     env["MTX_CONFIG_PATH"] = str(cfg)
-                    cmd = [str(entry_path), str(cfg)]
+                    cmd = [str(entry_path)]
             
             creationflags = 0
             if os.name == "nt":
