@@ -87,6 +87,14 @@ def _mediamtx_entrypoint() -> str:
     return "mediamtx/mediamtx"
 
 
+def _mediamtx_config_path(mtx_dir: Path) -> Path:
+    """Select the shipped config that enables the localhost Control API."""
+    compat = mtx_dir / "mediamtx_compat.yml"
+    if compat.exists():
+        return compat.resolve()
+    return (mtx_dir / "mediamtx.yml").resolve()
+
+
 def _mediamtx_release_url() -> str | None:
     override_url = (os.environ.get("MEDIAMTX_DOWNLOAD_URL") or "").strip()
     if override_url:
@@ -1832,12 +1840,21 @@ class SystemManagerDialog(QDialog):
                 else:
                     res = requests.get(check_url, timeout=2.0)
                 
-                # Consider it "up" if we get any response (even 401/404 means server is alive)
-                if res.status_code < 500:
+                if "MediaMTX" in name:
+                    # Recording depends on the Control API, not just an open TCP port.
+                    # A 404 or socket-only response means MediaMTX is not usable yet.
+                    healthy = res.status_code in (200, 401, 403)
+                else:
+                    # Consider backend alive if it returns any non-5xx response.
+                    healthy = res.status_code < 500
+                if healthy:
                     is_up = True
                     break
             except:
                 # Fallback to simple socket check if HTTP fails but server might be booting
+                if "MediaMTX" in name:
+                    # A listener on 9997 without a working API is not usable by Knoxnet.
+                    continue
                 try:
                     from urllib.parse import urlparse
                     import socket
@@ -2120,19 +2137,17 @@ class SystemManagerDialog(QDialog):
                 cmd = [str(entry_path)]
                 if "mediamtx" in entry_point.lower():
                     cwd = str(entry_path.parent)
-                    compat = entry_path.parent / "mediamtx_compat.yml"
-                    cfg = compat if compat.exists() else entry_path.parent / "mediamtx.yml"
+                    cfg = _mediamtx_config_path(entry_path.parent)
                     env["MTX_CONFIG_PATH"] = str(cfg)
-                    cmd = [str(entry_path)]
+                    cmd = [str(entry_path), str(cfg)]
             elif entry_path.is_file():
                 # Allow running non-extension binaries on Linux (e.g., mediamtx)
                 cmd = [str(entry_path)]
                 if "mediamtx" in entry_point.lower():
                     cwd = str(entry_path.parent)
-                    compat = entry_path.parent / "mediamtx_compat.yml"
-                    cfg = compat if compat.exists() else entry_path.parent / "mediamtx.yml"
+                    cfg = _mediamtx_config_path(entry_path.parent)
                     env["MTX_CONFIG_PATH"] = str(cfg)
-                    cmd = [str(entry_path)]
+                    cmd = [str(entry_path), str(cfg)]
             
             creationflags = 0
             if os.name == "nt":

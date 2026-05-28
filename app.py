@@ -321,7 +321,7 @@ def _build_record_path(camera: dict) -> str:
     return f"{base}/{cam_name}/%Y-%m-%d/%H-%M-%S-%f_%path"
 
 
-def _build_recording_payload(camera: dict, enable: bool) -> dict:
+def _build_recording_payload(camera: dict, enable: bool, source_override: Optional[str] = None) -> dict:
     """Build the full MediaMTX path payload for a recording toggle.
 
     When **enabling** recording we must guarantee MediaMTX actually has a
@@ -344,7 +344,7 @@ def _build_recording_payload(camera: dict, enable: bool) -> dict:
     When **disabling** recording we restore the on-demand defaults so we
     don't pin an RTSP session to every camera 24/7 just for live view.
     """
-    rtsp_url = (camera.get("rtsp_url") or "").strip()
+    rtsp_url = (source_override or camera.get("rtsp_url") or "").strip()
     payload: dict = {"record": bool(enable)}
 
     if enable:
@@ -372,7 +372,12 @@ def _mediamtx_yml_path() -> Path:
     return compat if compat.exists() else mtx_dir / "mediamtx.yml"
 
 
-def _toggle_recording_via_yml(camera_id: str, camera: dict, enable: bool) -> bool:
+def _toggle_recording_via_yml(
+    camera_id: str,
+    camera: dict,
+    enable: bool,
+    source_override: Optional[str] = None,
+) -> bool:
     """Toggle recording by writing directly to mediamtx.yml.
 
     MediaMTX v1.17 has an API bug where PATCH/POST always fails with
@@ -409,7 +414,7 @@ def _toggle_recording_via_yml(camera_id: str, camera: dict, enable: bool) -> boo
 
     record_path = _build_record_path(camera)
     record_val = "yes" if enable else "no"
-    rtsp_url = (camera.get("rtsp_url") or "").strip()
+    rtsp_url = (source_override or camera.get("rtsp_url") or "").strip()
 
     # Build the path block.  We MUST include ``source`` here:  if it's
     # omitted MediaMTX falls back to the ``all_others`` default which is
@@ -464,6 +469,226 @@ def _toggle_recording_via_yml(camera_id: str, camera: dict, enable: bool) -> boo
     except Exception as exc:
         logger.error("Failed to write %s: %s", yml, exc)
         return False
+
+
+def _mediamtx_request(method: str, suffix: str, **kwargs):
+    """Small authenticated MediaMTX API helper."""
+    url = f"{MEDIAMTX_API_URL.rstrip('/')}/{suffix.lstrip('/')}"
+    timeout = kwargs.pop("timeout", 5)
+    auth = mediamtx.auth if "mediamtx" in globals() else None
+    return requests.request(method, url, auth=auth, timeout=timeout, **kwargs)
+
+
+def _mediamtx_runtime_path(path_name: str) -> dict:
+    """Return runtime path info; distinguishes missing runtime from config-only paths."""
+    path_name = str(path_name or "").strip().strip("/")
+    if not path_name:
+        return {"ready": False, "error": "Missing MediaMTX path name"}
+    try:
+        resp = _mediamtx_request("GET", f"paths/get/{path_name}", timeout=3)
+        if resp.status_code == 200:
+            data = resp.json() if resp.content else {}
+            return data if isinstance(data, dict) else {"ready": False, "error": "Invalid path payload"}
+        if resp.status_code == 404:
+            return {"ready": False, "not_found": True, "error": "Runtime path is not present in MediaMTX"}
+        return {"ready": False, "status": resp.status_code, "error": (resp.text or "")[:500]}
+    except Exception as exc:
+        return {"ready": False, "error": str(exc)}
+
+
+def _mediamtx_config_path(path_name: str) -> dict:
+    path_name = str(path_name or "").strip().strip("/")
+    if not path_name:
+        return {"exists": False, "error": "Missing MediaMTX path name"}
+    try:
+        resp = _mediamtx_request("GET", f"config/paths/get/{path_name}", timeout=3)
+        if resp.status_code == 200:
+            data = resp.json() if resp.content else {}
+            if isinstance(data, dict):
+                data["exists"] = True
+                return data
+            return {"exists": False, "error": "Invalid config payload"}
+        if resp.status_code == 404:
+            return {"exists": False, "not_found": True}
+        return {"exists": False, "status": resp.status_code, "error": (resp.text or "")[:500]}
+    except Exception as exc:
+        return {"exists": False, "error": str(exc)}
+
+
+def _source_on_demand_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"yes", "true", "1", "on"}
+
+
+def _validate_recording_config(path_cfg: dict) -> Optional[str]:
+    if not path_cfg or not path_cfg.get("exists", True):
+        return "MediaMTX path config is missing"
+    source = str(path_cfg.get("source") or "").strip()
+    if not source.lower().startswith(("rtsp://", "rtsps://")):
+        return "MediaMTX path source is not a camera RTSP URL"
+    if _source_on_demand_enabled(path_cfg.get("sourceOnDemand", False)):
+        return "MediaMTX sourceOnDemand is enabled; recording does not start the source"
+    if not bool(path_cfg.get("record", False)):
+        return "MediaMTX path has record disabled"
+    record_path = str(path_cfg.get("recordPath") or "").strip()
+    if "%path" not in record_path:
+        return "MediaMTX recordPath is missing %path"
+    return None
+
+
+def _runtime_recording_ready(runtime_info: dict) -> bool:
+    if not isinstance(runtime_info, dict) or not bool(runtime_info.get("ready", False)):
+        return False
+    tracks = runtime_info.get("tracks")
+    if isinstance(tracks, list) and len(tracks) == 0:
+        return False
+    return True
+
+
+def _recording_status_detail(camera: dict) -> dict:
+    """Truth-driven recording state for UI/API consumers."""
+    camera_id = camera.get("id", "")
+    path_name = camera.get("mediamtx_path") or camera_id
+    wanted = bool(camera.get("recording", False))
+    detail = {
+        "recording": False,
+        "wanted": wanted,
+        "state": "off",
+        "path": path_name,
+        "recordPath": None,
+        "error": None,
+    }
+    if not wanted:
+        return detail
+
+    cfg = _mediamtx_config_path(path_name)
+    cfg_error = _validate_recording_config(cfg)
+    if cfg_error:
+        detail.update({
+            "state": "error",
+            "error": cfg_error if not cfg.get("error") else f"{cfg_error}: {cfg.get('error')}",
+        })
+        return detail
+
+    runtime = _mediamtx_runtime_path(path_name)
+    if not _runtime_recording_ready(runtime):
+        if cfg.get("exists"):
+            err = runtime.get("error") or "Runtime path exists in config but is not ready"
+        else:
+            err = "MediaMTX path config is missing"
+        detail.update({
+            "state": "starting" if cfg.get("exists") else "error",
+            "recordPath": cfg.get("recordPath"),
+            "error": err,
+        })
+        return detail
+
+    detail.update({
+        "recording": True,
+        "state": "recording",
+        "recordPath": cfg.get("recordPath"),
+        "source": cfg.get("source"),
+        "tracks": runtime.get("tracks"),
+        "bytesReceived": runtime.get("bytesReceived"),
+    })
+    return detail
+
+
+def _ensure_recording_dir_writable(camera: dict) -> Optional[str]:
+    try:
+        record_path = _build_record_path(camera)
+        prefix = record_path.split("%", 1)[0]
+        base_dir = Path(prefix).expanduser()
+        if base_dir.suffix:
+            base_dir = base_dir.parent
+        base_dir.mkdir(parents=True, exist_ok=True)
+        probe = base_dir / ".knoxnet_recording_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return None
+    except Exception as exc:
+        return f"Recording directory is not writable: {exc}"
+
+
+def _apply_recording_payload(camera_id: str, camera: dict, enable: bool, source: Optional[str] = None) -> tuple[bool, str]:
+    payload = _build_recording_payload(camera, enable, source_override=source)
+    path_name = camera.get("mediamtx_path") or camera_id
+    try:
+        resp = _mediamtx_request("PATCH", f"config/paths/patch/{path_name}", json=payload, timeout=5)
+        if resp.status_code == 200:
+            return True, ""
+        if resp.status_code == 404:
+            resp2 = _mediamtx_request("POST", f"config/paths/add/{path_name}", json=payload, timeout=5)
+            if resp2.status_code in (200, 201):
+                return True, ""
+            return False, f"MediaMTX add path returned {resp2.status_code}: {(resp2.text or '')[:500]}"
+        return False, f"MediaMTX patch path returned {resp.status_code}: {(resp.text or '')[:500]}"
+    except Exception as exc:
+        return False, f"MediaMTX API request failed: {exc}"
+
+
+def _wait_for_recording_ready(camera_id: str, camera: dict, timeout_s: float = 12.0) -> tuple[bool, dict]:
+    path_name = camera.get("mediamtx_path") or camera_id
+    deadline = time.time() + timeout_s
+    last_detail: dict = {}
+    while time.time() < deadline:
+        detail = _recording_status_detail({**camera, "recording": True, "mediamtx_path": path_name})
+        last_detail = detail
+        if detail.get("recording"):
+            return True, detail
+        time.sleep(0.75)
+    return False, last_detail or _recording_status_detail({**camera, "recording": True, "mediamtx_path": path_name})
+
+
+def _set_camera_recording_truth(camera_id: str, camera: dict, enable: bool) -> tuple[bool, dict]:
+    """Toggle recording and only report success after MediaMTX config/runtime agree."""
+    if not enable:
+        ok, err = _apply_recording_payload(camera_id, camera, False)
+        if not ok:
+            logger.info("Recording disable API failed for %s, falling back to YAML: %s", camera_id, err)
+            ok = _toggle_recording_via_yml(camera_id, camera, False)
+        return ok, {"recording": False, "state": "off", "error": None if ok else err}
+
+    source = str(camera.get("rtsp_url") or "").strip()
+    if not source.lower().startswith(("rtsp://", "rtsps://")):
+        return False, {"recording": False, "state": "error", "error": "Camera has no valid RTSP URL to record"}
+
+    dir_error = _ensure_recording_dir_writable(camera)
+    if dir_error:
+        return False, {"recording": False, "state": "error", "error": dir_error}
+
+    sources = [source]
+    sub_source = str(camera.get("substream_rtsp_url") or "").strip()
+    if sub_source.lower().startswith(("rtsp://", "rtsps://")) and sub_source not in sources:
+        sources.append(sub_source)
+
+    last_error = ""
+    for idx, candidate in enumerate(sources):
+        ok, err = _apply_recording_payload(camera_id, camera, True, source=candidate)
+        if not ok:
+            logger.info("Recording enable API failed for %s, falling back to YAML: %s", camera_id, err)
+            ok = _toggle_recording_via_yml(camera_id, camera, True, source_override=candidate)
+            if not ok:
+                restarted = _try_restart_mediamtx()
+                if restarted:
+                    ok = _toggle_recording_via_yml(camera_id, camera, True, source_override=candidate)
+        if not ok:
+            last_error = err or "Could not update MediaMTX recording path"
+            continue
+
+        ready, detail = _wait_for_recording_ready(camera_id, {**camera, "rtsp_url": candidate}, timeout_s=12.0)
+        if ready:
+            if idx > 0:
+                detail["state"] = "recording_degraded"
+                detail["warning"] = "Recording from substream because the main RTSP source did not become ready"
+            return True, detail
+
+        last_error = detail.get("error") or "MediaMTX path did not become ready"
+
+    # Avoid leaving the UI in a red REC state for a path that is only configured, not ready.
+    _apply_recording_payload(camera_id, camera, False)
+    return False, {"recording": False, "state": "error", "error": last_error}
 
 
 def _camera_limit_state() -> Dict[str, Any]:
@@ -910,18 +1135,20 @@ class MediaMTXClient:
     def get_path_info(self, camera_id: str) -> dict:
         """Get path information from MediaMTX"""
         try:
-            response = self.session.get(
-                f"{self.api_url}/paths/list",
-                timeout=10
-            )
-
+            response = self.session.get(f"{self.api_url}/paths/get/{camera_id}", timeout=5)
             if response.status_code == 200:
-                data = response.json()
-                paths = data.get('items', [])
-                for path in paths:
+                data = response.json() if response.content else {}
+                return data if isinstance(data, dict) else {}
+            if response.status_code == 404:
+                return {}
+
+            # Older MediaMTX builds may not support paths/get; fall back to list.
+            list_response = self.session.get(f"{self.api_url}/paths/list", timeout=5)
+            if list_response.status_code == 200:
+                data = list_response.json()
+                for path in data.get('items', []):
                     if path.get('name') == camera_id:
                         return path
-
             return {}
 
         except requests.exceptions.RequestException as e:
@@ -1057,10 +1284,9 @@ def _recording_watchdog_loop():
             else:
                 continue
 
-        # Reconcile: ensure cameras flagged recording=True still have record=true
-        # in MediaMTX (catches silent config loss after a MediaMTX restart).
+        # Reconcile: ensure cameras flagged recording=True still have a valid
+        # recording config, and surface config-only/stale runtime paths.
         try:
-            mtx_base = MEDIAMTX_API_URL.rstrip("/")
             for cam in cameras_db:
                 if not cam.get('recording'):
                     continue
@@ -1068,16 +1294,21 @@ def _recording_watchdog_loop():
                 if not cam_id:
                     continue
                 try:
-                    payload = _build_recording_payload(cam, True)
-                    cfg_resp = _req.get(f"{mtx_base}/config/paths/get/{cam_id}", timeout=3)
-                    if cfg_resp.status_code == 200:
-                        path_cfg = cfg_resp.json()
-                        if not path_cfg.get("record"):
-                            logger.warning("Recording lost for %s in MediaMTX – re-enabling", cam_id)
-                            _req.patch(f"{mtx_base}/config/paths/patch/{cam_id}", json=payload, timeout=5)
-                    elif cfg_resp.status_code == 404:
-                        logger.warning("Path missing for recording camera %s – re-creating", cam_id)
-                        _req.post(f"{mtx_base}/config/paths/add/{cam_id}", json=payload, timeout=5)
+                    detail = _recording_status_detail(cam)
+                    if detail.get("recording"):
+                        continue
+                    logger.warning(
+                        "Recording stale for %s (%s) - re-applying MediaMTX path",
+                        cam_id,
+                        detail.get("error") or detail.get("state"),
+                    )
+                    ok, new_detail = _set_camera_recording_truth(cam_id, cam, True)
+                    if ok:
+                        cam.pop("recording_error", None)
+                        cam["recording_state"] = new_detail.get("state", "recording")
+                    else:
+                        cam["recording_error"] = new_detail.get("error") or "Recording watchdog could not verify readiness"
+                        cam["recording_state"] = new_detail.get("state", "error")
                 except Exception as inner_err:
                     logger.warning("Watchdog reconcile error for %s: %s", cam_id, inner_err)
         except Exception as e:
@@ -1126,9 +1357,7 @@ def _try_restart_mediamtx() -> bool:
         logger.warning("Cannot restart MediaMTX: binary not found")
         return False
 
-    mtx_dir = mtx_bin.parent
-    compat = mtx_dir / "mediamtx_compat.yml"
-    cfg = compat if compat.exists() else mtx_dir / "mediamtx.yml"
+    cfg = _mediamtx_yml_path().resolve()
 
     logger.info("Attempting MediaMTX restart: %s %s", mtx_bin, cfg)
 
@@ -1137,7 +1366,7 @@ def _try_restart_mediamtx() -> bool:
             [str(mtx_bin), str(cfg)],
             stdout=open("/tmp/mediamtx.log", "a"),
             stderr=_sp.STDOUT,
-            cwd=str(mtx_dir),
+            cwd=str(cfg.parent),
             start_new_session=True,
         )
         _t.sleep(3)
@@ -2605,11 +2834,15 @@ def ensure_camera_mediamtx_ready(camera: Dict[str, Any], force_check: bool = Fal
 
         connected = connect_camera_to_mediamtx(camera['id'])
         if connected:
-            camera['mediamtx_ready'] = True
-            camera['ready'] = True
-            camera['status'] = 'live'
-            camera['last_seen'] = datetime.now().isoformat()
-            return True
+            for _ in range(12):
+                time.sleep(0.25)
+                path_info = mediamtx.get_path_info(path_name)
+                if path_info.get('ready'):
+                    camera['mediamtx_ready'] = True
+                    camera['ready'] = True
+                    camera['status'] = 'live'
+                    camera['last_seen'] = datetime.now().isoformat()
+                    return True
 
         camera['mediamtx_ready'] = False
         return False
@@ -3751,69 +3984,28 @@ def toggle_camera_recording(camera_id):
         if "recording_dir" in data:
             camera["recording_dir"] = data["recording_dir"]
 
-        ok = False
-        path_payload = _build_recording_payload(camera, enable)
-
-        if camera_manager:
-            loop = getattr(camera_manager, '_event_loop', None)
-            if loop and loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(
-                    camera_manager.toggle_recording(camera_id, bool(enable)), loop
-                )
-                ok = future.result(timeout=10)
-            else:
-                ok = asyncio.get_event_loop().run_until_complete(
-                    camera_manager.toggle_recording(camera_id, bool(enable))
-                )
-        else:
-            try:
-                import requests as _req
-                mtx_base = MEDIAMTX_API_URL.rstrip("/")
-                logger.info("Recording toggle: PATCH %s/config/paths/patch/%s payload=%s",
-                            mtx_base, camera_id, path_payload)
-                resp = _req.patch(
-                    f"{mtx_base}/config/paths/patch/{camera_id}",
-                    json=path_payload,
-                    timeout=5,
-                )
-                if resp.status_code == 200:
-                    ok = True
-                elif resp.status_code == 404:
-                    logger.info("Recording toggle: path not found, trying ADD")
-                    resp2 = _req.post(
-                        f"{mtx_base}/config/paths/add/{camera_id}",
-                        json=path_payload,
-                        timeout=5,
-                    )
-                    ok = resp2.status_code in (200, 201)
-                    if not ok:
-                        logger.error("MediaMTX add path returned %s: %s", resp2.status_code, resp2.text[:500] if resp2.text else "")
-                else:
-                    logger.error("MediaMTX PATCH returned %s: %s", resp.status_code, resp.text[:500] if resp.text else "")
-            except Exception as mtx_err:
-                logger.error("Direct MediaMTX recording toggle failed: %s", mtx_err)
-
-        if not ok:
-            # MediaMTX v1.17+ has an API bug where PATCH/POST always rejects
-            # recordPath.  Fall back to editing the YAML config directly.
-            logger.info("Recording toggle: API failed, falling back to YAML config write")
-            ok = _toggle_recording_via_yml(camera_id, camera, enable)
-
-        if not ok:
-            restarted = _try_restart_mediamtx()
-            if restarted:
-                ok = _toggle_recording_via_yml(camera_id, camera, enable)
+        ok, detail = _set_camera_recording_truth(camera_id, camera, bool(enable))
 
         if ok:
             camera['recording'] = bool(enable)
+            camera.pop('recording_error', None)
+            camera['recording_state'] = detail.get("state", "recording" if enable else "off")
             save_cameras()
-            return jsonify({"success": True, "recording": bool(enable)})
+            return jsonify({"success": True, "recording": bool(enable), "data": detail})
 
-        detail = (
-            "Could not toggle recording via MediaMTX API or YAML config. "
-            "Ensure MediaMTX is running and the config file is writable."
+        # Keep recording=True as the user's intent so the watchdog can retry,
+        # but expose verified recording state through /recording-status.
+        camera['recording'] = bool(enable) if enable else camera.get('recording', False)
+        camera['recording_error'] = detail.get("error") or "Recording could not be verified"
+        camera['recording_state'] = detail.get("state", "error")
+        save_cameras()
+
+        message = detail.get("error") or (
+            "Could not verify MediaMTX recording readiness. "
+            "Ensure MediaMTX is running, the camera RTSP source is reachable, "
+            "and the recording directory is writable."
         )
-        return jsonify({"success": False, "message": detail}), 500
+        return jsonify({"success": False, "recording": False, "message": message, "data": detail}), 503
     except Exception as e:
         logger.error("Error toggling recording for %s: %s", camera_id, e)
         return jsonify({"success": False, "message": str(e)}), 500
@@ -3821,11 +4013,17 @@ def toggle_camera_recording(camera_id):
 
 @app.route('/api/cameras/recording-status', methods=['GET'])
 def cameras_recording_status():
-    """Lightweight endpoint returning recording flags and per-camera paths."""
+    """Return verified recording flags plus details for degraded/error states."""
     statuses = {}
+    details = {}
     for cam in cameras_db:
-        statuses[cam.get('id', '')] = cam.get('recording', False)
-    return jsonify({"success": True, "data": statuses})
+        cid = cam.get('id', '')
+        if not cid:
+            continue
+        detail = _recording_status_detail(cam)
+        statuses[cid] = bool(detail.get("recording", False))
+        details[cid] = detail
+    return jsonify({"success": True, "data": statuses, "details": details})
 
 
 # Test camera connection
@@ -6106,26 +6304,29 @@ if __name__ == '__main__':
     # Test MediaMTX connection on startup
     test_mediamtx_connection()
 
-    # Restore recording for cameras that were recording before restart
+    # Restore recording for cameras that were recording before restart, but
+    # keep the persisted/UI state truthful if MediaMTX never becomes ready.
     try:
-        import requests as _req
-        mtx_base = MEDIAMTX_API_URL.rstrip("/")
         restored = 0
         for cam in cameras_db:
             if cam.get('recording') and cam.get('rtsp_url'):
                 cam_id = cam.get('id', '')
                 if not cam_id:
                     continue
-                payload = _build_recording_payload(cam, True)
                 try:
-                    resp = _req.patch(f"{mtx_base}/config/paths/patch/{cam_id}", json=payload, timeout=5)
-                    if resp.status_code == 404:
-                        _req.post(f"{mtx_base}/config/paths/add/{cam_id}", json=payload, timeout=5)
-                    restored += 1
+                    ok, detail = _set_camera_recording_truth(cam_id, cam, True)
+                    if ok:
+                        cam.pop("recording_error", None)
+                        cam["recording_state"] = detail.get("state", "recording")
+                        restored += 1
+                    else:
+                        cam["recording_error"] = detail.get("error") or "Recording could not be restored"
+                        cam["recording_state"] = detail.get("state", "error")
                 except Exception as re_err:
                     logger.warning("Could not restore recording for %s: %s", cam_id, re_err)
         if restored:
             logger.info("Restored recording for %d camera(s) from persisted state", restored)
+        save_cameras()
     except Exception as e:
         logger.warning("Recording restoration on startup failed: %s", e)
 

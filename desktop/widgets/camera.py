@@ -7828,7 +7828,8 @@ class CameraWidget(BaseDesktopWidget):
             self._continuous_recording = bool(data.get(self.camera_id, False))
             self.gl_widget._camera_recording_flag = self._continuous_recording
         except Exception:
-            pass
+            self._continuous_recording = False
+            self.gl_widget._camera_recording_flag = False
 
     def _sync_recording_state(self):
         """Periodic sync of recording indicator from the backend."""
@@ -7843,7 +7844,10 @@ class CameraWidget(BaseDesktopWidget):
                     self.gl_widget._camera_recording_flag = new_val
                     self.gl_widget.update()
             except Exception:
-                pass
+                if self._continuous_recording:
+                    self._continuous_recording = False
+                    self.gl_widget._camera_recording_flag = False
+                    self.gl_widget.update()
         threading.Thread(target=_fetch, daemon=True).start()
 
     def _load_motion_watch_settings(self):

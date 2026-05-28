@@ -598,21 +598,51 @@ class CameraManager:
             # Update status
             self.camera_health[camera_id].status = CameraStatus.CONNECTING
 
-            # Test RTSP connection
+            # Test the selected RTSP stream. If the main path is down but a
+            # derived/configured substream works, prefer showing the usable feed
+            # instead of failing the camera outright.
             if not await self._test_rtsp_connection(config):
-                logger.error(f"Failed to connect to RTSP stream: {camera_id}")
-                self.camera_health[camera_id].status = CameraStatus.ERROR
-                return False
+                recovered_with_substream = False
+                if config.substream_rtsp_url and config.substream_capable is not False:
+                    try:
+                        if await self._probe_substream(config, force=True):
+                            config.stream_quality = StreamQuality.LOW
+                            config.stream_priority = "sub"
+                            config.substream_capable = True
+                            config.updated_at = datetime.now()
+                            self._save_camera_to_db(config)
+                            recovered_with_substream = True
+                            logger.warning(
+                                "Main RTSP stream failed for %s; using verified substream %s",
+                                camera_id,
+                                config.substream_path or self._extract_stream_path(config.substream_rtsp_url),
+                            )
+                    except Exception as exc:
+                        logger.warning("Substream fallback failed for %s: %s", camera_id, exc)
+
+                if not recovered_with_substream:
+                    logger.error(f"Failed to connect to RTSP stream: {camera_id}")
+                    self.camera_health[camera_id].status = CameraStatus.ERROR
+                    return False
 
             # Configure MediaMTX stream source (for browser/WebRTC/HLS delivery), but do not
             # start a Python-side WebRTC receiver unless explicitly enabled.
             if config.webrtc_enabled:
                 stream_path = camera_id  # Use camera_id directly as path for consistency
+                primary_rtsp_url = (
+                    config.substream_rtsp_url
+                    if (
+                        config.stream_quality == StreamQuality.LOW
+                        and config.substream_rtsp_url
+                        and config.substream_capable is not False
+                    )
+                    else config.rtsp_url
+                )
                 # Use force_recreate=False to allow existing stable streams to persist
                 # Only if connection fails will we try again with force_recreate=True
                 success = await self.mediamtx_client.configure_stream_source(
                     stream_path, 
-                    config.rtsp_url,
+                    primary_rtsp_url,
                     force_recreate=False
                 )
 
@@ -635,7 +665,7 @@ class CameraManager:
                         # Optional: Connect Python-side WebRTC receiver (aiortc). Not used in desktop-light mode.
                         stream_config = StreamConfig(
                             stream_path=stream_path,
-                            rtsp_url=config.rtsp_url,
+                            rtsp_url=primary_rtsp_url,
                             quality=config.stream_quality.value,
                             enable_audio=config.audio_enabled
                         )
@@ -1423,10 +1453,10 @@ class CameraManager:
                     cam_dict['webrtc_whip_url'] = f"http://localhost:8889/{config.mediamtx_path}/whip"
                     cam_dict['webrtc_whep_url'] = f"http://localhost:8889/{config.mediamtx_path}/whep"
                     cam_dict['mediamtx_rtsp_url'] = f"rtsp://localhost:8554/{config.mediamtx_path}"
-                    cam_dict['ready'] = True
-                    cam_dict['mediamtx_ready'] = True
+                    cam_dict['ready'] = False
+                    cam_dict['mediamtx_ready'] = False
                     cam_dict['readers_count'] = 0
-                    cam_dict['publishers_count'] = 1
+                    cam_dict['publishers_count'] = 0
 
                 if getattr(config, 'mediamtx_sub_path', None):
                     cam_dict['mediamtx_sub_path'] = config.mediamtx_sub_path

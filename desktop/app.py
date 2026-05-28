@@ -304,7 +304,7 @@ class KnoxnetDesktopApp(QApplication):
             prefs = {}
 
         backend_up = self.is_backend_running()
-        mediamtx_up = self.is_backend_running(port=9997)
+        mediamtx_up = self.is_mediamtx_running()
 
         if prefs.get("autostart_backend") and not backend_up:
             logger.info("Auto-starting Backend (pref enabled)…")
@@ -329,7 +329,7 @@ class KnoxnetDesktopApp(QApplication):
     def _prompt_services_down(self):
         """Show the system manager dialog when no core services are detected."""
         try:
-            if not self.is_backend_running() and not self.is_backend_running(port=9997):
+            if not self.is_backend_running() and not self.is_mediamtx_running():
                 self.tray_icon.showMessage(
                     "Knoxnet VMS Beta",
                     "Backend and MediaMTX are not running.\nOpen System Management to start services.",
@@ -387,8 +387,8 @@ class KnoxnetDesktopApp(QApplication):
                 compat = mtx_dir / "mediamtx_compat.yml"
                 cfg = compat if compat.exists() else mtx_dir / "mediamtx.yml"
                 subprocess.Popen(
-                    [str(ep)],
-                    cwd=str(mtx_dir),
+                    [str(ep), str(cfg)],
+                    cwd=str(cfg.parent),
                     env={**os.environ, "MTX_CONFIG_PATH": str(cfg)},
                     stdout=open("/tmp/knoxnet_mediamtx.log", "a"),
                     stderr=subprocess.STDOUT,
@@ -406,6 +406,18 @@ class KnoxnetDesktopApp(QApplication):
                 s.settimeout(1)
                 return s.connect_ex((host, port)) == 0
         except:
+            return False
+
+    def is_mediamtx_running(self):
+        """MediaMTX is usable only when the Control API responds."""
+        try:
+            from requests.auth import HTTPBasicAuth
+            username = (os.environ.get("MEDIAMTX_API_USERNAME") or "").strip()
+            password = (os.environ.get("MEDIAMTX_API_PASSWORD") or "").strip()
+            auth = HTTPBasicAuth(username, password) if username and password else None
+            res = requests.get("http://127.0.0.1:9997/v3/config/global/get", timeout=2, auth=auth)
+            return res.status_code in (200, 401, 403)
+        except Exception:
             return False
 
     def run_camera_manager(self):
@@ -630,7 +642,8 @@ class KnoxnetDesktopApp(QApplication):
                 with self._recording_status_lock:
                     self._recording_status_cache = {k: bool(v) for k, v in data.items()}
             except Exception:
-                pass
+                with self._recording_status_lock:
+                    self._recording_status_cache = {}
         threading.Thread(target=_fetch, daemon=True).start()
 
     def rebuild_tray_menu(self):

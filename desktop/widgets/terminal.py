@@ -2889,9 +2889,12 @@ class TerminalWidget(BaseDesktopWidget):
                 return
             try:
                 r = _req.get("http://localhost:5000/api/cameras/recording-status", timeout=3)
-                rec_flags = r.json().get("data", {})
+                body = r.json()
+                rec_flags = body.get("data", {})
+                rec_details = body.get("details", {})
             except Exception:
                 rec_flags = {}
+                rec_details = {}
 
             lines = ["Camera                 Recording   Directory"]
             lines.append("─" * 65)
@@ -2901,10 +2904,19 @@ class TerminalWidget(BaseDesktopWidget):
                 name = cam.get("name") or cid[:8]
                 is_rec = rec_flags.get(cid, cam.get("recording", False))
                 rec_dir = cam.get("recording_dir", "").strip() or "(default)"
-                status = "● REC" if is_rec else "  off"
+                detail = rec_details.get(cid, {}) if isinstance(rec_details, dict) else {}
+                wanted = bool(detail.get("wanted", cam.get("recording", False))) if isinstance(detail, dict) else bool(cam.get("recording", False))
+                if is_rec:
+                    status = "● REC"
+                elif wanted:
+                    status = "  error"
+                else:
+                    status = "  off"
                 if is_rec:
                     rec_count += 1
                 lines.append(f"  {name:20s} {status:11s} {rec_dir}")
+                if wanted and not is_rec and isinstance(detail, dict) and detail.get("error"):
+                    lines.append(f"    -> {detail.get('error')}")
 
             lines.append("")
             lines.append(f"Recording: {rec_count}/{len(cameras)} cameras")

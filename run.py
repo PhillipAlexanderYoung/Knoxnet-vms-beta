@@ -240,6 +240,21 @@ class ServerManager:
         # Restart
         return self.start_mediamtx()
 
+    def _mediamtx_config_path(self):
+        """Resolve the Knoxnet MediaMTX config that enables the Control API."""
+        binary_dir = Path(getattr(self, "mediamtx_path", "")).resolve().parent
+        repo_dir = Path(__file__).resolve().parent / "mediamtx"
+        candidates = [
+            binary_dir / "mediamtx_compat.yml",
+            binary_dir / "mediamtx.yml",
+            repo_dir / "mediamtx_compat.yml",
+            repo_dir / "mediamtx.yml",
+        ]
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return candidate.resolve()
+        return (repo_dir / "mediamtx_compat.yml").resolve()
+
     def trigger_camera_reconnection(self):
         """Trigger backend to reconnect all cameras to MediaMTX"""
         try:
@@ -283,27 +298,19 @@ class ServerManager:
             print(f"   Using: {self.mediamtx_path}")
             self.cleanup_stale_mediamtx()
 
-            # Start MediaMTX process with explicit config to avoid wrong file being loaded
-            compat_path = self.mediamtx_path.parent / "mediamtx_compat.yml"
-            config_path = compat_path if compat_path.exists() else (
-                self.mediamtx_path.parent / 'mediamtx.yml'
-                if self.mediamtx_path.parent.name == 'mediamtx'
-                else Path('mediamtx.yml')
-            )
+            # Pass the config as an explicit argument. Relying on CWD or env lets
+            # MediaMTX silently load mediamtx.yml with the Control API disabled.
+            config_path = self._mediamtx_config_path()
             print(f"   Config: {config_path}")
 
             exe_path = self.mediamtx_path.resolve()
             self.mediamtx_process = subprocess.Popen(
-                # MediaMTX uses environment variable MTX_CONFIG for config path, or no args for default
-                # But for local execution, we don't need -config flag, we just point env var or run in dir
-                # If we must specify config, some versions use just the path as argument
-                # Let's try setting the environment variable instead as it's safer across versions
-                [str(exe_path)],
+                [str(exe_path), str(config_path)],
                 env={**os.environ, 'MTX_CONFIG_PATH': str(config_path)},
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                cwd=self.mediamtx_path.parent if self.mediamtx_path.parent.name == "mediamtx" else "."
+                cwd=str(config_path.parent)
             )
 
             # Give MediaMTX time to start

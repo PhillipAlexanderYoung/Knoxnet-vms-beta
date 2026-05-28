@@ -403,16 +403,35 @@ class MediaMTXWebRTCClient:
         add_url = f"{base}/v3/config/paths/add/{stream_path}"
         payload: Dict[str, Any] = {"record": enable}
         if source:
+            if enable and not str(source).lower().startswith(("rtsp://", "rtsps://")):
+                logger.error("Refusing to enable recording for %s without a valid RTSP source", stream_path)
+                return False
             payload["source"] = source
             payload["sourceProtocol"] = "tcp"
-        if record_path and enable:
+        if enable:
+            payload["sourceOnDemand"] = False
+            if not record_path:
+                try:
+                    from core.paths import get_recordings_dir
+                    record_path = str(get_recordings_dir() / "%path" / "%Y-%m-%d_%H-%M-%S-%f").replace("\\", "/")
+                except Exception:
+                    record_path = "../recordings/%path/%Y-%m-%d_%H-%M-%S-%f"
+            if "%path" not in str(record_path):
+                logger.error("Refusing to enable recording for %s: recordPath must contain %%path", stream_path)
+                return False
             payload["recordPath"] = record_path
+        else:
+            payload["sourceOnDemand"] = True
+            payload["sourceOnDemandStartTimeout"] = "10s"
+            payload["sourceOnDemandCloseAfter"] = "30s"
         try:
             async with aiohttp.ClientSession() as session:
                 auth = aiohttp.BasicAuth(self.api_username, self.api_password)
                 async with session.patch(patch_url, json=payload, auth=auth) as resp:
                     if resp.status == 200:
-                        logger.info("Recording %s for path %s", "enabled" if enable else "disabled", stream_path)
+                        if enable:
+                            return await self._verify_recording_ready(stream_path)
+                        logger.info("Recording disabled for path %s", stream_path)
                         return True
                     if resp.status != 404:
                         body = ""
@@ -429,6 +448,8 @@ class MediaMTXWebRTCClient:
                     if resp2.status in (200, 201):
                         logger.info("Created config path and %s recording for %s",
                                     "enabled" if enable else "disabled", stream_path)
+                        if enable:
+                            return await self._verify_recording_ready(stream_path)
                         return True
                     body = ""
                     try:
@@ -440,6 +461,50 @@ class MediaMTXWebRTCClient:
         except Exception as e:
             logger.error("Error toggling recording for %s: %s", stream_path, e)
             return False
+
+    async def _verify_recording_ready(self, stream_path: str, timeout_s: float = 10.0) -> bool:
+        """Verify that MediaMTX has both valid recording config and a ready runtime path."""
+        deadline = time.time() + timeout_s
+        last_error = ""
+        while time.time() < deadline:
+            cfg = await self._get_path_config(stream_path)
+            if not cfg:
+                last_error = "config path missing"
+            elif not bool(cfg.get("record", False)):
+                last_error = "record flag disabled"
+            elif str(cfg.get("source") or "").strip().lower().startswith(("rtsp://", "rtsps://")) is False:
+                last_error = "source is not RTSP"
+            elif str(cfg.get("recordPath") or "").find("%path") < 0:
+                last_error = "recordPath missing %path"
+            elif bool(str(cfg.get("sourceOnDemand", "")).lower() in {"yes", "true", "1", "on"}):
+                last_error = "sourceOnDemand is enabled"
+            else:
+                info = await self.get_path_info(stream_path)
+                if bool(info.get("ready", False)):
+                    tracks = info.get("tracks")
+                    if not isinstance(tracks, list) or len(tracks) > 0:
+                        logger.info("Recording verified ready for path %s", stream_path)
+                        return True
+                last_error = info.get("error") or "runtime path not ready"
+            await asyncio.sleep(0.5)
+        logger.error("Recording for %s did not become ready: %s", stream_path, last_error)
+        return False
+
+    async def _get_path_config(self, stream_path: str) -> Dict[str, Any]:
+        api_url = (
+            f"http://{self.mediamtx_host}:{self.mediamtx_api_port}"
+            f"/v3/config/paths/get/{stream_path}"
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                auth = aiohttp.BasicAuth(self.api_username, self.api_password)
+                async with session.get(api_url, auth=auth) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.error("Error checking path config for %s: %s", stream_path, e)
+        return {}
 
     async def get_recording_status(self, stream_path: str) -> Optional[bool]:
         """Return True if recording is enabled for *stream_path*, None on error."""
