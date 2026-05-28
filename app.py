@@ -372,6 +372,335 @@ def _mediamtx_yml_path() -> Path:
     return compat if compat.exists() else mtx_dir / "mediamtx.yml"
 
 
+def _mediamtx_yml_paths() -> List[Path]:
+    """Return existing MediaMTX YAML configs that can hold persisted paths."""
+    project_root = Path(__file__).resolve().parent
+    mtx_dir = project_root / "mediamtx"
+    compat = mtx_dir / "mediamtx_compat.yml"
+    main = mtx_dir / "mediamtx.yml"
+    ordered = [compat, main] if compat.exists() else [main, compat]
+    return [path for path in ordered if path.exists()]
+
+
+def _is_reserved_mediamtx_path(path_name: str) -> bool:
+    path_name = str(path_name or "").strip().strip("/")
+    return not path_name or path_name in {"all", "all_others"} or path_name.startswith("~")
+
+
+def _is_knoxnet_camera_path_name(path_name: str) -> bool:
+    """Return True for Knoxnet-generated camera path names safe for orphan cleanup."""
+    path_name = str(path_name or "").strip().strip("/")
+    if _is_reserved_mediamtx_path(path_name):
+        return False
+
+    base = path_name[:-4] if path_name.endswith("_sub") else path_name
+    try:
+        uuid.UUID(base)
+    except (TypeError, ValueError):
+        return False
+    return path_name == base or path_name == f"{base}_sub"
+
+
+def _camera_mediamtx_path_names(camera_id: str, camera: dict) -> List[str]:
+    """Return main/sub MediaMTX path names owned by a camera."""
+    names: List[str] = []
+    main_path = str(camera.get("mediamtx_path") or camera_id or "").strip().strip("/")
+    sub_path = str(camera.get("mediamtx_sub_path") or "").strip().strip("/")
+
+    for candidate in (main_path, sub_path):
+        if candidate and candidate not in names:
+            names.append(candidate)
+
+    # Older metadata may not have persisted mediamtx_sub_path even though the
+    # path naming convention was used in MediaMTX.
+    if main_path:
+        conventional_sub = f"{main_path}_sub"
+        if conventional_sub not in names:
+            names.append(conventional_sub)
+
+    return names
+
+
+def _owned_mediamtx_path_names() -> set[str]:
+    """Return every MediaMTX path currently owned by cameras_db."""
+    owned: set[str] = set()
+    for camera in cameras_db:
+        camera_id = str(camera.get("id") or "").strip()
+        for path_name in _camera_mediamtx_path_names(camera_id, camera):
+            if not _is_reserved_mediamtx_path(path_name):
+                owned.add(path_name)
+    return owned
+
+
+def _remove_explicit_mediamtx_paths_from_text(text: str, path_names: set[str]) -> tuple[str, set[str]]:
+    """Remove exact explicit path blocks from the top-level MediaMTX paths map."""
+    if not path_names:
+        return text, set()
+
+    lines = text.splitlines(keepends=True)
+    output: List[str] = []
+    removed: set[str] = set()
+    in_paths = False
+    i = 0
+    path_key_re = re.compile(r"^  ([^#:\s][^:\n]*):\s*(?:#.*)?(?:\r?\n)?$")
+
+    while i < len(lines):
+        line = lines[i]
+
+        if not in_paths:
+            output.append(line)
+            if re.match(r"^paths:\s*(?:#.*)?(?:\r?\n)?$", line):
+                in_paths = True
+            i += 1
+            continue
+
+        # A new top-level key means the paths map ended.
+        if line.strip() and not line.startswith((" ", "\t", "#")):
+            in_paths = False
+            output.append(line)
+            i += 1
+            continue
+
+        match = path_key_re.match(line)
+        if not match:
+            output.append(line)
+            i += 1
+            continue
+
+        path_name = match.group(1).strip().strip('"\'')
+        if path_name not in path_names:
+            output.append(line)
+            i += 1
+            continue
+
+        removed.add(path_name)
+        i += 1
+        while i < len(lines):
+            next_line = lines[i]
+            if next_line.strip() and not next_line.startswith((" ", "\t", "#")):
+                in_paths = False
+                break
+            if path_key_re.match(next_line):
+                break
+            i += 1
+
+    return "".join(output), removed
+
+
+def _remove_mediamtx_paths_from_yml(path_names: set[str]) -> set[str]:
+    """Remove explicit path blocks from managed MediaMTX YAML configs."""
+    safe_names = {
+        str(path_name or "").strip().strip("/")
+        for path_name in path_names
+        if not _is_reserved_mediamtx_path(str(path_name or ""))
+    }
+    if not safe_names:
+        return set()
+
+    removed_all: set[str] = set()
+    for yml in _mediamtx_yml_paths():
+        try:
+            text = yml.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to read MediaMTX config %s while deleting paths: %s", yml, exc)
+            continue
+
+        new_text, removed = _remove_explicit_mediamtx_paths_from_text(text, safe_names)
+        if not removed:
+            continue
+
+        try:
+            yml.write_text(new_text, encoding="utf-8")
+            logger.info("Removed %d stale MediaMTX YAML path(s) from %s: %s", len(removed), yml, sorted(removed))
+            removed_all.update(removed)
+        except Exception as exc:
+            logger.warning("Failed to write MediaMTX config %s while deleting paths: %s", yml, exc)
+
+    return removed_all
+
+
+def _remove_mediamtx_path_from_yml(path_name: str) -> bool:
+    """Remove an explicit path block from MediaMTX YAML configs."""
+    path_name = str(path_name or "").strip().strip("/")
+    if _is_reserved_mediamtx_path(path_name):
+        return False
+
+    return path_name in _remove_mediamtx_paths_from_yml({path_name})
+
+
+def _extract_mediamtx_path_names(payload: Any) -> set[str]:
+    names: set[str] = set()
+    if isinstance(payload, dict):
+        items = payload.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and item.get("name"):
+                    names.add(str(item["name"]).strip().strip("/"))
+            return names
+
+        for key, value in payload.items():
+            if key in {"itemCount", "pageCount"}:
+                continue
+            if isinstance(value, dict):
+                names.add(str(key).strip().strip("/"))
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict) and item.get("name"):
+                names.add(str(item["name"]).strip().strip("/"))
+    return {name for name in names if name}
+
+
+def _list_mediamtx_config_path_names() -> Optional[set[str]]:
+    """Return configured MediaMTX path names, or None when the API is unavailable."""
+    for endpoint in ("config/paths/list", "paths/list"):
+        try:
+            resp = _mediamtx_request("GET", endpoint, timeout=3)
+        except Exception as exc:
+            logger.debug("MediaMTX %s unavailable during orphan cleanup: %s", endpoint, exc)
+            continue
+
+        if resp.status_code == 200:
+            try:
+                return _extract_mediamtx_path_names(resp.json() if resp.content else {})
+            except Exception as exc:
+                logger.warning("Failed to parse MediaMTX %s response during orphan cleanup: %s", endpoint, exc)
+                return set()
+
+        logger.debug("MediaMTX %s returned %s during orphan cleanup", endpoint, resp.status_code)
+
+    return None
+
+
+def _disable_and_delete_mediamtx_path(path_name: str, reason: str) -> bool:
+    """Best-effort API cleanup that disables recording before deleting config."""
+    path_name = str(path_name or "").strip().strip("/")
+    if _is_reserved_mediamtx_path(path_name):
+        return False
+
+    deleted = False
+    try:
+        resp = _mediamtx_request(
+            "PATCH",
+            f"config/paths/patch/{path_name}",
+            json={
+                "record": False,
+                "sourceOnDemand": True,
+                "sourceOnDemandStartTimeout": "10s",
+                "sourceOnDemandCloseAfter": "30s",
+            },
+            timeout=5,
+        )
+        if resp.status_code not in (200, 404):
+            logger.warning(
+                "MediaMTX recording disable for %s returned %s during %s cleanup: %s",
+                path_name,
+                resp.status_code,
+                reason,
+                (resp.text or "")[:300],
+            )
+    except Exception as exc:
+        logger.warning("MediaMTX recording disable failed for %s during %s cleanup: %s", path_name, reason, exc)
+
+    try:
+        resp = _mediamtx_request("DELETE", f"config/paths/delete/{path_name}", timeout=5)
+        if resp.status_code in (200, 204):
+            deleted = True
+            logger.info("Removed MediaMTX API path during %s cleanup: %s", reason, path_name)
+        elif resp.status_code == 404:
+            logger.debug("MediaMTX API path already absent during %s cleanup: %s", reason, path_name)
+        else:
+            logger.warning(
+                "MediaMTX path delete for %s returned %s during %s cleanup: %s",
+                path_name,
+                resp.status_code,
+                reason,
+                (resp.text or "")[:300],
+            )
+    except Exception as exc:
+        logger.warning("MediaMTX path delete failed for %s during %s cleanup: %s", path_name, reason, exc)
+
+    return deleted
+
+
+def cleanup_orphan_mediamtx_paths() -> dict:
+    """Remove stale Knoxnet-owned MediaMTX path config not present in cameras_db."""
+    owned_paths = _owned_mediamtx_path_names()
+    api_removed: set[str] = set()
+    yaml_candidates: set[str] = set()
+
+    api_paths = _list_mediamtx_config_path_names()
+    if api_paths is None:
+        logger.info("MediaMTX API unavailable for orphan path cleanup; checking persisted YAML only")
+    else:
+        api_orphans = {
+            path_name
+            for path_name in api_paths
+            if _is_knoxnet_camera_path_name(path_name) and path_name not in owned_paths
+        }
+        for path_name in sorted(api_orphans):
+            if _disable_and_delete_mediamtx_path(path_name, "orphan"):
+                api_removed.add(path_name)
+        yaml_candidates.update(api_orphans)
+
+    for yml in _mediamtx_yml_paths():
+        try:
+            text = yml.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to read MediaMTX config %s during orphan cleanup: %s", yml, exc)
+            continue
+
+        explicit_names = _extract_yaml_explicit_path_names(text)
+        yaml_candidates.update(
+            path_name
+            for path_name in explicit_names
+            if _is_knoxnet_camera_path_name(path_name) and path_name not in owned_paths
+        )
+
+    yaml_removed = _remove_mediamtx_paths_from_yml(yaml_candidates)
+    total_removed = api_removed | yaml_removed
+    if total_removed:
+        logger.info("Cleaned up %d orphan Knoxnet MediaMTX path(s): %s", len(total_removed), sorted(total_removed))
+    else:
+        logger.debug("No orphan Knoxnet MediaMTX paths found during startup cleanup")
+
+    return {
+        "api_removed": sorted(api_removed),
+        "yaml_removed": sorted(yaml_removed),
+        "owned_count": len(owned_paths),
+    }
+
+
+def _extract_yaml_explicit_path_names(text: str) -> set[str]:
+    names: set[str] = set()
+    in_paths = False
+    path_key_re = re.compile(r"^  ([^#:\s][^:\n]*):\s*(?:#.*)?$")
+
+    for raw_line in text.splitlines():
+        if not in_paths:
+            if re.match(r"^paths:\s*(?:#.*)?$", raw_line):
+                in_paths = True
+            continue
+
+        if raw_line.strip() and not raw_line.startswith((" ", "\t", "#")):
+            break
+
+        match = path_key_re.match(raw_line)
+        if match:
+            names.add(match.group(1).strip().strip('"\''))
+
+    return names
+
+
+def _delete_camera_mediamtx_paths(camera_id: str, camera: dict) -> None:
+    """Disable recording and remove MediaMTX paths owned by a deleted camera."""
+    for path_name in _camera_mediamtx_path_names(camera_id, camera):
+        if _is_reserved_mediamtx_path(path_name):
+            continue
+
+        _disable_and_delete_mediamtx_path(path_name, "deleted camera")
+        _remove_mediamtx_path_from_yml(path_name)
+
+
 def _toggle_recording_via_yml(
     camera_id: str,
     camera: dict,
@@ -3938,10 +4267,12 @@ def delete_camera(camera_id):
                 "message": "Camera not found"
             }), 404
 
-        # Delete from MediaMTX
-        mediamtx.delete_path(camera.get('mediamtx_path', camera_id))
-        if camera.get('mediamtx_sub_path'):
-            mediamtx.delete_path(camera['mediamtx_sub_path'])
+        # Delete from MediaMTX and persisted YAML before dropping JSON state.
+        # A failed live API delete used to leave record-enabled config paths
+        # behind, so MediaMTX could resume pulling a deleted camera on restart.
+        camera['recording'] = False
+        ensure_camera_stream_metadata(camera)
+        _delete_camera_mediamtx_paths(camera_id, camera)
 
         # Remove from database
         cameras_db = [c for c in cameras_db if c['id'] != camera_id]
@@ -6303,6 +6634,14 @@ if __name__ == '__main__':
 
     # Test MediaMTX connection on startup
     test_mediamtx_connection()
+
+    # Remove stale explicit MediaMTX path configs left behind by deleted cameras.
+    # This never touches recording files; it only disables/deletes UUID-shaped
+    # Knoxnet camera path config that is no longer present in cameras_db.
+    try:
+        cleanup_orphan_mediamtx_paths()
+    except Exception as e:
+        logger.warning("MediaMTX orphan path cleanup failed: %s", e)
 
     # Restore recording for cameras that were recording before restart, but
     # keep the persisted/UI state truthful if MediaMTX never becomes ready.
