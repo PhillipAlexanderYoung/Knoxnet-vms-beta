@@ -2473,7 +2473,8 @@ class TerminalWidget(BaseDesktopWidget):
                 self._post_error(j.get("message") or "Report failed", tool="events_report")
                 return
             data = j.get("data") or {}
-            url = data.get("report_url")
+            # Prefer HTTP URL so /api image links resolve; file:// reports show broken thumbnails.
+            url = data.get("report_http_url") or data.get("report_url")
             path = data.get("report_path")
             n = data.get("events")
             

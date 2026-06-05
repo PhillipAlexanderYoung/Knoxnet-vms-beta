@@ -1088,6 +1088,31 @@ def events_vehicle_count():
         return jsonify({'success': False, 'message': 'Failed to count vehicles'}), 500
 
 
+@api_bp.route('/events/report/view/<path:filename>', methods=['GET'])
+def events_report_view(filename: str):
+    """
+    Serve a generated HTML security report over HTTP so embedded /api image URLs resolve.
+    """
+    try:
+        from core.paths import get_data_dir
+
+        reports_dir = (get_data_dir() / "reports").resolve()
+        safe_name = Path(str(filename or "")).name
+        if not safe_name.endswith(".html"):
+            return jsonify({'success': False, 'message': 'Invalid report filename'}), 400
+        out_path = (reports_dir / safe_name).resolve()
+        try:
+            out_path.relative_to(reports_dir)
+        except Exception:
+            return jsonify({'success': False, 'message': 'Invalid report path'}), 400
+        if not out_path.exists():
+            return jsonify({'success': False, 'message': 'Report not found'}), 404
+        return send_file(str(out_path), mimetype="text/html", conditional=True)
+    except Exception:
+        logger.exception("Events report view error")
+        return jsonify({'success': False, 'message': 'Failed to serve report'}), 500
+
+
 @api_bp.route('/events/report', methods=['POST'])
 def events_report():
     """
@@ -1435,31 +1460,44 @@ def events_report():
 
         # Build a compact JSON payload and render a zoomable timeline in-browser.
         # Avoid per-event detection queries here (too slow for large days).
+        origin = (request.host_url or "http://localhost:5000").rstrip("/")
+        # Embed inline thumbnails for modest reports so file:// fallback still shows images.
+        embed_thumbs = len(hits_sorted) <= 250
         events_payload: List[Dict[str, Any]] = []
         for h in hits_sorted:
             try:
                 file_p = str(h.file_path)
                 thumb_p = str(h.thumb_path) if getattr(h, "thumb_path", None) else ""
                 eid = str(h.id)
-                events_payload.append(
-                    {
-                        "event_id": eid,
-                        "captured_ts": int(h.captured_ts or 0),
-                        "captured_at": str(h.captured_at or ""),
-                        "camera_name": str(h.camera_name or ""),
-                        "caption": str(h.caption or ""),
-                        "file_uri": _file_uri(file_p),
-                        "api_file_url": f"/api/events/file?id={eid}",
-                        "folder_uri": _file_uri(str(Path(file_p).parent)),
-                        "thumb_uri": _file_uri(thumb_p) if thumb_p else _file_uri(file_p),
-                        "api_thumb_url": f"/api/events/file?id={eid}&kind=thumb",
-                        "dominant_color": str(h.dominant_color or ""),
-                        "tags": [str(t) for t in (h.tags or [])],
-                        "detection_classes": [str(c) for c in (h.detection_classes or [])],
-                        "shape_name": str(h.shape_name or ""),
-                        "media_type": str(getattr(h, "media_type", None) or "image"),
-                    }
-                )
+                thumb_b64 = None
+                if embed_thumbs and event_index_service:
+                    thumb_b64 = (
+                        event_index_service.read_thumb_base64(thumb_p)
+                        if thumb_p
+                        else None
+                    )
+                    if not thumb_b64 and file_p:
+                        thumb_b64 = event_index_service.read_file_base64(file_p, max_bytes=240_000)
+                row: Dict[str, Any] = {
+                    "event_id": eid,
+                    "captured_ts": int(h.captured_ts or 0),
+                    "captured_at": str(h.captured_at or ""),
+                    "camera_name": str(h.camera_name or ""),
+                    "caption": str(h.caption or ""),
+                    "file_uri": _file_uri(file_p),
+                    "api_file_url": f"{origin}/api/events/file?id={eid}",
+                    "folder_uri": _file_uri(str(Path(file_p).parent)),
+                    "thumb_uri": _file_uri(thumb_p) if thumb_p else _file_uri(file_p),
+                    "api_thumb_url": f"{origin}/api/events/file?id={eid}&kind=thumb",
+                    "dominant_color": str(h.dominant_color or ""),
+                    "tags": [str(t) for t in (h.tags or [])],
+                    "detection_classes": [str(c) for c in (h.detection_classes or [])],
+                    "shape_name": str(h.shape_name or ""),
+                    "media_type": str(getattr(h, "media_type", None) or "image"),
+                }
+                if thumb_b64:
+                    row["thumb_base64"] = thumb_b64
+                events_payload.append(row)
             except Exception:
                 continue
 
@@ -1804,11 +1842,27 @@ def events_report():
     
     function normalize(e) {
       const ts = Number(e.captured_ts || 0);
+      const isFile = (window.location.protocol === 'file:');
+      const thumbFromB64 = e.thumb_base64 ? ('data:image/jpeg;base64,' + e.thumb_base64) : '';
+      let fileUri = '';
+      let thumbUri = '';
+      if (thumbFromB64) {
+        thumbUri = thumbFromB64;
+      } else if (isFile) {
+        thumbUri = e.thumb_uri || e.file_uri || '';
+      } else {
+        thumbUri = e.api_thumb_url || e.thumb_uri || e.api_file_url || e.file_uri || '';
+      }
+      if (isFile) {
+        fileUri = e.file_uri || e.thumb_uri || '';
+      } else {
+        fileUri = e.api_file_url || e.file_uri || '';
+      }
       return {
         ...e,
         captured_ts: ts,
-        file_uri: e.api_file_url || e.file_uri || '',
-        thumb_uri: e.api_thumb_url || e.thumb_uri || e.api_file_url || e.file_uri || '',
+        file_uri: fileUri,
+        thumb_uri: thumbUri,
         _date: isoDate(ts),
         _time: localTime(ts),
         _dt: localDateTime(ts),
@@ -2082,6 +2136,7 @@ def events_report():
         )
 
         out_path.write_text(html, encoding="utf-8", errors="ignore")
+        report_http_url = f"{origin}/api/events/report/view/{out_path.name}"
 
         return jsonify(
             {
@@ -2089,6 +2144,7 @@ def events_report():
                 'data': {
                     'report_path': str(out_path),
                     'report_url': out_path.resolve().as_uri(),
+                    'report_http_url': report_http_url,
                     'events': len(hits_sorted),
                 },
             }
