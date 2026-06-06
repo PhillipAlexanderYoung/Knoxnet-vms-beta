@@ -698,6 +698,7 @@ class CameraOpenGLWidget(QWidget):
     def update_frame(self, frame):
         """Receive a numpy array (OpenCV frame), convert, and render."""
         try:
+            self._current_frame = frame
             # Auto-protection paint cap takes precedence over the
             # baseline small-widget throttle.  When the load shedder
             # has set a cap, drop frames arriving above that rate.
@@ -931,7 +932,23 @@ class CameraOpenGLWidget(QWidget):
         if len(self.motion_hit_pulses) > 50:
             self.motion_hit_pulses = self.motion_hit_pulses[-50:]
         if events and self.camera_id:
-            self.shape_triggered.emit({'camera_id': self.camera_id, 'events': events})
+            trigger_mono = time.monotonic()
+            trigger_jpg = None
+            try:
+                fr = getattr(self, "_current_frame", None)
+                if fr is not None:
+                    ok, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if ok:
+                        trigger_jpg = bytes(buf)
+            except Exception:
+                trigger_jpg = None
+            self._mw_trigger_mono = trigger_mono
+            self._mw_trigger_jpg = trigger_jpg
+            self.shape_triggered.emit({
+                'camera_id': self.camera_id,
+                'events': events,
+                'trigger_mono': trigger_mono,
+            })
 
     def _process_detection_shapes(self, dets: List[dict], *, source: str = "detection"):
         """
@@ -1074,7 +1091,15 @@ class CameraOpenGLWidget(QWidget):
             last = float(getattr(self, "_detection_last_emit_ts", 0.0) or 0.0)
             if cooldown_s <= 0.0 or (now - last) >= cooldown_s:
                 self._detection_last_emit_ts = now
-                self.shape_triggered.emit({"camera_id": self.camera_id, "events": events, "source": source})
+                trigger_mono = time.monotonic()
+                self._mw_trigger_mono = trigger_mono
+                self._mw_trigger_jpg = None
+                self.shape_triggered.emit({
+                    "camera_id": self.camera_id,
+                    "events": events,
+                    "source": source,
+                    "trigger_mono": trigger_mono,
+                })
 
     def _apply_detection_roi_filter(self, dets: List[dict]) -> List[dict]:
         """
@@ -3217,8 +3242,18 @@ class MotionWatchDialog(QDialog):
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(0, 5000)
         self.delay_spin.setSuffix(" ms")
-        self.delay_spin.setValue(int(self.settings.get("trigger_delay_ms", 500)))
+        self.delay_spin.setValue(int(self.settings.get("trigger_delay_ms", 0)))
         form.addRow("Trigger delay", self.delay_spin)
+
+        self.offset_spin = QSpinBox()
+        self.offset_spin.setRange(-2000, 5000)
+        self.offset_spin.setSuffix(" ms")
+        self.offset_spin.setValue(int(self.settings.get("capture_offset_ms", 0)))
+        self.offset_spin.setToolTip(
+            "Fine-tune which buffered frame is used. Negative = slightly before the trigger "
+            "(helps align fast-moving objects with tags). Added to trigger delay."
+        )
+        form.addRow("Capture offset", self.offset_spin)
 
         self.crop_w_spin = QSpinBox()
         self.crop_w_spin.setRange(0, 3840)
@@ -3262,9 +3297,13 @@ class MotionWatchDialog(QDialog):
         form.addRow("Trigger on", filter_row)
 
         self.cooldown_spin = QSpinBox()
-        self.cooldown_spin.setRange(0, 60)
-        self.cooldown_spin.setSuffix(" s")
-        self.cooldown_spin.setValue(int(self.settings.get("cooldown_sec", 3)))
+        self.cooldown_spin.setRange(0, 60000)
+        self.cooldown_spin.setSuffix(" ms")
+        self.cooldown_spin.setSingleStep(50)
+        cooldown_ms = self.settings.get("cooldown_ms")
+        if cooldown_ms is None:
+            cooldown_ms = int(float(self.settings.get("cooldown_sec", 3) or 3) * 1000)
+        self.cooldown_spin.setValue(int(cooldown_ms))
         form.addRow("Cooldown between shots", self.cooldown_spin)
 
         # Clip Recording group
@@ -3363,6 +3402,7 @@ class MotionWatchDialog(QDialog):
             "duration_sec": duration_sec,
             "duration_unit": unit,
             "trigger_delay_ms": int(self.delay_spin.value()),
+            "capture_offset_ms": int(self.offset_spin.value()),
             "crop_w": int(self.crop_w_spin.value()),
             "crop_h": int(self.crop_h_spin.value()),
             "resize_w": int(self.resize_w_spin.value()),
@@ -3371,7 +3411,8 @@ class MotionWatchDialog(QDialog):
             "allow_zone": bool(self.zone_check.isChecked()),
             "allow_line": bool(self.line_check.isChecked()),
             "allow_tag": bool(self.tag_check.isChecked()),
-            "cooldown_sec": int(self.cooldown_spin.value()),
+            "cooldown_ms": int(self.cooldown_spin.value()),
+            "cooldown_sec": max(0, int(round(int(self.cooldown_spin.value()) / 1000.0))),
             "clip_enabled": bool(self.clip_enabled_check.isChecked()),
             "clip_duration_sec": int(self.clip_duration_spin.value()),
             "clip_pre_roll_sec": int(self.clip_pre_roll_spin.value()),
@@ -4971,7 +5012,7 @@ class CameraWidget(BaseDesktopWidget):
     _motion_watch_ingest_sem = threading.Semaphore(1)
     # Global capture throttle: if many cameras trigger at once, cap concurrent capture workers
     # so live rendering stays responsive.
-    _motion_watch_capture_sem = threading.Semaphore(2)
+    _motion_watch_capture_sem = threading.Semaphore(4)
     """
     Desktop Widget wrapper for the OpenGL Camera view.
     Connects to the shared CameraManager to fetch frames.
@@ -5120,7 +5161,8 @@ class CameraWidget(BaseDesktopWidget):
         self.motion_watch_settings = {
             "duration_sec": 30,
             "duration_unit": "Seconds",
-            "trigger_delay_ms": 500,
+            "trigger_delay_ms": 0,
+            "capture_offset_ms": 0,
             "crop_w": 0,
             "crop_h": 0,
             "resize_w": 0,
@@ -5129,6 +5171,7 @@ class CameraWidget(BaseDesktopWidget):
             "allow_zone": True,
             "allow_line": True,
             "allow_tag": True,
+            "cooldown_ms": 3000,
             "cooldown_sec": 3,
             "clip_enabled": False,
             "clip_duration_sec": 10,
@@ -5145,6 +5188,12 @@ class CameraWidget(BaseDesktopWidget):
         # image encode + disk + base64 work off the UI thread, and prevent overlapping captures.
         self._motion_watch_capture_lock = threading.Lock()
         self._motion_watch_capture_inflight = False
+        self._motion_watch_capture_queue: deque = deque(maxlen=4)
+        # Rolling snapshot buffer for trigger-aligned stills (monotonic_ts, jpg_bytes).
+        self._motion_watch_snapshot_ring: deque = deque(maxlen=90)
+        self._motion_watch_ring_lock = threading.Lock()
+        self._motion_watch_ring_fps: float = 30.0
+        self._motion_watch_ring_last_push: float = 0.0
         
         # Setup OpenGL Widget
         self.shapes_by_camera: Dict[str, List[Shape]] = {}
@@ -7752,10 +7801,14 @@ class CameraWidget(BaseDesktopWidget):
             }
             if any(allowed.get(ev.get("shape_type"), False) for ev in events):
                 now = time.time()
-                cooldown = float(self.motion_watch_settings.get("cooldown_sec", 3))
+                cooldown = self._motion_watch_cooldown_seconds()
                 if now - self.motion_watch_last_trigger >= cooldown:
                     self.motion_watch_last_trigger = now
                     delay_ms = int(self.motion_watch_settings.get("trigger_delay_ms", 0))
+                    offset_ms = int(self.motion_watch_settings.get("capture_offset_ms", 0))
+                    total_offset_ms = delay_ms + offset_ms
+                    trigger_mono = float((payload or {}).get("trigger_mono") or time.monotonic())
+                    trigger_jpg = getattr(self.gl_widget, "_mw_trigger_jpg", None)
                     motion_box = None
                     try:
                         if src in ("desktop", "backend", "detection"):
@@ -7769,18 +7822,39 @@ class CameraWidget(BaseDesktopWidget):
                     except Exception:
                         motion_box = None
 
+                    overlay_snapshot = None
+                    if bool(self.motion_watch_settings.get("include_overlays", True)):
+                        try:
+                            overlay_snapshot = self.get_overlay_snapshot()
+                        except Exception:
+                            overlay_snapshot = None
+
+                    capture_kwargs = {
+                        "motion_box": motion_box,
+                        "trigger_events": events,
+                        "trigger_source": src,
+                        "remaining_seconds": self._remaining_watch_seconds(),
+                        "trigger_mono": trigger_mono,
+                        "overlay_snapshot": overlay_snapshot,
+                    }
+
                     def do_capture():
+                        jpg = None
+                        if total_offset_ms <= 0 and trigger_jpg:
+                            jpg = trigger_jpg
+                        elif total_offset_ms != 0:
+                            jpg = self._pick_snapshot_jpg(trigger_mono, total_offset_ms)
+                        if jpg is None:
+                            jpg = trigger_jpg or self._pick_snapshot_jpg(trigger_mono, 0)
                         self._capture_motion_watch_shot_async(
-                            motion_box,
-                            trigger_events=events,
-                            trigger_source=src,
-                            remaining_seconds=self._remaining_watch_seconds(),
+                            pre_encoded_jpg=jpg,
+                            **capture_kwargs,
                         )
 
-                    if delay_ms > 0:
-                        QTimer.singleShot(delay_ms, do_capture)
+                    if total_offset_ms > 0:
+                        QTimer.singleShot(max(0, int(total_offset_ms)), do_capture)
                     else:
-                        do_capture()
+                        QTimer.singleShot(0, do_capture)
 
                     # Trigger clip recording if enabled (independent of screenshot cooldown)
                     if self.motion_watch_settings.get("clip_enabled"):
@@ -7859,6 +7933,14 @@ class CameraWidget(BaseDesktopWidget):
                     saved = data.get(self.camera_id) or data.get("default") or {}
                     if isinstance(saved, dict):
                         self.motion_watch_settings.update(saved)
+                        # Migrate legacy second-based cooldown to milliseconds.
+                        if "cooldown_ms" not in saved and "cooldown_sec" in saved:
+                            try:
+                                self.motion_watch_settings["cooldown_ms"] = int(
+                                    float(saved.get("cooldown_sec", 3) or 3) * 1000
+                                )
+                            except Exception:
+                                self.motion_watch_settings["cooldown_ms"] = 3000
         except Exception as e:
             print(f"Motion watch settings load error for {self.camera_id}: {e}")
 
@@ -8346,6 +8428,12 @@ class CameraWidget(BaseDesktopWidget):
         # Make sure a terminal is up to display countdown/images
         self._ensure_terminal_widget()
         self.motion_watch_active = True
+        try:
+            with self._motion_watch_ring_lock:
+                self._motion_watch_snapshot_ring.clear()
+            self._motion_watch_ring_last_push = 0.0
+        except Exception:
+            pass
         if duration < 0:
             self.motion_watch_end_ts = None  # infinite
         else:
@@ -8365,6 +8453,11 @@ class CameraWidget(BaseDesktopWidget):
             return
         self.motion_watch_active = False
         self.motion_watch_timer.stop()
+        try:
+            with self._motion_watch_ring_lock:
+                self._motion_watch_snapshot_ring.clear()
+        except Exception:
+            pass
         self._post_motion_watch_to_terminal(f"Motion watch {reason}", stopped=True)
 
     def _remaining_watch_seconds(self) -> Optional[int]:
@@ -8392,6 +8485,75 @@ class CameraWidget(BaseDesktopWidget):
             suppress_log=True,
         )
 
+    def _motion_watch_cooldown_seconds(self) -> float:
+        settings = self.motion_watch_settings or {}
+        ms = settings.get("cooldown_ms")
+        if ms is None:
+            ms = int(float(settings.get("cooldown_sec", 3) or 3) * 1000)
+        try:
+            return max(0.0, float(ms) / 1000.0)
+        except Exception:
+            return 3.0
+
+    def _push_motion_watch_snapshot_ring(self, frame: np.ndarray) -> None:
+        """Buffer recent frames for trigger-aligned still captures (encode off UI thread)."""
+        if not self.motion_watch_active:
+            return
+        try:
+            now = time.monotonic()
+            interval = 1.0 / max(1.0, float(self._motion_watch_ring_fps))
+            if (now - float(self._motion_watch_ring_last_push or 0.0)) < interval:
+                return
+            self._motion_watch_ring_last_push = now
+            frame_copy = frame.copy()
+        except Exception:
+            return
+
+        def _encode():
+            try:
+                ok, buf = cv2.imencode(".jpg", frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if not ok:
+                    return
+                with self._motion_watch_ring_lock:
+                    self._motion_watch_snapshot_ring.append((now, bytes(buf)))
+            except Exception:
+                pass
+
+        threading.Thread(target=_encode, daemon=True).start()
+
+    def _pick_snapshot_jpg(self, trigger_mono: float, offset_ms: int = 0) -> Optional[bytes]:
+        """Return the ring frame closest to trigger_mono + offset_ms."""
+        try:
+            target = float(trigger_mono) + (float(offset_ms) / 1000.0)
+        except Exception:
+            target = float(trigger_mono)
+        with self._motion_watch_ring_lock:
+            if not self._motion_watch_snapshot_ring:
+                return None
+            ts, jpg = min(self._motion_watch_snapshot_ring, key=lambda item: abs(item[0] - target))
+            return jpg
+
+    @staticmethod
+    def _qimage_from_jpg_bytes(jpg_bytes: bytes) -> Optional[QImage]:
+        try:
+            arr = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if arr is None:
+                return None
+            h, w, ch = arr.shape
+            return QImage(arr.data, w, h, ch * w, QImage.Format.Format_BGR888).copy()
+        except Exception:
+            return None
+
+    def _dispatch_next_motion_watch_capture(self) -> None:
+        try:
+            with self._motion_watch_capture_lock:
+                if self._motion_watch_capture_inflight or not self._motion_watch_capture_queue:
+                    return
+                pending = self._motion_watch_capture_queue.popleft()
+            self._capture_motion_watch_shot_async(**pending)
+        except Exception:
+            pass
+
     def _capture_motion_watch_shot_async(
         self,
         motion_box: Optional[Tuple[int, int, int, int]] = None,
@@ -8399,26 +8561,43 @@ class CameraWidget(BaseDesktopWidget):
         trigger_events: Optional[List[dict]] = None,
         trigger_source: Optional[str] = None,
         remaining_seconds: Optional[int] = None,
+        pre_encoded_jpg: Optional[bytes] = None,
+        trigger_mono: Optional[float] = None,
+        overlay_snapshot: Optional[dict] = None,
     ) -> None:
         """
         Capture a motion-watch screenshot without blocking the UI thread.
 
-        Important: We only grab a copy of the latest frame on the UI thread. Everything else
-        (overlay drawing, crop/resize, JPG encode, disk write, base64, sidecar/ingest) runs in a
-        background worker.
+        When pre_encoded_jpg is supplied (trigger-aligned frame from the snapshot ring or
+        trigger-time encode), the UI thread avoids copying the live GL framebuffer.
         """
+        capture_request = {
+            "motion_box": motion_box,
+            "trigger_events": trigger_events,
+            "trigger_source": trigger_source,
+            "remaining_seconds": remaining_seconds,
+            "pre_encoded_jpg": pre_encoded_jpg,
+            "trigger_mono": trigger_mono,
+            "overlay_snapshot": overlay_snapshot,
+        }
         try:
             acquired_global_capture = False
             with self._motion_watch_capture_lock:
                 if self._motion_watch_capture_inflight:
+                    try:
+                        self._motion_watch_capture_queue.append(capture_request)
+                    except Exception:
+                        pass
                     return
                 self._motion_watch_capture_inflight = True
-            # Cross-camera throttle. If the system is already busy with other capture workers,
-            # skip this trigger rather than stalling all live feeds.
             acquired_global_capture = CameraWidget._motion_watch_capture_sem.acquire(blocking=False)
             if not acquired_global_capture:
                 with self._motion_watch_capture_lock:
                     self._motion_watch_capture_inflight = False
+                    try:
+                        self._motion_watch_capture_queue.append(capture_request)
+                    except Exception:
+                        pass
                 return
 
             settings = dict(self.motion_watch_settings or {})
@@ -8427,21 +8606,18 @@ class CameraWidget(BaseDesktopWidget):
             local_enrich = bool(settings.get("local_enrich", False))
             persist_overlay_snapshot = bool(settings.get("persist_overlay_snapshot", False))
 
-            # Prefer the raw frame buffer (no GPU readback). If overlays are requested, we paint
-            # them onto the frame in the worker using a snapshot of current overlay state.
             frame_img: Optional[QImage] = None
-            overlay_snapshot: Optional[dict] = None
-            if self.gl_widget.image and not self.gl_widget.image.isNull():
+            if pre_encoded_jpg:
+                frame_img = self._qimage_from_jpg_bytes(pre_encoded_jpg)
+            elif self.gl_widget.image and not self.gl_widget.image.isNull():
                 frame_img = self.gl_widget.image.copy()
-                if include_overlays:
+                if include_overlays and overlay_snapshot is None:
                     overlay_snapshot = self.get_overlay_snapshot() or None
             else:
-                # Fallback: last resort capture from the GL widget.
                 if include_overlays and not non_blocking:
                     frame_img = self.gl_widget.grabFramebuffer()
                     overlay_snapshot = None
                 else:
-                    # In non-blocking mode, skip capture rather than forcing a GPU readback.
                     with self._motion_watch_capture_lock:
                         self._motion_watch_capture_inflight = False
                     if acquired_global_capture:
@@ -8449,6 +8625,7 @@ class CameraWidget(BaseDesktopWidget):
                             CameraWidget._motion_watch_capture_sem.release()
                         except Exception:
                             pass
+                    QTimer.singleShot(0, self._dispatch_next_motion_watch_capture)
                     return
 
             if not frame_img or frame_img.isNull():
@@ -8459,7 +8636,14 @@ class CameraWidget(BaseDesktopWidget):
                         CameraWidget._motion_watch_capture_sem.release()
                     except Exception:
                         pass
+                QTimer.singleShot(0, self._dispatch_next_motion_watch_capture)
                 return
+
+            if include_overlays and overlay_snapshot is None:
+                try:
+                    overlay_snapshot = self.get_overlay_snapshot() or None
+                except Exception:
+                    overlay_snapshot = None
 
             camera_id = self.camera_id
             camera_label = self._camera_label()
@@ -8707,6 +8891,7 @@ class CameraWidget(BaseDesktopWidget):
                             CameraWidget._motion_watch_capture_sem.release()
                         except Exception:
                             pass
+                    QTimer.singleShot(0, self._dispatch_next_motion_watch_capture)
 
             threading.Thread(target=_worker, args=(frame_img,), daemon=True).start()
         except Exception as e:
@@ -8718,6 +8903,7 @@ class CameraWidget(BaseDesktopWidget):
                     CameraWidget._motion_watch_capture_sem.release()
             except Exception:
                 pass
+            QTimer.singleShot(0, self._dispatch_next_motion_watch_capture)
 
     # ------------------------------------------------------------------
     # Clip recording: pre-roll drain, live accumulation, MP4 encode
@@ -11219,24 +11405,38 @@ class CameraWidget(BaseDesktopWidget):
                 self.offline_label.hide()
             if self.loading_label.isVisible():
                 self._stop_loading()
+            if self.motion_watch_active:
+                self._push_motion_watch_snapshot_ring(frame)
             self.gl_widget.update_frame(frame)
 
-            # Feed clip ring buffer when clip recording is enabled
+            # Feed clip ring buffer when clip recording is enabled (encode off UI thread).
             try:
                 if self.motion_watch_settings.get("clip_enabled"):
                     now = time.time()
                     interval = 1.0 / max(1.0, self._clip_ring_fps)
                     if now - self._clip_ring_last_push >= interval:
                         self._clip_ring_last_push = now
-                        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                        if ok:
-                            self._clip_frame_ring.append((now, bytes(jpg)))
-                        # If actively recording a clip, also push to the record buffer
-                        if self._clip_recording and self._clip_record_buf is not None:
-                            if now < self._clip_record_deadline:
-                                self._clip_record_buf.append((now, bytes(jpg) if ok else None))
-                            else:
-                                self._finalize_clip_recording()
+                        frame_copy = frame.copy()
+                        clip_recording = bool(self._clip_recording)
+                        clip_deadline = float(self._clip_record_deadline or 0.0)
+
+                        def _clip_ring_push():
+                            try:
+                                ok, jpg = cv2.imencode(".jpg", frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                                if not ok:
+                                    return
+                                jpg_bytes = bytes(jpg)
+                                self._clip_frame_ring.append((now, jpg_bytes))
+                                with self._clip_record_lock:
+                                    if clip_recording and self._clip_record_buf is not None:
+                                        if now < clip_deadline:
+                                            self._clip_record_buf.append((now, jpg_bytes))
+                                        else:
+                                            self._finalize_clip_recording()
+                            except Exception:
+                                pass
+
+                        threading.Thread(target=_clip_ring_push, daemon=True).start()
             except Exception:
                 pass
 
