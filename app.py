@@ -4448,18 +4448,18 @@ def get_camera_snapshot(camera_id):
         return jsonify({'success': False, 'message': 'Camera not found'}), 404
     
     try:
-        from PIL import Image, ImageDraw, ImageFont
         import io
         import time
-        
+
         # Prefer the stream server's latest frame if available. This avoids slow/unreliable
         # per-request RTSP opens (which often fall back to a gray status image).
         try:
-            if stream_server and camera.get('rtsp_url'):
+            ss = globals().get('STREAM_SERVER_GLOBAL')
+            if ss and camera.get('rtsp_url'):
                 # Start stream on-demand if needed
-                if hasattr(stream_server, 'active_streams') and camera_id not in stream_server.active_streams:
+                if hasattr(ss, 'active_streams') and camera_id not in ss.active_streams:
                     try:
-                        _run_coro_safe(stream_server.start_stream(camera_id, {
+                        _run_coro_safe(ss.start_stream(camera_id, {
                             'rtsp_url': camera.get('rtsp_url'),
                             'webrtc_enabled': False,
                             'fps': 15
@@ -4469,7 +4469,7 @@ def get_camera_snapshot(camera_id):
                     except Exception as e:
                         logger.warning(f"Failed to start stream_server stream for snapshot: {e}")
 
-                frame_bytes = stream_server.get_frame(camera_id)
+                frame_bytes = ss.get_frame(camera_id)
                 if frame_bytes:
                     img_io = io.BytesIO(frame_bytes)
                     img_io.seek(0)
@@ -4477,7 +4477,15 @@ def get_camera_snapshot(camera_id):
                     return send_file(img_io, mimetype='image/jpeg')
         except Exception as e:
             logger.warning(f"stream_server snapshot failed for camera {camera_id}: {e}")
-        
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            return jsonify({
+                'success': False,
+                'message': 'Snapshot unavailable (stream not ready and PIL not installed)',
+            }), 503
+
         # Fallback: Create a status image showing camera info
         width, height = 800, 600
         image = Image.new('RGB', (width, height), color='#2a2a2a')
@@ -7401,6 +7409,16 @@ if __name__ == '__main__':
     else:
         logger.warning("⚠️ Using basic API endpoints only")
 
+    # MediaMTX /proxy routes are required for WHEP/HLS even when the full API blueprint is unavailable.
+    if not API_ROUTES_AVAILABLE:
+        try:
+            from api.proxy_routes import proxy_bp
+
+            app.register_blueprint(proxy_bp)
+            logger.info("✅ Proxy routes registered (basic mode)")
+        except Exception as e:
+            logger.error(f"❌ Failed to register proxy routes in basic mode: {e}")
+
     # Fallback motion routes (ensure production-ready motion control even if blueprint fails)
     try:
         def _has_rule(path: str) -> bool:
@@ -7411,6 +7429,65 @@ if __name__ == '__main__':
             except Exception:
                 pass
             return False
+
+        # MJPEG fallback for Knoxnet Security Post portal when the full API blueprint is unavailable.
+        if not _has_rule('/api/cameras/<camera_id>/stream/mjpeg'):
+            @app.route('/api/cameras/<camera_id>/stream/mjpeg', methods=['GET'])
+            def _basic_mjpeg_stream(camera_id):
+                """Serve MJPEG from StreamServer when available, else poll snapshot frames."""
+                import time
+                from flask import Response, request as flask_request
+
+                camera = resolve_camera_ref(camera_id)
+                if not camera:
+                    return jsonify({'success': False, 'message': 'Camera not found'}), 404
+
+                stream_tier = str(flask_request.args.get('stream') or 'sub').strip().lower()
+                sub_rtsp = str(camera.get('substream_rtsp_url') or '').strip()
+                use_sub = stream_tier != 'main' and bool(sub_rtsp)
+                active_rtsp = sub_rtsp if use_sub else camera.get('rtsp_url')
+                stream_key = f"{camera.get('id') or camera_id}:{'sub' if use_sub else 'main'}"
+
+                ss = globals().get('STREAM_SERVER_GLOBAL')
+
+                def _frame_bytes() -> Optional[bytes]:
+                    if ss and active_rtsp:
+                        try:
+                            if hasattr(ss, 'active_streams') and stream_key not in ss.active_streams:
+                                _run_coro_safe(ss.start_stream(stream_key, {
+                                    'rtsp_url': active_rtsp,
+                                    'webrtc_enabled': False,
+                                    'fps': 10,
+                                }))
+                                time.sleep(0.2)
+                            return ss.get_frame(stream_key)
+                        except Exception:
+                            return None
+                    return None
+
+                def generate():
+                    boundary = b'frame'
+                    while True:
+                        frame = _frame_bytes()
+                        if not frame:
+                            with app.test_request_context():
+                                snap_resp = get_camera_snapshot(camera.get('id') or camera_id)
+                            if hasattr(snap_resp, 'get_data'):
+                                frame = snap_resp.get_data()
+                            elif isinstance(snap_resp, tuple):
+                                body = snap_resp[0]
+                                frame = body.get_data() if hasattr(body, 'get_data') else None
+                        if frame:
+                            yield (
+                                b'--' + boundary + b'\r\n'
+                                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
+                            )
+                        time.sleep(0.25)
+
+                return Response(
+                    generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame',
+                )
 
         # Enable motion (fallback)
         if not _has_rule('/api/cameras/<camera_id>/motion/enable'):

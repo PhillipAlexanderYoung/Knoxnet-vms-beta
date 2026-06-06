@@ -3376,6 +3376,85 @@ def events_reindex():
 
 # ==================== RECORDING PLAYBACK HELPERS ====================
 
+_RECORDING_FALLBACK_DURATION_S = 600
+
+
+def _recording_safe_name(name: str) -> str:
+    """Match the recording directory sanitizer used when MediaMTX recordPath is built."""
+    s = str(name or "").strip()
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', s)
+    s = s.rstrip('. ')
+    if s.startswith('.'):
+        s = '_' + s[1:]
+    return s[:120] or "unknown"
+
+
+def _recording_dir_candidates(rec_base, camera_id: str, cam: Optional[Dict[str, Any]] = None):
+    from pathlib import Path
+
+    names = []
+    for value in (
+        camera_id,
+        _recording_safe_name(camera_id),
+        cam.get("name") if cam else None,
+        _recording_safe_name(cam.get("name")) if cam else None,
+        cam.get("mediamtx_path") if cam else None,
+        _recording_safe_name(cam.get("mediamtx_path")) if cam else None,
+    ):
+        if value and value not in names:
+            names.append(value)
+
+    bases = [rec_base]
+    custom = (cam.get("recording_dir") or "").strip() if cam else ""
+    if custom:
+        bases.append(Path(custom).expanduser().resolve())
+
+    out = []
+    seen = set()
+    for base in bases:
+        for name in names:
+            path = base / name
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                out.append(path)
+    return out
+
+
+def _recording_segment_start_ts(path) -> Optional[int]:
+    """Parse MediaMTX recording names: YYYY-MM-DD/HH-MM-SS-ffffff_path.mp4 or legacy flat names."""
+    from datetime import datetime as _dt
+
+    stem = path.stem
+    # New recordPath appends _%path after the time; strip it without losing microseconds.
+    time_part = stem
+    m = re.match(r"^(\d{2}-\d{2}-\d{2}(?:-\d{1,6})?)", stem)
+    if m:
+        time_part = m.group(1)
+
+    attempts = [
+        (f"{path.parent.name} {time_part}", "%Y-%m-%d %H-%M-%S-%f"),
+        (f"{path.parent.name} {time_part}", "%Y-%m-%d %H-%M-%S"),
+        (stem, "%Y-%m-%d_%H-%M-%S-%f"),
+        (stem, "%Y-%m-%d_%H-%M-%S"),
+    ]
+    for text, fmt in attempts:
+        try:
+            return int(_dt.strptime(text, fmt).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def _recording_segment_duration(seg, next_start: Optional[int] = None) -> int:
+    start_ts = int(seg.get("start_ts") or 0)
+    if next_start and next_start > start_ts:
+        return max(1, min(_RECORDING_FALLBACK_DURATION_S, int(next_start - start_ts)))
+    mtime = int(seg.get("mtime") or 0)
+    if start_ts and mtime > start_ts:
+        return max(1, min(_RECORDING_FALLBACK_DURATION_S, int(mtime - start_ts)))
+    return _RECORDING_FALLBACK_DURATION_S
+
 
 @api_bp.route('/recordings/extract-clip', methods=['POST'])
 def recordings_extract_clip():
@@ -3426,48 +3505,37 @@ def recordings_extract_clip():
 
     from core.paths import get_recordings_dir
     rec_base = get_recordings_dir()
-    rec_dir = rec_base / camera_id
-    # Also try camera-name directory (new naming scheme)
-    if not rec_dir.exists():
-        try:
-            from app import cameras_db
-            import re as _re
-            cam = next((c for c in cameras_db if c.get('id') == camera_id), None)
-            if cam:
-                safe = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', cam.get('name', '')).strip('. ')[:120]
-                if safe:
-                    alt = rec_base / safe
-                    if alt.exists():
-                        rec_dir = alt
-                custom = (cam.get('recording_dir') or '').strip()
-                if custom and not rec_dir.exists():
-                    from pathlib import Path
-                    alt2 = Path(custom).expanduser().resolve() / (safe or camera_id)
-                    if alt2.exists():
-                        rec_dir = alt2
-        except Exception:
-            pass
-    if not rec_dir.exists():
+    cam = None
+    try:
+        from app import cameras_db
+        cam = next((c for c in cameras_db if c.get('id') == camera_id), None)
+    except Exception:
+        pass
+
+    rec_dir = next((d for d in _recording_dir_candidates(rec_base, camera_id, cam) if d.exists()), None)
+    if not rec_dir:
         return jsonify({"success": False, "message": f"No recordings found for {camera_id}"}), 404
 
     from datetime import datetime as _dt, timezone as _tz
     target_dt = _dt.fromtimestamp(start_ts, tz=_tz.utc)
 
-    segments = sorted(rec_dir.rglob("*.mp4"))
+    segments = sorted(rec_dir.rglob("*.mp4"), key=lambda p: _recording_segment_start_ts(p) or p.stat().st_mtime)
     if not segments:
         return jsonify({"success": False, "message": "No recording segments found"}), 404
 
     best = None
+    best_start = 0
     for seg in segments:
-        try:
-            name = seg.stem
-            seg_dt = _dt.strptime(name[:19], "%Y-%m-%d_%H-%M-%S").replace(tzinfo=_tz.utc)
-            if seg_dt <= target_dt:
-                best = seg
-        except Exception:
+        seg_start = _recording_segment_start_ts(seg)
+        if not seg_start:
             continue
+        seg_dt = _dt.fromtimestamp(seg_start, tz=_tz.utc)
+        if seg_dt <= target_dt:
+            best = seg
+            best_start = seg_start
     if best is None:
         best = segments[0]
+        best_start = _recording_segment_start_ts(best) or start_ts
 
     import subprocess, tempfile, shutil
     ffmpeg = shutil.which("ffmpeg")
@@ -3475,7 +3543,7 @@ def recordings_extract_clip():
         return jsonify({"success": False, "message": "ffmpeg not found on system"}), 500
 
     out_file = Path(tempfile.mktemp(suffix=".mp4", prefix="knoxnet_clip_"))
-    offset_s = max(0, start_ts - int(best.stem[:19].replace("-", "").replace("_", "")[:14] if len(best.stem) >= 19 else "0") if False else 0)
+    offset_s = max(0, start_ts - int(best_start or start_ts))
 
     cmd = [
         ffmpeg, "-y",
@@ -3524,23 +3592,7 @@ def recordings_list():
     except Exception:
         pass
 
-    search_dirs = []
-    # UUID-based dir (legacy)
-    search_dirs.append(rec_base / camera_id)
-    # Camera-name dir (new naming)
-    if cam:
-        import re
-        cam_name = cam.get('name', '')
-        if cam_name:
-            safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', cam_name).strip('. ')[:120]
-            if safe:
-                search_dirs.append(rec_base / safe)
-        custom = (cam.get('recording_dir') or '').strip()
-        if custom:
-            from pathlib import Path
-            custom_base = Path(custom).expanduser().resolve()
-            if safe:
-                search_dirs.append(custom_base / safe)
+    search_dirs = _recording_dir_candidates(rec_base, camera_id, cam)
 
     segments = []
     seen_paths: set = set()
@@ -3556,16 +3608,21 @@ def recordings_list():
             try:
                 st = seg.stat()
                 rel = seg.relative_to(rec_dir)
+                start_ts = _recording_segment_start_ts(seg)
                 segments.append({
                     "name": str(rel),
                     "path": str(seg),
                     "size_mb": round(st.st_size / (1 << 20), 2),
                     "mtime": int(st.st_mtime),
+                    "start_ts": start_ts,
                 })
             except (OSError, ValueError):
                 continue
 
-    segments.sort(key=lambda s: s.get("mtime", 0))
+    segments.sort(key=lambda s: s.get("start_ts") or s.get("mtime", 0))
+    for idx, seg in enumerate(segments):
+        next_start = segments[idx + 1].get("start_ts") if idx + 1 < len(segments) else None
+        seg["duration_seconds"] = _recording_segment_duration(seg, next_start)
     return jsonify({"success": True, "data": segments})
 
 

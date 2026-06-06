@@ -70,6 +70,151 @@ BBOX_COLOR_CHOICES: List[Tuple[str, str]] = [
     ("Black", "#000000"),
 ]
 
+# Shape overlay presets (zones/lines/tags) — hex list used by the VNC-safe picker.
+SHAPE_COLOR_PRESETS: List[Tuple[str, str]] = list(BBOX_COLOR_CHOICES) + [
+    (hx.upper(), hx)
+    for hx in ZONE_COLORS
+    if str(hx or "").lower() not in {h.lower() for _, h in BBOX_COLOR_CHOICES}
+]
+
+
+def show_vnc_safe_color_picker(
+    parent: QWidget,
+    anchor: QWidget,
+    initial: QColor,
+    title: str,
+    on_color_selected,
+    presets: Optional[List[Tuple[str, str]]] = None,
+) -> None:
+    """
+    Show a preset color menu plus a non-native Qt color dialog.
+
+    Native QColorDialog.getColor() often fails or appears behind Tool/StayOnTop
+    parents on Linux headless/VNC setups — motion/detection pickers already avoid
+    that path; shape settings use this helper too.
+    """
+    from PySide6.QtGui import QAction, QPixmap, QIcon
+    from PySide6.QtWidgets import QMenu
+    from PySide6.QtCore import QPoint
+
+    base = initial if isinstance(initial, QColor) else QColor(str(initial or ""))
+    if not base.isValid():
+        base = QColor("#24D1FF")
+    cur_hex = base.name().lower()
+    preset_list = presets or SHAPE_COLOR_PRESETS
+
+    def _apply(col: QColor) -> None:
+        try:
+            if col and col.isValid():
+                on_color_selected(QColor(col))
+        except Exception:
+            pass
+
+    def _open_custom_dialog() -> None:
+        try:
+            dlg = QColorDialog(QColor(base), parent)
+            dlg.setWindowTitle(title)
+            dlg.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+            try:
+                dlg.setOption(QColorDialog.ColorDialogOption.NoButtons, True)
+                dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+            except Exception:
+                pass
+
+            holder = parent
+            setattr(holder, "_vnc_color_picker_dlg", dlg)
+            close_timer = QTimer(dlg)
+            close_timer.setSingleShot(True)
+            setattr(holder, "_vnc_color_picker_close_timer", close_timer)
+
+            def _on_change(col: QColor) -> None:
+                _apply(col)
+                try:
+                    close_timer.start(350)
+                except Exception:
+                    pass
+
+            def _on_finished(_code: int = 0) -> None:
+                try:
+                    close_timer.stop()
+                except Exception:
+                    pass
+                try:
+                    setattr(holder, "_vnc_color_picker_dlg", None)
+                except Exception:
+                    pass
+
+            dlg.currentColorChanged.connect(_on_change)
+            dlg.finished.connect(_on_finished)
+            dlg.open()
+        except Exception as exc:
+            print(f"Color picker error ({title}): {exc}")
+            try:
+                col = QColorDialog.getColor(base, parent, title)
+                if col.isValid():
+                    _apply(col)
+            except Exception:
+                pass
+
+    try:
+        old_menu = getattr(parent, "_vnc_color_picker_menu", None)
+        if old_menu is not None:
+            old_menu.close()
+            old_menu.deleteLater()
+    except Exception:
+        pass
+
+    try:
+        menu = QMenu(parent)
+        setattr(parent, "_vnc_color_picker_menu", menu)
+        menu.aboutToHide.connect(lambda: setattr(parent, "_vnc_color_picker_menu", None))
+
+        for label, hx in preset_list:
+            h = str(hx or "").strip()
+            if not h:
+                continue
+            c = QColor(h)
+            if not c.isValid():
+                continue
+            px = QPixmap(14, 14)
+            px.fill(c)
+            is_sel = cur_hex == h.lower()
+            text = f"✓ {label}" if is_sel else str(label)
+            act = QAction(QIcon(px), text, menu)
+
+            def _pick(_checked=False, col=c, m=menu):
+                try:
+                    m.close()
+                except Exception:
+                    pass
+                _apply(QColor(col))
+
+            act.triggered.connect(_pick)
+            menu.addAction(act)
+
+        menu.addSeparator()
+        custom = QAction("Custom…", menu)
+
+        def _custom(_checked=False, m=menu):
+            try:
+                m.close()
+            except Exception:
+                pass
+            _open_custom_dialog()
+
+        custom.triggered.connect(_custom)
+        menu.addAction(custom)
+
+        try:
+            pt = anchor.mapToGlobal(QPoint(0, anchor.height()))
+            menu.popup(pt)
+        except Exception:
+            menu.exec()
+    except Exception as exc:
+        print(f"Color preset menu error ({title}): {exc}")
+        _open_custom_dialog()
+
+
 def _sanitize_zone_dirname(name: str) -> str:
     """Sanitize a shape/zone name for use as a filesystem directory name."""
     s = str(name or "").strip()
@@ -3174,10 +3319,13 @@ class TrackedObjectSettingsDialog(QDialog):
 
     def _pick_color(self):
         base = self._color if (self._color and self._color.isValid()) else QColor(0, 255, 255)
-        c = QColorDialog.getColor(base, self, "Select Track Color")
-        if c.isValid():
-            self._color = c
-            self._refresh_color_button()
+        show_vnc_safe_color_picker(
+            self,
+            self.color_btn,
+            base,
+            "Select Track Color",
+            lambda c: (setattr(self, "_color", c), self._refresh_color_button()),
+        )
 
     def _on_save(self):
         name = str(self.name_edit.text() or "").strip()
@@ -3464,6 +3612,8 @@ class ShapeSettingsDialog(QDialog):
         self.color_btn = QPushButton()
         self.color_btn.setFixedHeight(25)
         self.color = QColor(self.shape.get('color', '#24D1FF'))
+        if not self.color.isValid():
+            self.color = QColor('#24D1FF')
         self.color_btn.setStyleSheet(f"background-color: {self.color.name()}; border: 1px solid #555;")
         self.color_btn.clicked.connect(self._pick_color)
         layout.addRow("Color:", self.color_btn)
@@ -3520,6 +3670,8 @@ class ShapeSettingsDialog(QDialog):
             self.text_color_btn.setFixedHeight(25)
             text_val = self.shape.get('text_color') or '#F0F0F0'
             self.text_color = QColor(text_val)
+            if not self.text_color.isValid():
+                self.text_color = QColor('#F0F0F0')
             self.text_color_btn.setStyleSheet(f"background-color: {self.text_color.name()}; border: 1px solid #555;")
             self.text_color_btn.clicked.connect(self._pick_text_color)
             layout.addRow("Text Color:", self.text_color_btn)
@@ -3533,6 +3685,8 @@ class ShapeSettingsDialog(QDialog):
         default_int = '#FFD74A' if self.shape.get('kind') != 'tag' else '#00FFC6'
         int_val = self.shape.get('interaction_color') or default_int
         self.int_color = QColor(int_val)
+        if not self.int_color.isValid():
+            self.int_color = QColor(default_int if QColor(default_int).isValid() else '#FFD74A')
         self.int_color_btn.setStyleSheet(f"background-color: {self.int_color.name()}; border: 1px solid #555;")
         self.int_color_btn.clicked.connect(self._pick_int_color)
         layout.addRow("Interaction Color:", self.int_color_btn)
@@ -3632,26 +3786,47 @@ class ShapeSettingsDialog(QDialog):
     def _update_alpha(self, val):
         self.shape['alpha'] = val / 100.0
 
+    def _apply_color_to_btn(self, c: QColor, btn: QPushButton) -> None:
+        btn.setStyleSheet(f"background-color: {c.name()}; border: 1px solid #555;")
+
     def _pick_color(self):
-        c = QColorDialog.getColor(self.color, self, "Select Shape Color")
-        if c.isValid():
-            self.color = c
-            self.shape['color'] = c.name()
-            self.color_btn.setStyleSheet(f"background-color: {c.name()}; border: 1px solid #555;")
+        show_vnc_safe_color_picker(
+            self,
+            self.color_btn,
+            self.color,
+            "Select Shape Color",
+            lambda c: (
+                setattr(self, "color", c),
+                self.shape.__setitem__("color", c.name()),
+                self._apply_color_to_btn(c, self.color_btn),
+            ),
+        )
 
     def _pick_int_color(self):
-        c = QColorDialog.getColor(self.int_color, self, "Select Interaction Color")
-        if c.isValid():
-            self.int_color = c
-            self.shape['interaction_color'] = c.name()
-            self.int_color_btn.setStyleSheet(f"background-color: {c.name()}; border: 1px solid #555;")
+        show_vnc_safe_color_picker(
+            self,
+            self.int_color_btn,
+            self.int_color,
+            "Select Interaction Color",
+            lambda c: (
+                setattr(self, "int_color", c),
+                self.shape.__setitem__("interaction_color", c.name()),
+                self._apply_color_to_btn(c, self.int_color_btn),
+            ),
+        )
 
     def _pick_text_color(self):
-        c = QColorDialog.getColor(self.text_color, self, "Select Text Color")
-        if c.isValid():
-            self.text_color = c
-            self.shape['text_color'] = c.name()
-            self.text_color_btn.setStyleSheet(f"background-color: {c.name()}; border: 1px solid #555;")
+        show_vnc_safe_color_picker(
+            self,
+            self.text_color_btn,
+            self.text_color,
+            "Select Text Color",
+            lambda c: (
+                setattr(self, "text_color", c),
+                self.shape.__setitem__("text_color", c.name()),
+                self._apply_color_to_btn(c, self.text_color_btn),
+            ),
+        )
 
     def get_shape(self):
         return self.shape

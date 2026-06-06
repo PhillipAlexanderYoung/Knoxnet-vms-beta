@@ -4745,6 +4745,14 @@ class KnoxnetDesktopApp(QApplication):
                 "exit_on_emergency_after_sec": 60,
                 "show_overlay": True,
             },
+            # Knoxnet Security Post customer portal
+            "security_post": {
+                "enabled": False,
+                "wifi_enabled": False,
+                "wifi_ssid": "KNOXNET_SECURITY_POST",
+                "portal_host": "post.knoxnetvms.com",
+                "portal_domain": "knoxnetvms.com",
+            },
         }
 
         # Best-effort migrate legacy prefsX if desktop_prefs.json doesn't exist yet.
@@ -4803,6 +4811,13 @@ class KnoxnetDesktopApp(QApplication):
             for k, v in ap_defaults.items():
                 ap.setdefault(k, v)
             merged["auto_protect"] = ap
+            sp = merged.get("security_post")
+            if not isinstance(sp, dict):
+                sp = {}
+            sp_defaults = defaults.get("security_post", {}) if isinstance(defaults.get("security_post"), dict) else {}
+            for k, v in sp_defaults.items():
+                sp.setdefault(k, v)
+            merged["security_post"] = sp
             return merged
         except Exception as e:
             logger.warning(f"Failed to load desktop prefs: {e}")

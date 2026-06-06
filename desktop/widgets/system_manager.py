@@ -207,6 +207,20 @@ def _llm_entrypoint() -> str:
     return "services/llm_local/start_service.sh"
 
 
+def _security_post_hooks():
+    from extensions.security_post.integration import beta_hooks
+
+    return beta_hooks
+
+
+def _security_post_entrypoint() -> str:
+    return _security_post_hooks().optional_service_entrypoint()
+
+
+def _security_post_health_url() -> str:
+    return _security_post_hooks().health_url()
+
+
 def _default_state_dir() -> Path:
     """
     Per-user writable state directory.
@@ -662,6 +676,9 @@ class SystemManagerDialog(QDialog):
         self._disk_protect_chk.toggled.connect(self._on_disk_protect_toggled)
         self._on_disk_protect_toggled(self._disk_protect_chk.isChecked())
 
+        # ── Knoxnet Security Post portal ──
+        self._build_security_post_panel(root)
+
         # ── Optional Services (collapsed by default) ──
         opt_box = QGroupBox("Optional Services")
         opt_g = QGridLayout(opt_box)
@@ -670,6 +687,7 @@ class SystemManagerDialog(QDialog):
         optional_services = [
             ("Local Vision", "http://localhost:8101/health", _vision_entrypoint()),
             ("Local LLM",    "http://localhost:8102/health", _llm_entrypoint()),
+            ("Knoxnet Security Post", _security_post_health_url(), _security_post_entrypoint()),
         ]
 
         for row, (name, health_url, entry_point) in enumerate(optional_services):
@@ -1413,6 +1431,89 @@ class SystemManagerDialog(QDialog):
         self.health_lbl.setText("  ·  ".join(parts) if parts else "")
 
     # ----------------------------------------------------------------
+    # Knoxnet Security Post panel
+    # ----------------------------------------------------------------
+
+    def _build_security_post_panel(self, root):
+        box = QGroupBox("Knoxnet Security Post")
+        box.setToolTip(
+            "Knoxnet Security Post customer portal sidecar (port 8090). "
+            "Configure portal access and operator PIN; start the service under Optional Services."
+        )
+        form = QFormLayout(box)
+
+        prefs = self._load_prefs()
+        sp = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
+
+        self._sp_enabled_chk = QCheckBox("Enable Knoxnet Security Post portal")
+        self._sp_enabled_chk.setChecked(bool(sp.get("enabled", False)))
+        form.addRow("", self._sp_enabled_chk)
+
+        self._sp_wifi_enabled_chk = QCheckBox("Customer WiFi/AP configured on this box")
+        self._sp_wifi_enabled_chk.setChecked(bool(sp.get("wifi_enabled", False)))
+        form.addRow("", self._sp_wifi_enabled_chk)
+
+        self._sp_wifi_ssid_edit = QLineEdit(str(sp.get("wifi_ssid") or "KNOXNET_SECURITY_POST"))
+        self._sp_wifi_ssid_edit.setPlaceholderText("Customer WiFi SSID")
+        form.addRow("WiFi SSID:", self._sp_wifi_ssid_edit)
+
+        self._sp_portal_host_edit = QLineEdit(str(sp.get("portal_host") or "post.knoxnetvms.com"))
+        self._sp_portal_host_edit.setPlaceholderText("post.knoxnetvms.com")
+        form.addRow("Portal host:", self._sp_portal_host_edit)
+
+        self._sp_portal_domain_edit = QLineEdit(str(sp.get("portal_domain") or "knoxnetvms.com"))
+        self._sp_portal_domain_edit.setPlaceholderText("knoxnetvms.com")
+        form.addRow("Portal domain:", self._sp_portal_domain_edit)
+
+        wifi_note = QLabel("WPA passphrase and firewall rules are applied from the WiFi templates on the AP host; they are not exposed to customer devices.")
+        wifi_note.setWordWrap(True)
+        form.addRow("", wifi_note)
+
+        self._sp_pin_edit = QLineEdit()
+        self._sp_pin_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._sp_pin_edit.setPlaceholderText("Set / change operator PIN")
+        form.addRow("Operator PIN:", self._sp_pin_edit)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.setFixedWidth(70)
+        save_btn.clicked.connect(self._save_security_post_settings)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        form.addRow("", btn_row)
+
+        root.addWidget(box)
+
+    def _save_security_post_settings(self):
+        prefs = self._load_prefs()
+        if not isinstance(prefs, dict):
+            prefs = {}
+        sp = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
+        sp["enabled"] = bool(self._sp_enabled_chk.isChecked())
+        sp["wifi_enabled"] = bool(self._sp_wifi_enabled_chk.isChecked())
+        sp["wifi_ssid"] = self._sp_wifi_ssid_edit.text().strip() or "KNOXNET_SECURITY_POST"
+        sp["portal_host"] = self._sp_portal_host_edit.text().strip().lower() or "post.knoxnetvms.com"
+        sp["portal_domain"] = self._sp_portal_domain_edit.text().strip().lower() or "knoxnetvms.com"
+        prefs["security_post"] = sp
+        try:
+            if self._app:
+                self._app._save_prefs(prefs)
+        except Exception as e:
+            QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to save prefs: {e}")
+            return
+
+        pin = self._sp_pin_edit.text().strip()
+        if pin:
+            try:
+                _security_post_hooks().set_operator_pin(pin)
+                self._sp_pin_edit.clear()
+            except Exception as e:
+                QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to set PIN: {e}")
+                return
+
+        QMessageBox.information(self, "Knoxnet Security Post", "Knoxnet Security Post settings saved.")
+
+    # ----------------------------------------------------------------
     # Auto Protection panel
     # ----------------------------------------------------------------
 
@@ -1844,6 +1945,16 @@ class SystemManagerDialog(QDialog):
                     # Recording depends on the Control API, not just an open TCP port.
                     # A 404 or socket-only response means MediaMTX is not usable yet.
                     healthy = res.status_code in (200, 401, 403)
+                elif name == "Knoxnet Security Post":
+                    try:
+                        payload = res.json() if res.status_code == 200 else {}
+                    except Exception:
+                        payload = {}
+                    healthy = (
+                        res.status_code == 200
+                        and str(payload.get("service") or "") == "security_post"
+                        and str(payload.get("status") or "").lower() == "ok"
+                    )
                 else:
                     # Consider backend alive if it returns any non-5xx response.
                     healthy = res.status_code < 500
@@ -1852,8 +1963,8 @@ class SystemManagerDialog(QDialog):
                     break
             except:
                 # Fallback to simple socket check if HTTP fails but server might be booting
-                if "MediaMTX" in name:
-                    # A listener on 9997 without a working API is not usable by Knoxnet.
+                if "MediaMTX" in name or name == "Knoxnet Security Post":
+                    # A listener without the expected HTTP API is not usable by Knoxnet.
                     continue
                 try:
                     from urllib.parse import urlparse
@@ -2065,7 +2176,9 @@ class SystemManagerDialog(QDialog):
                 env["KNOXNET_SIMPLE_SERVER"] = "1"
                 if hasattr(self, "web_ui_toggle") and not self.web_ui_toggle.isChecked():
                     env["KNOXNET_WEB_UI_DISABLED"] = "1"
-            
+            if name == "Knoxnet Security Post":
+                _security_post_hooks().configure_service_env(env)
+
             cmd = []
             # Never default to a read-only mount (AppImage). Use a per-user writable dir for cwd.
             cwd = str(_default_state_dir() if frozen else repo_root)
@@ -2081,6 +2194,13 @@ class SystemManagerDialog(QDialog):
                     env.setdefault("LLM_HOST", env.get("LLM_HOST", "127.0.0.1"))
                     env.setdefault("LLM_PORT", env.get("LLM_PORT", "8102"))
                     cmd = [sys.executable, "--run-llm-local"]
+                elif name == "Knoxnet Security Post":
+                    _security_post_hooks().configure_service_env(env)
+                    cmd = _security_post_hooks().frozen_start_command(sys.executable)
+
+            if not cmd and not frozen and name == "Knoxnet Security Post":
+                _security_post_hooks().configure_service_env(env)
+                cmd = _security_post_hooks().dev_start_command(sys.executable, repo_root)
 
             if cmd:
                 # fall through to logging + Popen
@@ -2283,25 +2403,70 @@ class SystemManagerDialog(QDialog):
             QMessageBox.warning(self, "Error", f"Failed to stop {name}: {e}")
 
     def _cleanup_port(self, port: int) -> bool:
-        """Find and kill any process using the specified port."""
+        """Find and kill any process listening on the specified port."""
         if not PSUTIL_AVAILABLE:
             return False
-        
+
         import psutil
-        found = False
-        for proc in psutil.process_iter(['pid', 'name']):
+        listen_status = getattr(psutil, "CONN_LISTEN", "LISTEN")
+
+        def _conn_port(conn) -> Optional[int]:
             try:
-                for conn in proc.connections(kind='inet'):
-                    if conn.laddr.port == port:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=1)
-                        except:
-                            proc.kill()
-                        found = True
-                        break
-                if found: break
+                laddr = getattr(conn, "laddr", None)
+                if not laddr:
+                    return None
+                return int(getattr(laddr, "port", laddr[1]))
+            except Exception:
+                return None
+
+        def _is_listener(conn) -> bool:
+            status = str(getattr(conn, "status", "") or "")
+            return status in {str(listen_status), "LISTEN"}
+
+        pids: set[int] = set()
+        try:
+            for conn in psutil.net_connections(kind="inet"):
+                if _conn_port(conn) == port and _is_listener(conn):
+                    pid = getattr(conn, "pid", None)
+                    if pid and pid != os.getpid():
+                        pids.add(int(pid))
+        except Exception:
+            pass
+
+        # Fallback for psutil/platform combinations where the global table is
+        # incomplete but per-process connection inspection is available.
+        if not pids:
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    if proc.info.get("pid") == os.getpid():
+                        continue
+                    connections = getattr(proc, "net_connections", None)
+                    if connections is None:
+                        connections = getattr(proc, "connections", None)
+                    if connections is None:
+                        continue
+                    for conn in connections(kind="inet"):
+                        if _conn_port(conn) == port and _is_listener(conn):
+                            pids.add(int(proc.info["pid"]))
+                            break
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+                except Exception:
+                    continue
+
+        found = False
+        for pid in sorted(pids):
+            try:
+                proc = psutil.Process(pid)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    proc.kill()
+                found = True
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:
                 continue
         return found
 

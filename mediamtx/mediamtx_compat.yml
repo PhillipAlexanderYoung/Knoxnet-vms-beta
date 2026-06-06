@@ -34,3 +34,24 @@ pathDefaults:
 paths:
   all_others:
     source: publisher
+
+  d9c2a53e-1028-45c5-8602-9c3a1fa3769e:
+    source: rtsp://kadmin:$Knoxnet1@10.10.10.176:554/stream2
+    sourceProtocol: tcp
+    sourceOnDemand: no
+    record: yes
+    recordPath: /home/operator1/Documents/Knoxnet-VMS/recordings/_176/%Y-%m-%d/%H-%M-%S-%f_%path
+
+  f162f1a7-7193-4d65-a4bf-b88cbd03efd8:
+    source: rtsp://kadmin:$Knoxnet1@10.10.10.173:554/stream2
+    sourceProtocol: tcp
+    sourceOnDemand: no
+    record: yes
+    recordPath: /home/operator1/Documents/Knoxnet-VMS/recordings/_140/%Y-%m-%d/%H-%M-%S-%f_%path
+
+  d2728e43-32cb-4186-ad6e-4a09895e74b6:
+    source: rtsp://kadmin:$Knoxnet1@10.10.10.103:554/stream2
+    sourceProtocol: tcp
+    sourceOnDemand: no
+    record: yes
+    recordPath: /home/operator1/Documents/Knoxnet-VMS/recordings/_103/%Y-%m-%d/%H-%M-%S-%f_%path
