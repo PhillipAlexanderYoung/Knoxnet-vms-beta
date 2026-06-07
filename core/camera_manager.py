@@ -598,9 +598,76 @@ class CameraManager:
             # Update status
             self.camera_health[camera_id].status = CameraStatus.CONNECTING
 
+            # Configure MediaMTX first so a single upstream RTSP pull serves
+            # portal/HLS/WHEP and desktop OpenCV (localhost re-stream).  Most
+            # IP cameras allow only one session; probing or capturing direct
+            # RTSP before MTX is ready races the portal and kills the stream.
+            if config.webrtc_enabled:
+                stream_path = camera_id  # Use camera_id directly as path for consistency
+                priority = getattr(config, "stream_priority", "main") or "main"
+                # Single-session cameras: when portal/desktop prefer sub, avoid
+                # opening a main upstream pull unless recording needs it.
+                configure_main = priority != "sub" or bool(config.recording)
+                success = True
+                if configure_main:
+                    success = await self.mediamtx_client.configure_stream_source(
+                        stream_path,
+                        config.rtsp_url,
+                        force_recreate=False,
+                    )
+
+                # Also publish the substream as {id}_sub so widgets can
+                # auto-switch to low-res without hammering the camera.
+                # Probe first if we don't already know whether it works.
+                if config.substream_rtsp_url and config.substream_capable is not False:
+                    try:
+                        if config.substream_capable is None:
+                            await self._probe_substream(config)
+                        if config.substream_capable:
+                            sub_ok = await self._ensure_mediamtx_sub_path(config)
+                            if priority == "sub":
+                                success = bool(success and sub_ok)
+                    except Exception as exc:
+                        logger.warning(
+                            "Sub stream setup failed for %s: %s", camera_id, exc,
+                        )
+
+                ready_path = stream_path
+                if priority == "sub" and config.substream_rtsp_url and config.substream_capable:
+                    ready_path = (
+                        config.mediamtx_sub_path
+                        or f"{config.mediamtx_path or camera_id}_sub"
+                    )
+
+                if success:
+                    if self.enable_webrtc_receiver:
+                        # Optional: Connect Python-side WebRTC receiver (aiortc). Not used in desktop-light mode.
+                        stream_config = StreamConfig(
+                            stream_path=stream_path,
+                            rtsp_url=config.rtsp_url,
+                            quality=config.stream_quality.value,
+                            enable_audio=config.audio_enabled
+                        )
+
+                        webrtc_success = await self.mediamtx_client.connect_stream(stream_config)
+                        if webrtc_success:
+                            self.webrtc_streams[camera_id] = True
+                            logger.info(f"WebRTC receiver connected for camera: {camera_id}")
+                        else:
+                            logger.warning(f"WebRTC receiver connection failed for camera: {camera_id}")
+                            self.webrtc_streams[camera_id] = False
+                    else:
+                        # We still consider WebRTC available if MediaMTX path is configured.
+                        self.webrtc_streams[camera_id] = True
+                    await self._wait_for_mediamtx_path_ready(ready_path, total_timeout=5.0)
+                else:
+                    logger.warning(f"Failed to configure MediaMTX path for {camera_id}")
+                    self.webrtc_streams[camera_id] = False
+
             # Test the selected RTSP stream. If the main path is down but a
             # derived/configured substream works, prefer showing the usable feed
-            # instead of failing the camera outright.
+            # instead of failing the camera outright.  Skips direct OpenCV probe
+            # when MediaMTX already has a ready path (see _test_rtsp_connection).
             if not await self._test_rtsp_connection(config):
                 recovered_with_substream = False
                 if config.substream_rtsp_url and config.substream_capable is not False:
@@ -624,65 +691,6 @@ class CameraManager:
                     logger.error(f"Failed to connect to RTSP stream: {camera_id}")
                     self.camera_health[camera_id].status = CameraStatus.ERROR
                     return False
-
-            # Configure MediaMTX stream source (for browser/WebRTC/HLS delivery), but do not
-            # start a Python-side WebRTC receiver unless explicitly enabled.
-            if config.webrtc_enabled:
-                stream_path = camera_id  # Use camera_id directly as path for consistency
-                primary_rtsp_url = (
-                    config.substream_rtsp_url
-                    if (
-                        config.stream_quality == StreamQuality.LOW
-                        and config.substream_rtsp_url
-                        and config.substream_capable is not False
-                    )
-                    else config.rtsp_url
-                )
-                # Use force_recreate=False to allow existing stable streams to persist
-                # Only if connection fails will we try again with force_recreate=True
-                success = await self.mediamtx_client.configure_stream_source(
-                    stream_path, 
-                    primary_rtsp_url,
-                    force_recreate=False
-                )
-
-                # Also publish the substream as {id}_sub so widgets can
-                # auto-switch to low-res without hammering the camera.
-                # Probe first if we don't already know whether it works.
-                if config.substream_rtsp_url and config.substream_capable is not False:
-                    try:
-                        if config.substream_capable is None:
-                            await self._probe_substream(config)
-                        if config.substream_capable:
-                            await self._ensure_mediamtx_sub_path(config)
-                    except Exception as exc:
-                        logger.warning(
-                            "Sub stream setup failed for %s: %s", camera_id, exc,
-                        )
-
-                if success:
-                    if self.enable_webrtc_receiver:
-                        # Optional: Connect Python-side WebRTC receiver (aiortc). Not used in desktop-light mode.
-                        stream_config = StreamConfig(
-                            stream_path=stream_path,
-                            rtsp_url=primary_rtsp_url,
-                            quality=config.stream_quality.value,
-                            enable_audio=config.audio_enabled
-                        )
-
-                        webrtc_success = await self.mediamtx_client.connect_stream(stream_config)
-                        if webrtc_success:
-                            self.webrtc_streams[camera_id] = True
-                            logger.info(f"WebRTC receiver connected for camera: {camera_id}")
-                        else:
-                            logger.warning(f"WebRTC receiver connection failed for camera: {camera_id}")
-                            self.webrtc_streams[camera_id] = False
-                    else:
-                        # We still consider WebRTC available if MediaMTX path is configured.
-                        self.webrtc_streams[camera_id] = True
-                else:
-                    logger.warning(f"Failed to configure MediaMTX path for {camera_id}")
-                    self.webrtc_streams[camera_id] = False
 
             # Enable continuous recording if the camera config requests it
             if config.recording and config.webrtc_enabled:
@@ -923,7 +931,11 @@ class CameraManager:
                         local_sub_url = f"rtsp://{mtx_host}:8554/{sub_path}"
                         new_url = local_sub_url
                 else:
-                    new_url = config.rtsp_url
+                    main_path = config.mediamtx_path or camera_id
+                    mtx_host = self.mediamtx_client.mediamtx_host or "localhost"
+                    local_main_url = f"rtsp://{mtx_host}:8554/{main_path}"
+                    ready = await self._wait_for_mediamtx_path_ready(main_path, total_timeout=2.0)
+                    new_url = local_main_url if ready else config.rtsp_url
 
                 ok = await self._switch_rtsp_stream(camera_id, new_url)
                 if not ok and want_sub and config.substream_capable is not False:
@@ -2147,16 +2159,32 @@ class CameraManager:
         """Test RTSP connection to camera.
 
         If MediaMTX already has a ready path for this camera (e.g. from a
-        prior connect or ongoing recording), skip the expensive OpenCV probe
-        to avoid conflicting with the existing RTSP pull.
+        prior connect, portal warmup, or ongoing recording), skip the
+        expensive OpenCV probe to avoid conflicting with the existing RTSP pull.
         """
-        try:
-            path_info = await self.mediamtx_client.get_path_info(config.id)
-            if path_info.get("ready"):
-                logger.info("MediaMTX path already ready for %s; skipping OpenCV probe", config.id)
-                return True
-        except Exception:
-            pass
+        main_path = config.mediamtx_path or config.id
+        mtx_paths = [main_path, config.id]
+        if config.substream_rtsp_url and config.substream_capable is not False:
+            sub_path = (
+                config.mediamtx_sub_path
+                or f"{config.mediamtx_path or config.id}_sub"
+            )
+            mtx_paths.insert(0, sub_path)
+        seen = set()
+        for path in mtx_paths:
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            try:
+                path_info = await self.mediamtx_client.get_path_info(path)
+                if path_info.get("ready"):
+                    logger.info(
+                        "MediaMTX path %s ready for %s; skipping OpenCV probe",
+                        path, config.id,
+                    )
+                    return True
+            except Exception:
+                pass
 
         def _probe_sync(url: str) -> bool:
             cap = None
@@ -2180,6 +2208,61 @@ class CameraManager:
             logger.error(f"RTSP connection test failed for {config.id}: {e}")
             return False
 
+    async def _pick_local_mediamtx_read(
+        self, camera_id: str, config: CameraConfig, *, wait_timeout: float = 5.0
+    ) -> tuple[str, str, bool]:
+        """Pick the best read URL: localhost MediaMTX re-stream when ready, else direct.
+
+        Returns (stream_url, direct_fallback_url, use_local).
+        Prefers sub path when stream_quality/priority is sub; otherwise main.
+        Falls back to whichever MTX path is already publishing if the preferred
+        tier is not ready yet (portal on sub, desktop reads whatever MTX has).
+        """
+        main_path = config.mediamtx_path or camera_id
+        sub_path = (
+            config.mediamtx_sub_path
+            or f"{main_path}_sub"
+        )
+        want_sub = (
+            (
+                config.stream_quality == StreamQuality.LOW
+                or getattr(config, "stream_priority", "main") == "sub"
+            )
+            and bool(config.substream_rtsp_url)
+            and config.substream_capable is not False
+        )
+
+        candidates: list[tuple[str, str]] = []
+        if want_sub:
+            candidates.append((sub_path, config.substream_rtsp_url))
+        candidates.append((main_path, config.rtsp_url))
+        if not want_sub and config.substream_rtsp_url and config.substream_capable is not False:
+            candidates.append((sub_path, config.substream_rtsp_url))
+
+        mtx_host = self.mediamtx_client.mediamtx_host or "localhost"
+        seen: set[str] = set()
+        for path, direct_url in candidates:
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            ready = False
+            try:
+                info = await self.mediamtx_client.get_path_info(path)
+                ready = bool(info and info.get("ready"))
+            except Exception:
+                pass
+            if not ready and wait_timeout > 0:
+                ready = await self._wait_for_mediamtx_path_ready(
+                    path, total_timeout=wait_timeout
+                )
+            if ready:
+                local_url = f"rtsp://{mtx_host}:8554/{path}"
+                return local_url, direct_url, True
+
+        if want_sub and config.substream_rtsp_url:
+            return config.substream_rtsp_url, config.substream_rtsp_url, False
+        return config.rtsp_url, config.rtsp_url, False
+
     async def _start_rtsp_stream(self, camera_id: str, config: CameraConfig):
         """Start RTSP stream capture thread.
 
@@ -2189,88 +2272,49 @@ class CameraManager:
         only allow 1-2 concurrent RTSP sessions, so a duplicate pull would
         fail and kill the recording.
 
-        For LOW quality, prefers the substream:
-          1) Local MediaMTX sub path  (rtsp://localhost:8554/{id}_sub) if ready
-          2) Direct substream_rtsp_url
-          3) Falls back to main if no sub URL is available
+        For LOW/sub priority, prefers the substream path when ready; otherwise
+        reads whichever MTX path is already publishing (main or sub).
         """
         try:
             if camera_id in self.active_streams:
                 return  # Already streaming
 
-            want_sub = (
-                config.stream_quality == StreamQuality.LOW
-                and bool(config.substream_rtsp_url)
-                and config.substream_capable is not False
+            wait_timeout = 5.0 if config.webrtc_enabled else 3.0
+            stream_url, direct_url, use_local = await self._pick_local_mediamtx_read(
+                camera_id, config, wait_timeout=wait_timeout
             )
 
-            if want_sub:
-                direct_url = config.substream_rtsp_url
-                mtx_path = (config.mediamtx_sub_path
-                            or f"{config.mediamtx_path or camera_id}_sub")
-            else:
-                direct_url = config.rtsp_url
-                mtx_path = camera_id
-
-            use_local = False
-            try:
-                path_info = await self.mediamtx_client.get_path_info(mtx_path)
-                if path_info.get("ready"):
-                    use_local = True
-            except Exception:
-                pass
-
-            mtx_host = self.mediamtx_client.mediamtx_host or "localhost"
-            local_url = f"rtsp://{mtx_host}:8554/{mtx_path}"
-
             if use_local:
-                stream_url = local_url
                 logger.info(
-                    "MediaMTX path %s ready - reading from local re-stream %s",
-                    mtx_path, local_url,
+                    "MediaMTX path ready - reading from local re-stream %s",
+                    stream_url,
                 )
             else:
-                stream_url = direct_url
+                logger.info(
+                    "No ready MediaMTX path - using direct camera URL for %s",
+                    camera_id,
+                )
 
             logger.info(f"Starting RTSP stream capture from: {stream_url} (quality={config.stream_quality.value})")
 
-            def _open_cap_sync(url: str) -> cv2.VideoCapture:
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|buffer_size;1048576|max_delay;500000|stimeout;5000000"
-                cap_local = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-                try:
-                    cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:
-                    pass
-                if cap_local.isOpened():
-                    return cap_local
-
-                if "?" in url:
-                    tcp_url = f"{url}&transport=tcp"
-                else:
-                    tcp_url = f"{url}?transport=tcp"
-                logger.info(f"Retrying with explicit TCP: {tcp_url}")
-                try:
-                    cap_local.release()
-                except Exception:
-                    pass
-                cap_local = cv2.VideoCapture(tcp_url, cv2.CAP_FFMPEG)
-                try:
-                    cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:
-                    pass
-                return cap_local
-
-            cap = await asyncio.to_thread(_open_cap_sync, stream_url)
+            cap = await asyncio.to_thread(
+                self._open_capture_with_retry, stream_url, max_attempts=3
+            )
 
             # If the local re-stream failed, fall back to the direct camera URL.
             if use_local and (not cap or not cap.isOpened()):
-                logger.warning("Local re-stream failed for %s – falling back to direct camera URL", camera_id)
+                logger.warning(
+                    "Local re-stream failed for %s – falling back to direct camera URL",
+                    camera_id,
+                )
                 try:
                     if cap:
                         cap.release()
                 except Exception:
                     pass
-                cap = await asyncio.to_thread(_open_cap_sync, direct_url)
+                cap = await asyncio.to_thread(
+                    self._open_capture_with_retry, direct_url, max_attempts=3
+                )
 
             if not cap or not cap.isOpened():
                 try:
