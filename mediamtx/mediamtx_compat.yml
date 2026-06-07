@@ -43,7 +43,7 @@ paths:
     recordPath: /home/operator1/Documents/Knoxnet-VMS/recordings/_176/%Y-%m-%d/%H-%M-%S-%f_%path
 
   f162f1a7-7193-4d65-a4bf-b88cbd03efd8:
-    source: rtsp://kadmin:$Knoxnet1@10.10.10.173:554/stream2
+    source: rtsp://kadmin:$Knoxnet1@10.10.10.140:554/stream2
     sourceProtocol: tcp
     sourceOnDemand: no
     record: yes

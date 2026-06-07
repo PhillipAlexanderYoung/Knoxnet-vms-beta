@@ -5518,6 +5518,72 @@ def get_video_stream(camera_id):
                 "message": "Stream info retrieved"
             })
 
+        if stream_format.lower() in {'hls', 'webrtc', 'whep'}:
+            try:
+                cam = safe_service_call(camera_manager, 'get_camera', None, camera_id) if camera_manager else None
+
+                def _get(cam_obj, key, default=None):
+                    if isinstance(cam_obj, dict):
+                        return cam_obj.get(key, default)
+                    try:
+                        return getattr(cam_obj, key)
+                    except Exception:
+                        return default
+
+                requested_tier = str(
+                    request.args.get('stream')
+                    or request.args.get('tier')
+                    or stream_info.get('stream_priority')
+                    or ''
+                ).strip().lower()
+                want_sub = requested_tier == 'sub'
+                main_path = str(_get(cam, 'mediamtx_path', None) or camera_id).lstrip('/').rstrip('/')
+                sub_path = str(_get(cam, 'mediamtx_sub_path', None) or f"{main_path}_sub").lstrip('/').rstrip('/')
+                sub_rtsp_url = _get(cam, 'substream_rtsp_url')
+                sub_capable = _get(cam, 'substream_capable', None)
+
+                if want_sub and sub_rtsp_url and sub_capable is not False:
+                    mediamtx_path = sub_path
+                    source_url = sub_rtsp_url
+                else:
+                    mediamtx_path = main_path
+                    source_url = _get(cam, 'rtsp_url')
+                    want_sub = False
+
+                if source_url and mediamtx_path:
+                    mt = None
+                    if stream_server:
+                        mt = getattr(stream_server, 'mediamtx_client', None)
+                    if not mt and camera_manager:
+                        mt = getattr(camera_manager, 'mediamtx_client', None)
+                    if mt and hasattr(mt, 'configure_stream_source'):
+                        ok = bool(_run_coro_safe(mt.configure_stream_source(
+                            str(mediamtx_path),
+                            str(source_url),
+                            force_recreate=False,
+                        )))
+                        if not ok:
+                            logger.warning(
+                                "HLS warmup configure_stream_source returned False for %s -> %s",
+                                camera_id,
+                                mediamtx_path,
+                            )
+
+                stream_info = dict(stream_info or {})
+                stream_info.update({
+                    "mediamtx_path": mediamtx_path,
+                    "hls_url": f"/proxy/hls/{mediamtx_path}/index.m3u8",
+                    "webrtc_whep_url": f"/proxy/webrtc/{mediamtx_path}/whep",
+                    "stream_priority": "sub" if want_sub else "main",
+                })
+                stream_info.setdefault("main_hls_url", f"/proxy/hls/{main_path}/index.m3u8")
+                stream_info.setdefault("main_whep_url", f"/proxy/webrtc/{main_path}/whep")
+                if sub_rtsp_url:
+                    stream_info.setdefault("sub_hls_url", f"/proxy/hls/{sub_path}/index.m3u8")
+                    stream_info.setdefault("sub_whep_url", f"/proxy/webrtc/{sub_path}/whep")
+            except Exception as warmup_exc:
+                logger.debug("HLS warmup failed for %s: %s", camera_id, warmup_exc)
+
         return jsonify({
             "success": True,
             "data": stream_info,

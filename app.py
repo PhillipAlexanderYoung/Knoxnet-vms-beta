@@ -1238,11 +1238,19 @@ def _apply_camera_payload(camera: Dict[str, Any], data: Dict[str, Any]) -> bool:
         camera['stream_path'] = _extract_stream_path_from_rtsp(camera.get('rtsp_url')) or '/media/video1'
 
     if 'substream_path' in data:
-        camera['substream_path'] = _normalize_stream_path(data.get('substream_path'))
+        new_substream_path = _normalize_stream_path(data.get('substream_path'))
+        old_substream_path = _normalize_stream_path(camera.get('substream_path'))
+        if new_substream_path != old_substream_path:
+            connection_changed = True
+        camera['substream_path'] = new_substream_path
 
     if 'substream_rtsp_url' in data:
         substream_rtsp_url = str(data.get('substream_rtsp_url') or '').strip()
-        camera['substream_rtsp_url'] = substream_rtsp_url or None
+        new_substream_rtsp_url = substream_rtsp_url or None
+        old_substream_rtsp_url = str(camera.get('substream_rtsp_url') or '').strip() or None
+        if new_substream_rtsp_url != old_substream_rtsp_url:
+            connection_changed = True
+        camera['substream_rtsp_url'] = new_substream_rtsp_url
 
     if 'mediamtx_path' in data:
         camera['mediamtx_path'] = data.get('mediamtx_path') or None
@@ -1319,8 +1327,19 @@ def ensure_camera_stream_metadata(camera: Dict[str, Any]) -> None:
     ):
         substream_path = _transform_to_substream_path(base_stream_path)
 
-    if substream_path and not substream_rtsp_url:
-        substream_rtsp_url = _build_rtsp_with_path(camera.get('rtsp_url'), substream_path)
+    if substream_path:
+        main_rtsp_url = camera.get('rtsp_url')
+        rebuild_substream = not substream_rtsp_url
+        if not rebuild_substream and main_rtsp_url and substream_rtsp_url:
+            try:
+                main_host = (urlparse(main_rtsp_url).hostname or '').lower()
+                sub_host = (urlparse(substream_rtsp_url).hostname or '').lower()
+                if main_host and sub_host and main_host != sub_host:
+                    rebuild_substream = True
+            except Exception:
+                pass
+        if rebuild_substream:
+            substream_rtsp_url = _build_rtsp_with_path(main_rtsp_url, substream_path)
 
     if substream_path or substream_rtsp_url:
         camera['substream_path'] = substream_path
@@ -4208,8 +4227,14 @@ def update_camera(camera_id):
                 "message": "No data provided"
             }), 400
 
+        pre_substream_rtsp = camera.get('substream_rtsp_url')
+        pre_substream_path = camera.get('substream_path')
         connection_changed = _apply_camera_payload(camera, data)
         ensure_camera_stream_metadata(camera)
+        substream_changed = (
+            camera.get('substream_rtsp_url') != pre_substream_rtsp or
+            camera.get('substream_path') != pre_substream_path
+        )
 
         # Update MediaMTX path if connection details changed
         if connection_changed:
@@ -4232,6 +4257,13 @@ def update_camera(camera_id):
             else:
                 camera['webrtc_enabled'] = False
                 logger.warning(f"⚠️ Failed to update MediaMTX path for camera {camera_id}")
+        elif substream_changed and camera.get('mediamtx_sub_path'):
+            mediamtx.delete_path(camera['mediamtx_sub_path'])
+            if camera.get('substream_rtsp_url'):
+                mediamtx.create_path(camera['mediamtx_sub_path'], camera['substream_rtsp_url'])
+                logger.info(f"✅ Updated MediaMTX sub path for camera {camera_id}")
+            else:
+                logger.info(f"✅ Removed MediaMTX sub path for camera {camera_id}")
 
         save_cameras()
 

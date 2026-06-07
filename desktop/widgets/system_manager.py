@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import signal
 import sys
 import subprocess
 import threading
@@ -193,6 +195,130 @@ def _terminate_existing_mediamtx() -> bool:
     return found
 
 
+@dataclass
+class _PortCleanupResult:
+    found_pids: List[int]
+    killed_pids: List[int]
+    denied_pids: List[int]
+
+    @property
+    def any_killed(self) -> bool:
+        return bool(self.killed_pids)
+
+
+def _process_security_label(pid: int) -> str:
+    try:
+        path = Path(f"/proc/{int(pid)}/attr/current")
+        if path.exists():
+            return path.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _port_listener_pids(port: int) -> List[int]:
+    """Collect PIDs listening on a TCP port (ss/lsof/fuser, then psutil)."""
+    pids: set[int] = set()
+    port = int(port)
+
+    if shutil.which("ss"):
+        try:
+            proc = subprocess.run(
+                ["ss", "-ltnp", f"sport = :{port}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            for line in (proc.stdout or "").splitlines():
+                for match in re.finditer(r"pid=(\d+)", line):
+                    pids.add(int(match.group(1)))
+        except Exception:
+            pass
+
+    if not pids and shutil.which("lsof"):
+        try:
+            proc = subprocess.run(
+                ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            for token in (proc.stdout or "").split():
+                if token.isdigit():
+                    pids.add(int(token))
+        except Exception:
+            pass
+
+    if not pids and shutil.which("fuser"):
+        try:
+            proc = subprocess.run(
+                ["fuser", "-n", "tcp", str(port)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            combined = f"{proc.stdout or ''} {proc.stderr or ''}"
+            for token in combined.split():
+                digits = re.sub(r"[^0-9]", "", token)
+                if digits:
+                    pids.add(int(digits))
+        except Exception:
+            pass
+
+    if PSUTIL_AVAILABLE:
+        listen_status = getattr(psutil, "CONN_LISTEN", "LISTEN")
+
+        def _conn_port(conn) -> Optional[int]:
+            try:
+                laddr = getattr(conn, "laddr", None)
+                if not laddr:
+                    return None
+                return int(getattr(laddr, "port", laddr[1]))
+            except Exception:
+                return None
+
+        def _is_listener(conn) -> bool:
+            status = str(getattr(conn, "status", "") or "")
+            return status in {str(listen_status), "LISTEN"}
+
+        try:
+            for conn in psutil.net_connections(kind="inet"):
+                if _conn_port(conn) == port and _is_listener(conn):
+                    pid = getattr(conn, "pid", None)
+                    if pid and pid != os.getpid():
+                        pids.add(int(pid))
+        except Exception:
+            pass
+
+        if not pids:
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    if proc.info.get("pid") == os.getpid():
+                        continue
+                    connections = getattr(proc, "net_connections", None)
+                    if connections is None:
+                        connections = getattr(proc, "connections", None)
+                    if connections is None:
+                        continue
+                    for conn in connections(kind="inet"):
+                        if _conn_port(conn) == port and _is_listener(conn):
+                            pids.add(int(proc.info["pid"]))
+                            break
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+                except Exception:
+                    continue
+
+    return sorted(pids)
+
+
+def _port_is_listening(port: int) -> bool:
+    return bool(_port_listener_pids(port))
+
+
 def _vision_entrypoint() -> str:
     if os.name == "nt":
         return "services/vision_local/start_service.bat"
@@ -218,7 +344,12 @@ def _security_post_entrypoint() -> str:
 
 
 def _security_post_health_url() -> str:
-    return _security_post_hooks().health_url()
+    env = dict(os.environ)
+    try:
+        _security_post_hooks().configure_service_env(env)
+    except Exception:
+        pass
+    return _security_post_hooks().health_url(env)
 
 
 def _default_state_dir() -> Path:
@@ -398,6 +529,7 @@ class SystemManagerDialog(QDialog):
             pass
 
         self._processes: Dict[str, Any] = {}
+        self._service_crash_notified: set[str] = set()
         self._backend_origin = (os.environ.get("KNOXNET_BACKEND_ORIGIN") or "http://localhost:5000").rstrip("/")
 
         # WireGuard state (kept for compat with existing RA methods)
@@ -1437,8 +1569,10 @@ class SystemManagerDialog(QDialog):
     def _build_security_post_panel(self, root):
         box = QGroupBox("Knoxnet Security Post")
         box.setToolTip(
-            "Knoxnet Security Post customer portal sidecar (port 8090). "
-            "Configure portal access and operator PIN; start the service under Optional Services."
+            "Knoxnet Security Post customer portal sidecar (default port 8090). "
+            "If 8090 is in use, the service auto-falls back "
+            "to the next free port (8091, …). Configure portal access and operator PIN; "
+            "start the service under Optional Services."
         )
         form = QFormLayout(box)
 
@@ -1902,6 +2036,130 @@ class SystemManagerDialog(QDialog):
 
         return [exe] if exe else ["python"]
 
+    def _service_python_cmd(self) -> List[str]:
+        """Interpreter used for optional Python sidecars started from System Manager."""
+        override = str(os.environ.get("KNOXNET_SERVICE_PYTHON") or "").strip()
+        if override and ".venv-sp-test" not in override.replace("\\", "/"):
+            return [override]
+        try:
+            repo_root = Path(self._app._repo_root() if self._app else ".").resolve()
+            for rel in ("venv/bin/python", ".venv/bin/python"):
+                candidate = repo_root / rel
+                if candidate.is_file():
+                    return [str(candidate)]
+        except Exception:
+            pass
+        cmd = self._backend_python_cmd()
+        if cmd and ".venv-sp-test" in str(cmd[0]).replace("\\", "/"):
+            py3 = shutil.which("python3") or shutil.which("python")
+            return [py3] if py3 else cmd
+        return cmd
+
+    def _read_service_log_tail(self, log_path: str, *, max_lines: int = 12) -> str:
+        path = str(log_path or "").strip()
+        if not path:
+            return ""
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+        lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        return "\n".join(lines[-max_lines:])
+
+    def _show_service_error(self, title: str, message: str) -> None:
+        try:
+            from PySide6.QtCore import QTimer
+
+            def _popup() -> None:
+                try:
+                    QMessageBox.warning(self, title, message)
+                except Exception:
+                    pass
+
+            QTimer.singleShot(0, _popup)
+        except Exception:
+            pass
+
+    def _terminate_tracked_process(self, proc: subprocess.Popen) -> None:
+        if os.name != "nt":
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    os.killpg(pgid, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            except Exception:
+                pass
+        if PSUTIL_AVAILABLE:
+            try:
+                parent = psutil.Process(proc.pid)
+                children = parent.children(recursive=True)
+                for child in children:
+                    try:
+                        child.terminate()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                parent.terminate()
+                gone, alive = psutil.wait_procs([parent, *children], timeout=2)
+                for p in alive:
+                    try:
+                        p.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                return
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            except Exception:
+                pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _security_post_port(self) -> int:
+        try:
+            return int(_security_post_hooks().effective_port())
+        except Exception:
+            return 8090
+
+    def _security_post_port_notice(self) -> str:
+        try:
+            state = _security_post_hooks().read_runtime_state()
+        except Exception:
+            return ""
+        port = state.get("port")
+        fallback = state.get("fallback_from")
+        message = str(state.get("message") or "").strip()
+        if port and fallback and int(port) != int(fallback):
+            base = f"Running on port {port} (default {fallback} blocked)."
+            return f"{base} {message}".strip()
+        if message:
+            return message
+        return ""
+
+    def _refresh_security_post_health_url(self) -> None:
+        widgets = self.service_widgets.get("Knoxnet Security Post")
+        if not widgets:
+            return
+        try:
+            widgets["health_url"] = _security_post_health_url()
+        except Exception:
+            pass
+
     def _prime_psutil(self) -> None:
         if PSUTIL_AVAILABLE:
             try:
@@ -1982,12 +2240,20 @@ class SystemManagerDialog(QDialog):
         
         # If we have a tracked process but health check failed, it's still STARTING
         if not is_up and name in self._processes:
-            # Check if process is actually still alive
-            if self._processes[name].poll() is None:
+            proc = self._processes[name]
+            exit_code = proc.poll()
+            if exit_code is None:
                 status_str = "STARTING"
             else:
-                # Process crashed or stopped
-                self._processes.pop(name)
+                self._processes.pop(name, None)
+                if name == "Knoxnet Security Post" and name not in self._service_crash_notified:
+                    self._service_crash_notified.add(name)
+                    log_path = str((self.service_widgets.get(name) or {}).get("log_file") or "")
+                    detail = self._read_service_log_tail(log_path)
+                    msg = f"{name} exited immediately (code {exit_code})."
+                    if detail:
+                        msg += f"\n\nRecent log output:\n{detail}"
+                    self._show_service_error(name, msg)
         
         # Emit signal to update UI safely
         self.status_updated.emit(name, status_str)
@@ -2154,10 +2420,10 @@ class SystemManagerDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Service entry point not found: {entry_path}")
             return
 
-        # Pre-cleanup: ensure ports are clear before starting
+        # Pre-cleanup: ensure ports are clear before starting (Security Post handles its own fallback)
         try:
             widgets = self.service_widgets.get(name)
-            if widgets:
+            if widgets and name != "Knoxnet Security Post":
                 from urllib.parse import urlparse
                 port = urlparse(widgets["health_url"]).port
                 if port:
@@ -2178,6 +2444,22 @@ class SystemManagerDialog(QDialog):
                     env["KNOXNET_WEB_UI_DISABLED"] = "1"
             if name == "Knoxnet Security Post":
                 _security_post_hooks().configure_service_env(env)
+                py_cmd = self._service_python_cmd()
+                if py_cmd:
+                    env["KNOXNET_SERVICE_PYTHON"] = py_cmd[0]
+                if ".venv-sp-test" in str(env.get("KNOXNET_SERVICE_PYTHON", "")).replace("\\", "/"):
+                    QMessageBox.critical(
+                        self,
+                        "Knoxnet Security Post",
+                        "Refusing to start with an unsupported test Python environment.\n"
+                        "Use System Manager, start_service.sh, or set KNOXNET_SERVICE_PYTHON to the project venv.",
+                    )
+                    return
+                runtime_err = _security_post_hooks().verify_runtime(py_cmd[0] if py_cmd else sys.executable)
+                if runtime_err:
+                    QMessageBox.critical(self, "Knoxnet Security Post", runtime_err)
+                    return
+                self._service_crash_notified.discard(name)
 
             cmd = []
             # Never default to a read-only mount (AppImage). Use a per-user writable dir for cwd.
@@ -2194,13 +2476,6 @@ class SystemManagerDialog(QDialog):
                     env.setdefault("LLM_HOST", env.get("LLM_HOST", "127.0.0.1"))
                     env.setdefault("LLM_PORT", env.get("LLM_PORT", "8102"))
                     cmd = [sys.executable, "--run-llm-local"]
-                elif name == "Knoxnet Security Post":
-                    _security_post_hooks().configure_service_env(env)
-                    cmd = _security_post_hooks().frozen_start_command(sys.executable)
-
-            if not cmd and not frozen and name == "Knoxnet Security Post":
-                _security_post_hooks().configure_service_env(env)
-                cmd = _security_post_hooks().dev_start_command(sys.executable, repo_root)
 
             if cmd:
                 # fall through to logging + Popen
@@ -2270,8 +2545,11 @@ class SystemManagerDialog(QDialog):
                     cmd = [str(entry_path), str(cfg)]
             
             creationflags = 0
+            popen_kwargs: Dict[str, Any] = {}
             if os.name == "nt":
                 creationflags = subprocess.CREATE_NO_WINDOW
+            else:
+                popen_kwargs["start_new_session"] = True
             
             if not cmd:
                 QMessageBox.critical(self, "Error", f"Failed to build start command for {name} ({entry_path})")
@@ -2280,7 +2558,10 @@ class SystemManagerDialog(QDialog):
             # Log output to a file so we can debug failures
             log_dir = _writable_log_dir(repo_root=repo_root)
             log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / f"service_{name.lower().replace(' ', '_').replace('(', '').replace(')', '')}.log"
+            if name == "Knoxnet Security Post":
+                log_file = log_dir / _security_post_hooks().service_log_name()
+            else:
+                log_file = log_dir / f"service_{name.lower().replace(' ', '_').replace('(', '').replace(')', '')}.log"
             
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(f"\n--- Starting {name} at {time.ctime()} ---\n")
@@ -2296,11 +2577,41 @@ class SystemManagerDialog(QDialog):
                     env=env,
                     stdout=f,
                     stderr=subprocess.STDOUT,
-                    creationflags=creationflags
+                    creationflags=creationflags,
+                    **popen_kwargs,
                 )
             
             self._processes[name] = proc
-            QMessageBox.information(self, "Service Started", f"Attempting to start {name}...\nLogs: {log_file}")
+            widgets = self.service_widgets.get(name)
+            if widgets is not None:
+                widgets["log_file"] = str(log_file)
+            start_msg = f"Attempting to start {name}...\nLogs: {log_file}"
+            if name == "Knoxnet Security Post":
+                start_msg += (
+                    "\n\nIf port 8090 is in use, the service will auto-start on the next free port (8091, …)."
+                )
+
+                def _refresh_sp_port_after_start():
+                    for _ in range(30):
+                        time.sleep(0.5)
+                        try:
+                            self._refresh_security_post_health_url()
+                            notice = self._security_post_port_notice()
+                            port = self._security_post_port()
+                            if notice or port != 8090:
+                                break
+                            res = requests.get(
+                                _security_post_health_url(),
+                                timeout=1.5,
+                            )
+                            if res.status_code == 200:
+                                break
+                        except Exception:
+                            pass
+
+                threading.Thread(target=_refresh_sp_port_after_start, daemon=True).start()
+
+            QMessageBox.information(self, "Service Started", start_msg)
 
             # If the user wants the Web UI, bring up the Vite server as part of "Backend".
             try:
@@ -2334,23 +2645,26 @@ class SystemManagerDialog(QDialog):
         if name in self._processes:
             proc = self._processes.pop(name)
             try:
-                proc.terminate()
-                proc.wait(timeout=2)
+                self._terminate_tracked_process(proc)
+                if name == "Knoxnet Security Post":
+                    self._cleanup_port(self._security_post_port())
                 QMessageBox.information(self, "Service Stopped", f"Stopped {name}.")
                 return
-            except:
+            except Exception:
                 try:
                     proc.kill()
+                    if name == "Knoxnet Security Post":
+                        self._cleanup_port(self._security_post_port())
                     QMessageBox.information(self, "Service Stopped", f"Stopped {name} (forced).")
                     return
-                except:
+                except Exception:
                     pass
 
         # 1b. If this is a script-managed service, attempt an explicit stop (best-effort).
         try:
             widgets0 = self.service_widgets.get(name)
             ep = str((widgets0 or {}).get("entry_point") or "")
-            if ep.endswith(".sh"):
+            if ep.endswith(".sh") or ep.endswith(".bat"):
                 frozen = bool(getattr(sys, "frozen", False))
                 if frozen:
                     repo_root = Path(sys.executable).resolve().parent
@@ -2360,7 +2674,24 @@ class SystemManagerDialog(QDialog):
                     repo_root = Path(self._app._repo_root() if self._app else ".").resolve()
                     ep_path = repo_root / ep
                 if ep_path.exists():
-                    subprocess.Popen(["bash", str(ep_path), "stop"], cwd=str(repo_root))
+                    stop_env = dict(os.environ)
+                    if name == "Knoxnet Security Post":
+                        _security_post_hooks().configure_service_env(stop_env)
+                    stop_cmd = (
+                        ["bash", str(ep_path), "stop"]
+                        if ep.endswith(".sh")
+                        else [str(ep_path), "stop"]
+                    )
+                    try:
+                        subprocess.run(
+                            stop_cmd,
+                            cwd=str(repo_root),
+                            env=stop_env,
+                            timeout=20,
+                            check=False,
+                        )
+                    except Exception:
+                        pass
                     # Fall through to port-based cleanup as a backup.
         except Exception:
             pass
@@ -2389,86 +2720,135 @@ class SystemManagerDialog(QDialog):
             elif "MediaMTX" in name:
                 _terminate_existing_mediamtx()
                 target_ports.extend([8554, 8888, 8889, 9996])
+            elif name == "Knoxnet Security Post":
+                target_ports = [self._security_post_port()]
 
-            found = False
+            results: List[_PortCleanupResult] = []
             for p in target_ports:
-                if self._cleanup_port(p):
-                    found = True
-            
-            if found:
-                QMessageBox.information(self, "Service Stopped", f"Stopped {name} by port(s) {', '.join(map(str, target_ports))}.")
+                results.append(self._cleanup_port(p))
+
+            still_listening = [p for p in target_ports if _port_is_listening(p)]
+            killed_any = any(r.any_killed for r in results)
+            found_pids = sorted({pid for r in results for pid in r.found_pids})
+            denied_pids = sorted({pid for r in results for pid in r.denied_pids})
+
+            if killed_any and not still_listening:
+                QMessageBox.information(
+                    self,
+                    "Service Stopped",
+                    f"Stopped {name} on port(s) {', '.join(map(str, target_ports))}.",
+                )
+            elif still_listening:
+                lines = [
+                    f"Port(s) {', '.join(map(str, still_listening))} still in use for {name}."
+                ]
+                live_pids = sorted({pid for p in still_listening for pid in _port_listener_pids(p)})
+                if live_pids:
+                    lines.append(f"Listener PID(s): {', '.join(map(str, live_pids))}")
+                if denied_pids:
+                    lines.append(f"Could not signal PID(s): {', '.join(map(str, denied_pids))}")
+                for pid in live_pids:
+                    label = _process_security_label(pid)
+                    if label and label not in {"unconfined", ""}:
+                        lines.append(
+                            f"PID {pid} is a protected process ({label}). "
+                            "Stop it from its owning session, reboot, or start Security Post on a fallback port (8091+)."
+                        )
+                        break
+                QMessageBox.warning(self, "Stop incomplete", "\n".join(lines))
+            elif found_pids:
+                QMessageBox.warning(
+                    self,
+                    "Stop incomplete",
+                    f"Found listener PID(s) {', '.join(map(str, found_pids))} for {name} "
+                    f"on port(s) {', '.join(map(str, target_ports))} but could not stop them.",
+                )
             else:
-                QMessageBox.warning(self, "Notice", f"Could not find process for {name} on port(s) {', '.join(map(str, target_ports))}.")
+                QMessageBox.warning(
+                    self,
+                    "Notice",
+                    f"Could not find process for {name} on port(s) {', '.join(map(str, target_ports))}.",
+                )
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to stop {name}: {e}")
 
-    def _cleanup_port(self, port: int) -> bool:
+    def _cleanup_port(self, port: int) -> _PortCleanupResult:
         """Find and kill any process listening on the specified port."""
+        found = _port_listener_pids(port)
+        killed: List[int] = []
+        denied: List[int] = []
+
+        if not found:
+            return _PortCleanupResult(found_pids=[], killed_pids=[], denied_pids=[])
+
         if not PSUTIL_AVAILABLE:
-            return False
-
-        import psutil
-        listen_status = getattr(psutil, "CONN_LISTEN", "LISTEN")
-
-        def _conn_port(conn) -> Optional[int]:
-            try:
-                laddr = getattr(conn, "laddr", None)
-                if not laddr:
-                    return None
-                return int(getattr(laddr, "port", laddr[1]))
-            except Exception:
-                return None
-
-        def _is_listener(conn) -> bool:
-            status = str(getattr(conn, "status", "") or "")
-            return status in {str(listen_status), "LISTEN"}
-
-        pids: set[int] = set()
-        try:
-            for conn in psutil.net_connections(kind="inet"):
-                if _conn_port(conn) == port and _is_listener(conn):
-                    pid = getattr(conn, "pid", None)
-                    if pid and pid != os.getpid():
-                        pids.add(int(pid))
-        except Exception:
-            pass
-
-        # Fallback for psutil/platform combinations where the global table is
-        # incomplete but per-process connection inspection is available.
-        if not pids:
-            for proc in psutil.process_iter(["pid", "name"]):
+            for pid in found:
                 try:
-                    if proc.info.get("pid") == os.getpid():
-                        continue
-                    connections = getattr(proc, "net_connections", None)
-                    if connections is None:
-                        connections = getattr(proc, "connections", None)
-                    if connections is None:
-                        continue
-                    for conn in connections(kind="inet"):
-                        if _conn_port(conn) == port and _is_listener(conn):
-                            pids.add(int(proc.info["pid"]))
-                            break
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    os.kill(pid, signal.SIGTERM)
+                    killed.append(pid)
+                except PermissionError:
+                    denied.append(pid)
+                except ProcessLookupError:
                     continue
                 except Exception:
-                    continue
+                    denied.append(pid)
+            time.sleep(0.5)
+            for pid in list(found):
+                if pid in killed and _port_is_listening(port):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except PermissionError:
+                        if pid not in denied:
+                            denied.append(pid)
+                    except ProcessLookupError:
+                        pass
+            still = set(_port_listener_pids(port))
+            killed = [pid for pid in killed if pid not in still]
+            return _PortCleanupResult(found_pids=found, killed_pids=killed, denied_pids=sorted(set(denied)))
 
-        found = False
-        for pid in sorted(pids):
+        import psutil
+
+        for pid in found:
+            if pid == os.getpid():
+                continue
             try:
                 proc = psutil.Process(pid)
+                children = proc.children(recursive=True)
+                for child in children:
+                    try:
+                        child.terminate()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
                 proc.terminate()
                 try:
                     proc.wait(timeout=1)
                 except Exception:
+                    for child in children:
+                        try:
+                            child.kill()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                            continue
                     proc.kill()
-                found = True
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                killed.append(pid)
+            except psutil.AccessDenied:
+                denied.append(pid)
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
             except Exception:
-                continue
-        return found
+                denied.append(pid)
+
+        time.sleep(0.3)
+        still = set(_port_listener_pids(port))
+        killed = [pid for pid in killed if pid not in still]
+        for pid in found:
+            if pid in still and pid not in denied:
+                denied.append(pid)
+
+        return _PortCleanupResult(
+            found_pids=found,
+            killed_pids=killed,
+            denied_pids=sorted(set(denied)),
+        )
 
     def _start_docker_all(self):
         if self._app and hasattr(self._app, "_run_docker_compose_async"):
@@ -2520,6 +2900,7 @@ class SystemManagerDialog(QDialog):
             )
 
     def refresh(self):
+        self._refresh_security_post_health_url()
         for name in self.service_widgets:
             threading.Thread(target=self._check_service_health, args=(name,), daemon=True).start()
 
