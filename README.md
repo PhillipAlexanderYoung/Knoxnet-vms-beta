@@ -122,6 +122,8 @@ A normal desktop may handle a few cameras, but it should not be expected to run 
 
 Python 3.10 or newer is recommended. The installer creates a local `.venv`, installs Python dependencies from `requirements.txt`, and copies `env.example` to `.env` if needed. MediaMTX is downloaded automatically on first server start if the binary is missing.
 
+For local MediaMTX settings (including paths added when recording is enabled), copy `mediamtx/mediamtx_compat.yml.example` to `mediamtx/mediamtx_compat.yml`. That file is gitignored and must not be committed.
+
 Clone the repo:
 
 ```bash

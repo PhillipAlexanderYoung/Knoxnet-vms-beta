@@ -89,8 +89,24 @@ def _mediamtx_entrypoint() -> str:
     return "mediamtx/mediamtx"
 
 
+def _ensure_local_mediamtx_compat(mtx_dir: Path) -> None:
+    compat = mtx_dir / "mediamtx_compat.yml"
+    if compat.exists():
+        return
+    example = mtx_dir / "mediamtx_compat.yml.example"
+    if not example.is_file():
+        return
+    try:
+        import shutil
+
+        shutil.copyfile(example, compat)
+    except OSError:
+        pass
+
+
 def _mediamtx_config_path(mtx_dir: Path) -> Path:
     """Select the shipped config that enables the localhost Control API."""
+    _ensure_local_mediamtx_compat(mtx_dir)
     compat = mtx_dir / "mediamtx_compat.yml"
     if compat.exists():
         return compat.resolve()

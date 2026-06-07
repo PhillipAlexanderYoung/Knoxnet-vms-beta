@@ -65,6 +65,7 @@ models/*.onnx
 depth_anything_v2_repo/
 mediamtx/mediamtx
 mediamtx/mediamtx.exe
+mediamtx/mediamtx_compat.yml
 
 # Node/build/release artifacts
 node_modules/

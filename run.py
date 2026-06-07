@@ -240,10 +240,24 @@ class ServerManager:
         # Restart
         return self.start_mediamtx()
 
+    def _ensure_local_mediamtx_compat(self, mtx_dir: Path) -> None:
+        """Create gitignored mediamtx_compat.yml from the shipped example if missing."""
+        compat = mtx_dir / "mediamtx_compat.yml"
+        if compat.exists():
+            return
+        example = mtx_dir / "mediamtx_compat.yml.example"
+        if not example.is_file():
+            return
+        try:
+            shutil.copyfile(example, compat)
+        except OSError:
+            pass
+
     def _mediamtx_config_path(self):
         """Resolve the Knoxnet MediaMTX config that enables the Control API."""
         binary_dir = Path(getattr(self, "mediamtx_path", "")).resolve().parent
         repo_dir = Path(__file__).resolve().parent / "mediamtx"
+        self._ensure_local_mediamtx_compat(repo_dir)
         candidates = [
             binary_dir / "mediamtx_compat.yml",
             binary_dir / "mediamtx.yml",

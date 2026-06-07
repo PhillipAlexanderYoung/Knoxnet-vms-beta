@@ -1,0 +1,49 @@
+# Minimal, version-tolerant MediaMTX config for desktop/supervisor runs.
+# Copy to mediamtx_compat.yml (gitignored) and customize for your site:
+#   cp mediamtx/mediamtx_compat.yml.example mediamtx/mediamtx_compat.yml
+#
+# Knoxnet adds per-camera paths here when you enable recording (app hot-reloads).
+# Do not commit mediamtx_compat.yml — it may contain RTSP URLs and credentials.
+
+logLevel: info
+logDestinations: [stdout]
+
+# Control API used by backend health/probing and recording control.
+api: yes
+apiAddress: 127.0.0.1:9997
+apiEncryption: no
+
+# Playback server for serving recorded segments over HTTP.
+playback: yes
+playbackAddress: :9996
+
+# Core listeners used by Knoxnet components.
+rtsp: yes
+rtspAddress: :8554
+
+hls: yes
+hlsAddress: :8888
+
+webrtc: yes
+webrtcAddress: :8889
+
+pathDefaults:
+  record: no
+  recordPath: ../recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 10m
+  recordDeleteAfter: 720h
+
+paths:
+  all_others:
+    source: publisher
+
+  # Example camera path (replace with your camera UUID and RTSP URL):
+  # 00000000-0000-0000-0000-000000000001:
+  #   source: rtsp://USERNAME:PASSWORD@192.0.2.10:554/stream1
+  #   sourceProtocol: tcp
+  #   sourceOnDemand: yes
+  #   sourceOnDemandStartTimeout: 10s
+  #   sourceOnDemandCloseAfter: 30s
+  #   record: no
