@@ -4909,6 +4909,7 @@ class KnoxnetDesktopApp(QApplication):
                 "wifi_ssid": "KNOXNET_SECURITY_POST",
                 "portal_host": "post.knoxnetvms.com",
                 "portal_domain": "knoxnetvms.com",
+                "system_name": "",
             },
         }
 

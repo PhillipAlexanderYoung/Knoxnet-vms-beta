@@ -1893,6 +1893,18 @@ class SystemManagerDialog(QDialog):
         self._sp_enabled_chk.setChecked(bool(sp.get("enabled", False)))
         form.addRow("", self._sp_enabled_chk)
 
+        try:
+            default_system_name = _security_post_hooks().effective_system_name(sp)
+        except Exception:
+            default_system_name = "Knoxnet VMS"
+        self._sp_system_name_edit = QLineEdit(str(sp.get("system_name") or ""))
+        self._sp_system_name_edit.setPlaceholderText(default_system_name)
+        self._sp_system_name_edit.setToolTip(
+            "Customer-visible name shown on the Security Post login page and portal header. "
+            "Leave blank to use the machine hostname or Knoxnet VMS."
+        )
+        form.addRow("System name:", self._sp_system_name_edit)
+
         self._sp_autostart_chk = QCheckBox("Start Security Post when Knoxnet VMS launches")
         self._sp_autostart_chk.setToolTip(
             "Automatically start the Knoxnet Security Post customer Events portal "
@@ -1947,12 +1959,19 @@ class SystemManagerDialog(QDialog):
         sp["wifi_ssid"] = self._sp_wifi_ssid_edit.text().strip() or "KNOXNET_SECURITY_POST"
         sp["portal_host"] = self._sp_portal_host_edit.text().strip().lower() or "post.knoxnetvms.com"
         sp["portal_domain"] = self._sp_portal_domain_edit.text().strip().lower() or "knoxnetvms.com"
+        sp["system_name"] = self._sp_system_name_edit.text().strip()
         prefs["security_post"] = sp
         try:
             if self._app:
                 self._app._save_prefs(prefs)
         except Exception as e:
             QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to save prefs: {e}")
+            return
+
+        try:
+            _security_post_hooks().sync_system_name(sp["system_name"])
+        except Exception as e:
+            QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to sync system name: {e}")
             return
 
         pin = self._sp_pin_edit.text().strip()
