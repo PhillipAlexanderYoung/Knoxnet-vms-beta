@@ -18,6 +18,9 @@ import cv2
 import numpy as np
 
 from .paths import get_data_dir, get_motion_watch_dir, get_project_root, get_recordings_dir, resolve_under_root
+from .events_search import fts_and_query as _fts_and_query
+from .events_search import fts_query_tokens as _fts_query_tokens
+from .events_search import merge_operator_shape_tags as _merge_operator_shape_tags
 
 try:
     from PIL import Image
@@ -551,11 +554,7 @@ class EventIndexService:
             except Exception:
                 pass
 
-        img = None
-        try:
-            img = cv2.imread(str(file_path))
-        except Exception:
-            img = None
+        img = self._read_analysis_frame(file_path)
 
         with self._connect() as conn:
             for idx, d in enumerate(detections or []):
@@ -822,6 +821,70 @@ class EventIndexService:
         self._refresh_event_aggregates(event_id)
         return {"event_id": event_id, "detection_id": det_id, "det_idx": det_idx_i, "updated_at": now}
 
+    def set_event_tags(
+        self,
+        event_id: str,
+        *,
+        tags: Optional[Sequence[str]] = None,
+        merge: bool = True,
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Operator correction: update event-level tags (merged into FTS index).
+        """
+        event_id = str(event_id or "").strip()
+        if not event_id:
+            raise ValueError("event_id is required")
+        if tags is None:
+            raise ValueError("tags is required")
+
+        new_tags = [str(t).strip().lower() for t in tags if str(t).strip()][:32]
+        if not new_tags:
+            raise ValueError("tags must not be empty")
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tags, shape_name, json_metadata FROM events WHERE id = ? LIMIT 1;",
+                (event_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("Event not found")
+
+            existing = [t.strip() for t in (row["tags"] or "").split(",") if t.strip()]
+            shape_name = row["shape_name"]
+            if merge:
+                merged = _merge_operator_shape_tags(
+                    list(dict.fromkeys([*existing, *new_tags])),
+                    shape_name=str(shape_name) if shape_name else None,
+                )
+            else:
+                merged = _merge_operator_shape_tags(new_tags, shape_name=str(shape_name) if shape_name else None)
+
+            meta: Dict[str, Any] = {}
+            try:
+                if row["json_metadata"]:
+                    meta = json.loads(row["json_metadata"])
+            except Exception:
+                meta = {}
+            meta["operator_tag_edit"] = {
+                "tags": merged,
+                "updated_at": int(time.time()),
+                "updated_by": str(updated_by) if updated_by else None,
+            }
+            meta["operator_aliases"] = merged[:24]
+
+            now = int(time.time())
+            conn.execute(
+                """
+                UPDATE events
+                SET tags = ?, json_metadata = ?, updated_at = ?
+                WHERE id = ?;
+                """,
+                (", ".join(merged), json.dumps(meta, default=str), now, event_id),
+            )
+
+        return {"event_id": event_id, "tags": merged, "updated_at": now}
+
     def _refresh_event_aggregates(self, event_id: str) -> None:
         """
         Update `events.tags`, `events.detection_classes`, and (best-effort) `events.dominant_color`
@@ -852,7 +915,33 @@ class EventIndexService:
                 vehicle_candidates.append((area * (0.25 + conf), area, col or None))
 
         classes = list(dict.fromkeys([c for c in classes if c]))[:24]
-        tags = list(dict.fromkeys([t for t in tags if t]))[:24]
+        det_tags = list(dict.fromkeys([t for t in tags if t]))[:24]
+
+        shape_name: Optional[str] = None
+        operator_aliases: List[str] = []
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tags, shape_name, json_metadata FROM events WHERE id = ? LIMIT 1;",
+                (event_id,),
+            ).fetchone()
+            if row:
+                shape_name = str(row["shape_name"]) if row["shape_name"] else None
+                try:
+                    if row["json_metadata"]:
+                        meta = json.loads(row["json_metadata"])
+                        if isinstance(meta.get("operator_aliases"), list):
+                            operator_aliases = [str(a) for a in meta["operator_aliases"] if str(a).strip()]
+                except Exception:
+                    pass
+                existing_tags = [t.strip() for t in (row["tags"] or "").split(",") if t.strip()]
+                # Keep non-detection tokens from prior tags (zone names, operator edits).
+                det_set = set(det_tags)
+                preserved = [t for t in existing_tags if t.lower() not in det_set and t.lower() not in classes]
+                det_tags = _merge_operator_shape_tags(
+                    list(dict.fromkeys([*preserved, *det_tags])),
+                    shape_name=shape_name,
+                    operator_aliases=operator_aliases,
+                )[:32]
 
         dominant = None
         try:
@@ -872,7 +961,7 @@ class EventIndexService:
                     updated_at = ?
                 WHERE id = ?;
                 """,
-                (", ".join(classes) if classes else "", ", ".join(tags) if tags else "", dominant, int(time.time()), event_id),
+                (", ".join(classes) if classes else "", ", ".join(det_tags) if det_tags else "", dominant, int(time.time()), event_id),
             )
 
     # ------------------------ Path safety ------------------------
@@ -967,6 +1056,70 @@ class EventIndexService:
         except Exception:
             return None
 
+    @staticmethod
+    def _bucket_rgb_color(r: float, g: float, b: float) -> Optional[str]:
+        yv = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        if yv >= 220:
+            return "white"
+        if yv <= 35:
+            return "black"
+        mx = max(r, g, b)
+        mn = min(r, g, b)
+        sat = 0 if mx == 0 else (mx - mn) / mx
+        if sat < 0.22:
+            return "white" if yv >= 125 else "gray"
+        if r > g * 1.2 and r > b * 1.2:
+            return "red" if r < 170 else "yellow"
+        if g > r * 1.2 and g > b * 1.2:
+            return "green"
+        if b > r * 1.2 and b > g * 1.2:
+            return "blue"
+        if r > 120 and g > 90 and b < 90:
+            return "brown"
+        return None
+
+    def _estimate_dominant_color_from_bgr(
+        self,
+        frame: np.ndarray,
+        *,
+        crop_box: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Optional[str]:
+        try:
+            img = frame
+            if crop_box:
+                x, y, w, h = crop_box
+                x = max(0, int(x))
+                y = max(0, int(y))
+                w = max(1, int(w))
+                h = max(1, int(h))
+                img = img[y : y + h, x : x + w]
+            if img is None or img.size == 0:
+                return None
+            small = cv2.resize(img, (64, 64))
+            b, g, r = cv2.split(small)
+            return self._bucket_rgb_color(float(r.mean()), float(g.mean()), float(b.mean()))
+        except Exception:
+            return None
+
+    def _read_analysis_frame(self, file_path: Path) -> Optional[np.ndarray]:
+        """Load a BGR frame for color/detection analysis (image or first video frame)."""
+        suffix = file_path.suffix.lower()
+        if suffix in (".mp4", ".avi", ".mkv", ".webm"):
+            try:
+                cap = cv2.VideoCapture(str(file_path))
+                ret, frame = cap.read()
+                cap.release()
+                if ret and frame is not None:
+                    return frame
+            except Exception:
+                return None
+            return None
+        try:
+            frame = cv2.imread(str(file_path))
+            return frame if frame is not None else None
+        except Exception:
+            return None
+
     def _estimate_dominant_color(self, file_path: Path, *, crop_box: Optional[Tuple[int, int, int, int]] = None) -> Optional[str]:
         """
         Very lightweight color estimate (white/black/gray/red/green/blue/yellow/brown).
@@ -974,7 +1127,10 @@ class EventIndexService:
         """
         suffix = file_path.suffix.lower()
         if suffix in (".mp4", ".avi", ".mkv", ".webm"):
-            return None
+            frame = self._read_analysis_frame(file_path)
+            if frame is None:
+                return None
+            return self._estimate_dominant_color_from_bgr(frame, crop_box=crop_box)
         if Image is None:
             return None
         try:
@@ -993,65 +1149,50 @@ class EventIndexService:
             r = sum(p[0] for p in px) / len(px)
             g = sum(p[1] for p in px) / len(px)
             b = sum(p[2] for p in px) / len(px)
-
-            # Luma-like intensity
-            yv = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            # White vehicles at dusk often land in the 125-200 luma range; treat low-saturation,
-            # higher-luma regions as "white" rather than "gray" to support queries like "white truck".
-            if yv >= 220:
-                return "white"
-            if yv <= 35:
-                return "black"
-            # saturation-ish
-            mx = max(r, g, b)
-            mn = min(r, g, b)
-            sat = 0 if mx == 0 else (mx - mn) / mx
-            if sat < 0.22:
-                return "white" if yv >= 125 else "gray"
-            # dominant hue bucket via channel dominance
-            if r > g * 1.2 and r > b * 1.2:
-                return "red" if r < 170 else "yellow"
-            if g > r * 1.2 and g > b * 1.2:
-                return "green"
-            if b > r * 1.2 and b > g * 1.2:
-                return "blue"
-            if r > 120 and g > 90 and b < 90:
-                return "brown"
-            return None
+            return self._bucket_rgb_color(r, g, b)
         except Exception:
             return None
 
-    def _yolo_detect(self, file_path: Path) -> List[Dict[str, Any]]:
+    def _yolo_detect(self, file_path: Path, *, model_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Run YOLO detection (cached) on a file and return detections with bbox + label + confidence.
+        Run object detection (cached) on a file and return detections with bbox + label + confidence.
         """
+        frame = self._read_analysis_frame(file_path)
+        if frame is None:
+            return []
         try:
-            frame = cv2.imread(str(file_path))
-            if frame is None:
+            from .capture_label_model import capture_labeling_enabled, get_cached_detector, normalize_capture_label_model
+
+            mid = normalize_capture_label_model(model_id or "auto")
+            if not capture_labeling_enabled(mid):
                 return []
-            # Cache YOLO detector on the instance (avoid repeated model loads).
-            try:
-                from .object_detector import ObjectDetector
-                if getattr(self, "_yolo_detector", None) is None:
-                    self._yolo_detector = ObjectDetector(model_type="yolo", device="auto")  # type: ignore[attr-defined]
-                det = getattr(self, "_yolo_detector", None)
-                if det is None:
-                    return []
+            det = get_cached_detector(mid)
+            dets = det.detect(frame, conf_threshold=0.25) or []
+            return [d for d in dets if isinstance(d, dict)]
+        except Exception:
+            pass
+        try:
+            from .object_detector import ObjectDetector
+
+            if getattr(self, "_yolo_detector", None) is None:
+                self._yolo_detector = ObjectDetector(model_type="yolo", device="auto")  # type: ignore[attr-defined]
+            det = getattr(self, "_yolo_detector", None)
+            if det is not None:
                 dets = det.detect(frame, conf_threshold=0.25) or []
-                return [d for d in dets if isinstance(d, dict)]
-            except Exception:
-                # Fallback: MobileNet SSD (keeps indexing functional even if Ultralytics isn't installed).
-                try:
-                    from .object_detector import ObjectDetector
-                    if getattr(self, "_mobilenet_detector", None) is None:
-                        self._mobilenet_detector = ObjectDetector(model_type="mobilenet", device="auto")  # type: ignore[attr-defined]
-                    det = getattr(self, "_mobilenet_detector", None)
-                    if det is None:
-                        return []
-                    dets = det.detect(frame, conf_threshold=0.25) or []
+                if dets:
                     return [d for d in dets if isinstance(d, dict)]
-                except Exception:
-                    return []
+        except Exception:
+            pass
+        try:
+            from .object_detector import ObjectDetector
+
+            if getattr(self, "_mobilenet_detector", None) is None:
+                self._mobilenet_detector = ObjectDetector(model_type="mobilenet", device="auto")  # type: ignore[attr-defined]
+            det = getattr(self, "_mobilenet_detector", None)
+            if det is None:
+                return []
+            dets = det.detect(frame, conf_threshold=0.25) or []
+            return [d for d in dets if isinstance(d, dict)]
         except Exception:
             return []
 
@@ -1263,6 +1404,15 @@ class EventIndexService:
         tags = list(dict.fromkeys(pre_tags_list))[:24]
         classes = list(dict.fromkeys(pre_classes_list))[:24]
 
+        operator_aliases = payload.get("operator_aliases")
+        if not operator_aliases and isinstance(payload_metadata, dict):
+            operator_aliases = payload_metadata.get("operator_aliases")
+        tags = _merge_operator_shape_tags(
+            tags,
+            shape_name=str(shape_name) if shape_name else None,
+            operator_aliases=operator_aliases if isinstance(operator_aliases, list) else None,
+        )[:32]
+
         # Optional caption/tags/classes from local vision (/describe)
         if enable_vision:
             cap2, tags2, classes2 = self._describe_local_vision(file_path)
@@ -1297,7 +1447,15 @@ class EventIndexService:
             if isinstance(provided_dets, list) and provided_dets:
                 yolo_dets = [d for d in provided_dets if isinstance(d, dict)]
             else:
-                yolo_dets = self._yolo_detect(file_path)
+                capture_model = None
+                try:
+                    capture_model = meta.get("capture_label_model") or payload_metadata.get("capture_label_model")
+                    cap_info = meta.get("capture_label") if isinstance(meta.get("capture_label"), dict) else {}
+                    if not capture_model and isinstance(cap_info, dict):
+                        capture_model = cap_info.get("model") or cap_info.get("effective")
+                except Exception:
+                    capture_model = None
+                yolo_dets = self._yolo_detect(file_path, model_id=capture_model)
             yolo_classes = []
             for d in yolo_dets:
                 lab = d.get("class") or d.get("label") or d.get("class_name")
@@ -1381,6 +1539,27 @@ class EventIndexService:
                 # Mark detection indexing attempt so reindex can skip even when there are zero objects.
                 meta["detections_indexed_at"] = now
                 meta["detections_count"] = int(len(det_rows or []))
+                try:
+                    from .capture_label_model import normalize_capture_label_model, resolve_effective_model
+
+                    cap_model = normalize_capture_label_model(
+                        meta.get("capture_label_model") or payload_metadata.get("capture_label_model") or "auto"
+                    )
+                    cap_info = meta.get("capture_label") if isinstance(meta.get("capture_label"), dict) else {}
+                    effective = cap_info.get("effective") or resolve_effective_model(cap_model)
+                    self._append_label_history(
+                        meta,
+                        {
+                            "model": cap_model,
+                            "effective_model": effective,
+                            "detector_type": cap_info.get("detector_type"),
+                            "labeled_at": now,
+                            "source": "capture",
+                            "count": int(len(det_rows or [])),
+                        },
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1787,12 +1966,16 @@ class EventIndexService:
         min_area: Optional[float] = None,
         start_ts: Optional[int] = None,
         end_ts: Optional[int] = None,
+        before_ts: Optional[int] = None,
+        offset: int = 0,
         limit: int = 25,
     ) -> List[EventSearchResult]:
         q = (query or "").strip()
         limit = max(1, min(int(limit or 25), 5000))
+        offset_i = max(0, int(offset or 0))
         start_ts_i = _safe_int(start_ts)
         end_ts_i = _safe_int(end_ts)
+        before_ts_i = _safe_int(before_ts)
         cam = (camera_name or "").strip()
         cam_id_guess: Optional[str] = None
         if cam:
@@ -1824,6 +2007,9 @@ class EventIndexService:
         if end_ts_i is not None:
             where.append("e.captured_ts <= ?")
             params.append(int(end_ts_i))
+        if before_ts_i is not None:
+            where.append("e.captured_ts < ?")
+            params.append(int(before_ts_i))
         if cam:
             # Accept either camera name or camera id (uuid) in the same field.
             where.append("(LOWER(COALESCE(e.camera_name,'')) = ? OR COALESCE(e.camera_id,'') = ?)")
@@ -1879,11 +2065,9 @@ class EventIndexService:
         with self._connect() as conn:
             rows: List[sqlite3.Row] = []
             if q:
-                # Try FTS first
+                fts_q = _fts_and_query(q)
+                # Try FTS first (multi-token AND)
                 try:
-                    # NOTE: When there are no filters, we must still include a WHERE clause.
-                    # The previous version emitted "... JOIN ... AND events_fts MATCH ?" which is invalid SQL,
-                    # causing silent fallback to LIKE and returning 0 when captions/classes are empty.
                     where_fts = (where_sql + " AND events_fts MATCH ?") if where_sql else "WHERE events_fts MATCH ?"
                     sql = f"""
                     SELECT e.*
@@ -1891,35 +2075,44 @@ class EventIndexService:
                     JOIN events e ON e.rowid = events_fts.rowid
                     {where_fts}
                     ORDER BY e.captured_ts DESC
-                    LIMIT ?;
+                    LIMIT ? OFFSET ?;
                     """
-                    rows = list(conn.execute(sql, [*params, q, limit]).fetchall())
+                    rows = list(conn.execute(sql, [*params, fts_q, limit, offset_i]).fetchall())
                 except Exception:
-                    # LIKE fallback
-                    like = f"%{q.lower()}%"
+                    # LIKE fallback: all tokens must appear somewhere in indexed text fields
+                    tokens = _fts_query_tokens(q)
+                    like_clauses = []
+                    like_params: List[Any] = []
+                    for tok in tokens:
+                        like = f"%{tok}%"
+                        like_clauses.append(
+                            "("
+                            "LOWER(COALESCE(e.caption,'')) LIKE ? OR "
+                            "LOWER(COALESCE(e.tags,'')) LIKE ? OR "
+                            "LOWER(COALESCE(e.detection_classes,'')) LIKE ? OR "
+                            "LOWER(COALESCE(e.shape_name,'')) LIKE ? OR "
+                            "LOWER(COALESCE(e.camera_name,'')) LIKE ?"
+                            ")"
+                        )
+                        like_params.extend([like, like, like, like, like])
                     sql = f"""
                     SELECT e.*
                     FROM events e
                     {where_sql}
-                    {"AND" if where_sql else "WHERE"} (
-                      LOWER(COALESCE(e.caption,'')) LIKE ?
-                      OR LOWER(COALESCE(e.tags,'')) LIKE ?
-                      OR LOWER(COALESCE(e.detection_classes,'')) LIKE ?
-                      OR LOWER(COALESCE(e.shape_name,'')) LIKE ?
-                    )
+                    {"AND" if where_sql else "WHERE"} {" AND ".join(like_clauses)}
                     ORDER BY e.captured_ts DESC
-                    LIMIT ?;
+                    LIMIT ? OFFSET ?;
                     """
-                    rows = list(conn.execute(sql, [*params, like, like, like, like, limit]).fetchall())
+                    rows = list(conn.execute(sql, [*params, *like_params, limit, offset_i]).fetchall())
             else:
                 sql = f"""
                 SELECT e.*
                 FROM events e
                 {where_sql}
                 ORDER BY e.captured_ts DESC
-                LIMIT ?;
+                LIMIT ? OFFSET ?;
                 """
-                rows = list(conn.execute(sql, [*params, limit]).fetchall())
+                rows = list(conn.execute(sql, [*params, limit, offset_i]).fetchall())
 
         out: List[EventSearchResult] = []
         for r in rows:
@@ -2074,6 +2267,315 @@ class EventIndexService:
                 "min_confidence": min_conf,
                 "min_area": min_ar,
             },
+        }
+
+    # ------------------------ Re-label / detection history ------------------------
+
+    @staticmethod
+    def _append_label_history(meta: Dict[str, Any], entry: Dict[str, Any]) -> None:
+        history = meta.get("label_history")
+        if not isinstance(history, list):
+            history = []
+        history.append(entry)
+        meta["label_history"] = history[-25:]
+        meta["current_label"] = entry
+
+    def list_events_for_relabel(
+        self,
+        *,
+        event_ids: Optional[Sequence[str]] = None,
+        camera_name: Optional[str] = None,
+        camera_id: Optional[str] = None,
+        trigger_type: Optional[str] = None,
+        shape_name: Optional[str] = None,
+        start_ts: Optional[int] = None,
+        end_ts: Optional[int] = None,
+        query: str = "",
+        media_type: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Return event rows matching relabel filters (newest first)."""
+        limit = max(1, min(int(limit or 500), 5000))
+        ids = [str(i).strip() for i in (event_ids or []) if str(i).strip()]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            sql = f"SELECT id, file_path, camera_name, shape_name, trigger_type, captured_ts, json_metadata FROM events WHERE id IN ({placeholders}) ORDER BY captured_ts DESC LIMIT ?;"
+            with self._connect() as conn:
+                rows = list(conn.execute(sql, [*ids, limit]).fetchall())
+            out = [dict(r) for r in rows]
+            if not (camera_name or camera_id or trigger_type or shape_name or start_ts or end_ts or query or media_type):
+                return out
+            # Apply extra filters client-side for explicit id lists
+            filtered: List[Dict[str, Any]] = []
+            for r in out:
+                if start_ts is not None and (r.get("captured_ts") or 0) < int(start_ts):
+                    continue
+                if end_ts is not None and (r.get("captured_ts") or 0) > int(end_ts):
+                    continue
+                if trigger_type and str(r.get("trigger_type") or "").lower() != str(trigger_type).lower():
+                    continue
+                if shape_name and str(r.get("shape_name") or "").lower() != str(shape_name).lower():
+                    continue
+                if camera_name and str(r.get("camera_name") or "").lower() != str(camera_name).lower():
+                    continue
+                filtered.append(r)
+            return filtered[:limit]
+
+        where: List[str] = []
+        params: List[Any] = []
+        start_ts_i = _safe_int(start_ts)
+        end_ts_i = _safe_int(end_ts)
+        if start_ts_i is not None:
+            where.append("e.captured_ts >= ?")
+            params.append(int(start_ts_i))
+        if end_ts_i is not None:
+            where.append("e.captured_ts <= ?")
+            params.append(int(end_ts_i))
+        cam = (camera_name or "").strip()
+        if cam:
+            where.append("(LOWER(COALESCE(e.camera_name,'')) = ? OR COALESCE(e.camera_id,'') = ?)")
+            params.append(cam.lower())
+            params.append(str(camera_id or cam))
+        elif camera_id:
+            where.append("COALESCE(e.camera_id,'') = ?")
+            params.append(str(camera_id))
+        if trigger_type:
+            where.append("LOWER(COALESCE(e.trigger_type,'')) = ?")
+            params.append(str(trigger_type).strip().lower())
+        if shape_name:
+            where.append("LOWER(COALESCE(e.shape_name,'')) = ?")
+            params.append(str(shape_name).strip().lower())
+        if media_type:
+            where.append("LOWER(COALESCE(e.media_type,'')) = ?")
+            params.append(str(media_type).strip().lower())
+
+        q = (query or "").strip()
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        with self._connect() as conn:
+            if q:
+                try:
+                    fts_q = _fts_and_query(q)
+                    sql = f"""
+                    SELECT e.id, e.file_path, e.camera_name, e.shape_name, e.trigger_type, e.captured_ts, e.json_metadata
+                    FROM events_fts
+                    JOIN events e ON e.rowid = events_fts.rowid
+                    {where_sql + (' AND ' if where_sql else 'WHERE ') + 'events_fts MATCH ?'}
+                    ORDER BY e.captured_ts DESC
+                    LIMIT ?;
+                    """
+                    rows = list(conn.execute(sql, [*params, fts_q, limit]).fetchall())
+                except Exception:
+                    like = f"%{q.lower()}%"
+                    sql = f"""
+                    SELECT e.id, e.file_path, e.camera_name, e.shape_name, e.trigger_type, e.captured_ts, e.json_metadata
+                    FROM events e
+                    {where_sql}
+                    {"AND" if where_sql else "WHERE"} (
+                      LOWER(COALESCE(e.tags,'')) LIKE ? OR LOWER(COALESCE(e.shape_name,'')) LIKE ?
+                    )
+                    ORDER BY e.captured_ts DESC
+                    LIMIT ?;
+                    """
+                    rows = list(conn.execute(sql, [*params, like, like, limit]).fetchall())
+            else:
+                sql = f"""
+                SELECT e.id, e.file_path, e.camera_name, e.shape_name, e.trigger_type, e.captured_ts, e.json_metadata
+                FROM events e
+                {where_sql}
+                ORDER BY e.captured_ts DESC
+                LIMIT ?;
+                """
+                rows = list(conn.execute(sql, [*params, limit]).fetchall())
+        return [dict(r) for r in rows]
+
+    def relabel_one(self, event_id: str, model_id: str = "auto") -> Dict[str, Any]:
+        """Re-run object detection on a single indexed event."""
+        from .capture_label_model import (
+            capture_labeling_enabled,
+            detections_to_sidecar_fields,
+            get_cached_detector,
+            normalize_capture_label_model,
+            resolve_effective_model,
+        )
+
+        event_id = str(event_id or "").strip()
+        if not event_id:
+            raise ValueError("event_id is required")
+        mid = normalize_capture_label_model(model_id)
+        if not capture_labeling_enabled(mid):
+            raise ValueError("model must not be 'off' for relabel")
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, file_path, shape_name, tags, json_metadata FROM events WHERE id = ? LIMIT 1;",
+                (event_id,),
+            ).fetchone()
+        if not row:
+            raise ValueError("Event not found")
+
+        file_path = Path(str(row["file_path"]))
+        if not file_path.exists():
+            file_path = self._resolve_capture_path(str(row["file_path"]))
+
+        frame = self._read_analysis_frame(file_path)
+        if frame is None:
+            raise FileNotFoundError(f"Cannot read image/frame: {file_path}")
+
+        effective = resolve_effective_model(mid)
+        det = get_cached_detector(mid)
+        dets = det.detect(frame, conf_threshold=0.25) or []
+        dets = [d for d in dets if isinstance(d, dict)]
+        classes, det_tags, _payload = detections_to_sidecar_fields(dets)
+        source = str(getattr(det, "model_type", None) or effective)
+
+        det_rows = self._upsert_detections(
+            event_id=event_id,
+            file_path=file_path,
+            detections=dets,
+            source=source,
+            replace_existing=True,
+        )
+
+        meta: Dict[str, Any] = {}
+        try:
+            if row["json_metadata"]:
+                meta = json.loads(row["json_metadata"])
+        except Exception:
+            meta = {}
+
+        now = int(time.time())
+        history_entry = {
+            "model": mid,
+            "effective_model": effective,
+            "detector_type": getattr(det, "model_type", None),
+            "labeled_at": now,
+            "source": "relabel",
+            "count": len(det_rows or []),
+        }
+        self._append_label_history(meta, history_entry)
+
+        dominant_color = None
+        shape_name = row["shape_name"]
+        existing_tags = [t.strip() for t in (row["tags"] or "").split(",") if t.strip()]
+        tags = _merge_operator_shape_tags(
+            list(dict.fromkeys([*existing_tags, *det_tags])),
+            shape_name=str(shape_name) if shape_name else None,
+            operator_aliases=meta.get("operator_aliases") if isinstance(meta.get("operator_aliases"), list) else None,
+        )
+
+        try:
+            veh = []
+            for d in dets:
+                lab = str(d.get("class") or d.get("label") or "").strip().lower()
+                if lab not in {"car", "truck", "bus", "motorcycle"}:
+                    continue
+                bb = d.get("bbox") or {}
+                x = float(bb.get("x", 0) or 0)
+                y = float(bb.get("y", 0) or 0)
+                w = float(bb.get("w", 0) or 0)
+                h = float(bb.get("h", 0) or 0)
+                score = float(d.get("confidence", 0.0) or 0.0)
+                area = max(0.0, w) * max(0.0, h)
+                veh.append((area * (0.25 + score), (int(x), int(y), int(w), int(h))))
+            veh.sort(key=lambda t: t[0], reverse=True)
+            if veh:
+                _, (x, y, w, h) = veh[0]
+                dominant_color = self._estimate_dominant_color_from_bgr(frame, crop_box=(x, y, w, h))
+                if dominant_color:
+                    tags = list(dict.fromkeys([*tags, dominant_color]))[:32]
+        except Exception:
+            pass
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE events
+                SET detection_classes = ?, tags = ?, dominant_color = COALESCE(?, dominant_color),
+                    json_metadata = ?, detections_indexed_at = ?, updated_at = ?
+                WHERE id = ?;
+                """,
+                (
+                    ", ".join(classes) if classes else "",
+                    ", ".join(tags) if tags else "",
+                    dominant_color,
+                    json.dumps(meta, default=str),
+                    now,
+                    now,
+                    event_id,
+                ),
+            )
+
+        self._refresh_event_aggregates(event_id)
+        return {
+            "event_id": event_id,
+            "model": mid,
+            "effective_model": effective,
+            "detection_count": len(det_rows or []),
+            "detection_classes": classes,
+            "labeled_at": now,
+        }
+
+    def relabel_events(
+        self,
+        *,
+        model_id: str = "auto",
+        event_ids: Optional[Sequence[str]] = None,
+        camera_name: Optional[str] = None,
+        camera_id: Optional[str] = None,
+        trigger_type: Optional[str] = None,
+        shape_name: Optional[str] = None,
+        start_ts: Optional[int] = None,
+        end_ts: Optional[int] = None,
+        query: str = "",
+        media_type: Optional[str] = None,
+        max_items: int = 250,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Re-run detection on a bounded subset of indexed events."""
+        max_items = max(1, min(int(max_items or 250), 5000))
+        targets = self.list_events_for_relabel(
+            event_ids=event_ids,
+            camera_name=camera_name,
+            camera_id=camera_id,
+            trigger_type=trigger_type,
+            shape_name=shape_name,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            query=query,
+            media_type=media_type,
+            limit=max_items,
+        )
+        if dry_run:
+            return {
+                "dry_run": True,
+                "matched": len(targets),
+                "max_items": max_items,
+                "sample_ids": [str(t.get("id")) for t in targets[:10]],
+                "model": model_id,
+            }
+
+        processed = 0
+        errors: List[str] = []
+        results: List[Dict[str, Any]] = []
+        for t in targets:
+            eid = str(t.get("id") or "")
+            if not eid:
+                continue
+            try:
+                results.append(self.relabel_one(eid, model_id))
+                processed += 1
+            except Exception as exc:
+                errors.append(f"{eid}: {exc}")
+
+        return {
+            "dry_run": False,
+            "matched": len(targets),
+            "processed": processed,
+            "errors": errors[:25],
+            "error_count": len(errors),
+            "model": model_id,
+            "results": results[:10],
         }
 
     def count_unique_vehicles(

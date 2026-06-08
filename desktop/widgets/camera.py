@@ -3352,7 +3352,7 @@ class MotionWatchDialog(QDialog):
     def __init__(self, current_settings: Dict[str, object], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Motion Watch")
-        self.setFixedSize(420, 700)
+        self.setFixedSize(420, 780)
         self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
         self.settings = current_settings.copy()
         duration_val = int(self.settings.get("duration_sec", 30))
@@ -3517,6 +3517,34 @@ class MotionWatchDialog(QDialog):
         self.storage_threshold_spin.setEnabled(self.storage_auto_check.isChecked())
         form.addRow(storage_group)
 
+        # Capture labeling (object detection at ingest for Events search)
+        label_group = QGroupBox("Events search labeling")
+        label_layout = QFormLayout()
+        self.capture_label_combo = QComboBox()
+        try:
+            from core.capture_label_model import CAPTURE_LABEL_MODELS, probe_hardware
+
+            for model_id, label in CAPTURE_LABEL_MODELS:
+                self.capture_label_combo.addItem(label, model_id)
+            hw = probe_hardware()
+            self.capture_label_hint = QLabel(hw.get("detail") or "")
+            self.capture_label_hint.setWordWrap(True)
+            self.capture_label_hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        except Exception:
+            self.capture_label_hint = QLabel("")
+            self.capture_label_combo.addItem("Auto", "auto")
+            self.capture_label_combo.addItem("Off", "off")
+        current_model = str(self.settings.get("capture_label_model") or "auto")
+        if self.settings.get("local_enrich") is True and not self.settings.get("capture_label_model"):
+            current_model = "auto"
+        idx = self.capture_label_combo.findData(current_model)
+        if idx >= 0:
+            self.capture_label_combo.setCurrentIndex(idx)
+        label_layout.addRow("Capture model", self.capture_label_combo)
+        label_layout.addRow("", self.capture_label_hint)
+        label_group.setLayout(label_layout)
+        form.addRow(label_group)
+
         btn_row = QHBoxLayout()
         self.start_btn = QPushButton("Start")
         self.cancel_btn = QPushButton("Cancel")
@@ -3569,6 +3597,9 @@ class MotionWatchDialog(QDialog):
             "clip_save_dir": self.clip_save_dir_edit.text().strip(),
             "storage_auto_manage": bool(self.storage_auto_check.isChecked()),
             "storage_max_pct": int(self.storage_threshold_spin.value()),
+            "capture_label_model": str(
+                self.capture_label_combo.currentData() or self.capture_label_combo.currentText() or "auto"
+            ),
         }
 
     def _on_unit_change(self, text: str):
@@ -5354,6 +5385,7 @@ class CameraWidget(BaseDesktopWidget):
             "clip_resize_w": 640,
             "clip_quality": 23,
             "clip_save_dir": "",
+            "capture_label_model": "auto",
         }
         self.motion_watch_end_ts = 0.0
         self.motion_watch_last_trigger = 0.0
@@ -8778,8 +8810,20 @@ class CameraWidget(BaseDesktopWidget):
             settings = dict(self.motion_watch_settings or {})
             include_overlays = bool(settings.get("include_overlays", True))
             non_blocking = bool(settings.get("non_blocking_capture", True))
-            local_enrich = bool(settings.get("local_enrich", False))
             persist_overlay_snapshot = bool(settings.get("persist_overlay_snapshot", False))
+            try:
+                from core.capture_label_model import (
+                    capture_labeling_enabled,
+                    load_desktop_prefs,
+                    resolve_capture_label_model,
+                    enrich_sidecar_for_index,
+                )
+
+                capture_label_model = resolve_capture_label_model(settings, load_desktop_prefs())
+            except Exception:
+                capture_label_model = "auto"
+
+            label_at_capture = capture_labeling_enabled(capture_label_model)
 
             frame_img: Optional[QImage] = None
             if pre_encoded_jpg:
@@ -8938,12 +8982,13 @@ class CameraWidget(BaseDesktopWidget):
                         "camera_id": camera_id,
                         "camera_name": camera_label,
                         "enable_vision": False,
-                        "enable_detections": False,
+                        "enable_detections": bool(label_at_capture),
                         **({"trigger": trigger} if trigger else {}),
                         **({"motion_box": motion_box_payload} if motion_box_payload else {}),
                         "metadata": {
                             "media_type": "image",
                             "include_overlays": include_overlays,
+                            "capture_label_model": capture_label_model,
                             "overlay_snapshot": (
                                 overlay_snapshot
                                 if (include_overlays and persist_overlay_snapshot)
@@ -8951,6 +8996,12 @@ class CameraWidget(BaseDesktopWidget):
                             ),
                         },
                     }
+                    try:
+                        from core.capture_label_model import merge_shape_name_tags
+
+                        merge_shape_name_tags(sidecar_payload)
+                    except Exception:
+                        pass
                     sidecar_path = fname.with_suffix(".json")
                     try:
                         sidecar_path.write_text(json.dumps(sidecar_payload, separators=(",", ":")))
@@ -8959,72 +9010,23 @@ class CameraWidget(BaseDesktopWidget):
 
                     def _enrich_and_ingest():
                         try:
-                            # Don't let enrichment pile up; skip if another is running.
                             if not CameraWidget._motion_watch_ingest_sem.acquire(blocking=False):
                                 return
-                            # Optional: local enrich (can be CPU-heavy). Default OFF to keep live feeds smooth;
-                            # backend post-processing can fill in detections later.
-                            if local_enrich:
-                                try:
-                                    from core.object_detector import ObjectDetector
+                            try:
+                                from core.capture_label_model import enrich_sidecar_for_index
 
-                                    img_cv = cv2.imread(str(fname))
-                                    if img_cv is not None:
-                                        det = getattr(CameraWidget, "_motion_watch_yolo", None)
-                                        if det is None:
-                                            det = ObjectDetector(model_type="yolo", device="auto")
-                                            setattr(CameraWidget, "_motion_watch_yolo", det)
-                                        dets = det.detect(img_cv, conf_threshold=0.25) or []
-                                        labels = []
-                                        detections_payload = []
-                                        for d in dets:
-                                            if not isinstance(d, dict):
-                                                continue
-                                            lab = d.get("class") or d.get("label") or d.get("class_name")
-                                            if isinstance(lab, str) and lab.strip():
-                                                labels.append(lab.strip().lower())
-                                            try:
-                                                bb = d.get("bbox")
-                                                conf = float(d.get("confidence", 0.0) or 0.0)
-                                                if isinstance(lab, str) and lab.strip() and isinstance(bb, dict):
-                                                    detections_payload.append(
-                                                        {
-                                                            "class": lab.strip().lower(),
-                                                            "confidence": conf,
-                                                            "bbox": {
-                                                                "x": float(bb.get("x", 0) or 0),
-                                                                "y": float(bb.get("y", 0) or 0),
-                                                                "w": float(bb.get("w", 0) or 0),
-                                                                "h": float(bb.get("h", 0) or 0),
-                                                            },
-                                                        }
-                                                    )
-                                            except Exception:
-                                                continue
-                                        labels = list(dict.fromkeys([l for l in labels if l]))[:24]
-                                        if labels:
-                                            sidecar_payload["detection_classes"] = labels
-                                            tags = sidecar_payload.get("tags") or []
-                                            if not isinstance(tags, list):
-                                                tags = []
-                                            sidecar_payload["tags"] = list(dict.fromkeys([*(tags or []), *labels]))[:24]
-                                        sidecar_payload.setdefault("metadata", {})
-                                        if isinstance(sidecar_payload["metadata"], dict):
-                                            sidecar_payload["metadata"]["yolo"] = {
-                                                "detections": [
-                                                    {
-                                                        "class": (d.get("class") or d.get("label") or d.get("class_name")),
-                                                        "confidence": float(d.get("confidence", 0.0) or 0.0),
-                                                        "bbox": d.get("bbox"),
-                                                    }
-                                                    for d in dets[:15]
-                                                    if isinstance(d, dict)
-                                                ]
-                                            }
-                                        if detections_payload:
-                                            sidecar_payload["detections"] = detections_payload[:50]
-                                except Exception:
-                                    pass
+                                if label_at_capture:
+                                    enrich_sidecar_for_index(
+                                        sidecar_payload,
+                                        image_path=fname,
+                                        per_camera_settings=settings,
+                                    )
+                                else:
+                                    from core.capture_label_model import merge_shape_name_tags
+
+                                    merge_shape_name_tags(sidecar_payload)
+                            except Exception:
+                                pass
 
                             try:
                                 sidecar_path.write_text(json.dumps(sidecar_payload, separators=(",", ":")))
@@ -9340,6 +9342,30 @@ class CameraWidget(BaseDesktopWidget):
                         "resolution": f"{w}x{h}",
                     },
                 }
+
+                # Label middle frame for Events search (clips cannot be read by cv2.imread at ingest).
+                try:
+                    from core.capture_label_model import enrich_sidecar_for_index
+
+                    label_frame = first_arr
+                    if len(frames) > 1:
+                        mid_idx = len(frames) // 2
+                        mid_arr = cv2.imdecode(np.frombuffer(frames[mid_idx][1], dtype=np.uint8), cv2.IMREAD_COLOR)
+                        if mid_arr is not None:
+                            label_frame = mid_arr
+                    enrich_sidecar_for_index(
+                        sidecar_payload,
+                        frame_bgr=label_frame,
+                        per_camera_settings=settings,
+                    )
+                except Exception:
+                    try:
+                        from core.capture_label_model import merge_shape_name_tags
+
+                        merge_shape_name_tags(sidecar_payload)
+                    except Exception:
+                        pass
+
                 sidecar_path = fname.with_suffix(".json")
                 try:
                     sidecar_path.write_text(json.dumps(sidecar_payload, separators=(",", ":")))

@@ -1296,11 +1296,7 @@ def ensure_camera_stream_metadata(camera: Dict[str, Any]) -> None:
     if not isinstance(camera, dict) or not camera.get('id'):
         return
 
-    stream_priority = _normalize_stream_priority(
-        camera.get('stream_priority') or ('sub' if str(camera.get('stream_quality') or '').strip().lower() == 'low' else 'main')
-    )
-    camera['stream_priority'] = stream_priority
-    camera['stream_quality'] = _normalize_stream_quality(stream_priority, camera.get('stream_quality'))
+    explicit_priority = str(camera.get('stream_priority') or '').strip()
 
     base_stream_path = (
         _normalize_stream_path(camera.get('stream_path')) or
@@ -1359,6 +1355,19 @@ def ensure_camera_stream_metadata(camera: Dict[str, Any]) -> None:
         camera.pop('mediamtx_sub_path', None)
         camera.pop('webrtc_sub_whep_url', None)
         camera.pop('hls_sub_url', None)
+
+    has_sub = bool(camera.get('substream_rtsp_url') or camera.get('mediamtx_sub_path'))
+    if explicit_priority:
+        stream_priority = _normalize_stream_priority(explicit_priority)
+    elif has_sub:
+        # Portal and multi-cam grids rely on substreams; default new cameras to sub when available.
+        stream_priority = 'sub'
+    elif str(camera.get('stream_quality') or '').strip().lower() == 'low':
+        stream_priority = 'sub'
+    else:
+        stream_priority = 'main'
+    camera['stream_priority'] = stream_priority
+    camera['stream_quality'] = _normalize_stream_quality(stream_priority, camera.get('stream_quality'))
 
 
 def _test_rtsp_stream(rtsp_url: str, timeout: int = 5) -> bool:
@@ -4606,37 +4615,46 @@ def get_camera_stream(camera_id):
             "message": "Camera not found"
         }), 404
 
+    requested_tier = str(request.args.get('stream') or request.args.get('tier') or '').strip().lower()
+    priority = _normalize_stream_priority(
+        requested_tier if requested_tier in {'main', 'sub'} else camera.get('stream_priority')
+    )
+    use_sub = priority == 'sub' and bool(
+        camera.get('substream_rtsp_url') or camera.get('mediamtx_sub_path') or camera.get('webrtc_sub_whep_url')
+    )
+
     # Ensure MediaMTX path exists (On-Demand Configuration)
     try:
+        main_path = camera.get('mediamtx_path', camera_id)
         rtsp_url = camera.get('rtsp_url')
-        if rtsp_url:
-            main_path = camera.get('mediamtx_path', camera_id)
-            
-            # Only try to create if it's likely not ready, or just always ensure (idempotent)
-            # Since we have connection pooling now, a quick check/create is cheap
-            created = mediamtx.create_path(main_path, rtsp_url)
+        sub_rtsp_url = camera.get('substream_rtsp_url')
+        sub_path = camera.get('mediamtx_sub_path')
+
+        def _ensure_path(path_name, source_url, label):
+            if not path_name or not source_url:
+                return False
+            created = mediamtx.create_path(path_name, source_url)
             if created:
-                logger.info(f"✅ [On-Demand] Configured MediaMTX path for {camera.get('name')}")
-                # Update status immediately so frontend sees it as 'online'
+                logger.info(f"✅ [On-Demand] Configured MediaMTX {label} path for {camera.get('name')}")
                 camera['status'] = 'online'
                 camera['ready'] = True
-            else:
-                logger.warning(f"⚠️ [On-Demand] Failed to configure path for {camera.get('name')}")
-                
-            # Handle substream if present
-            if camera.get('substream_rtsp_url') and camera.get('mediamtx_sub_path'):
-                sub_path = camera['mediamtx_sub_path']
-                mediamtx.create_path(sub_path, camera['substream_rtsp_url'])
-                
+                return True
+            logger.warning(f"⚠️ [On-Demand] Failed to configure {label} path for {camera.get('name')}")
+            return False
+
+        if use_sub and sub_rtsp_url and sub_path:
+            _ensure_path(sub_path, sub_rtsp_url, 'sub')
+            if rtsp_url:
+                _ensure_path(main_path, rtsp_url, 'main')
+        elif rtsp_url:
+            _ensure_path(main_path, rtsp_url, 'main')
+            if sub_rtsp_url and sub_path:
+                _ensure_path(sub_path, sub_rtsp_url, 'sub')
     except Exception as e:
         logger.error(f"Error configuring on-demand path for {camera_id}: {e}")
 
     # Get ICE servers
     ice_servers = mediamtx.get_ice_servers()
-
-    # Determine which stream to serve based on priority
-    priority = _normalize_stream_priority(camera.get('stream_priority'))
-    use_sub = (priority == 'sub' and camera.get('webrtc_sub_whep_url'))
 
     if use_sub:
         active_whep = camera.get('webrtc_sub_whep_url')

@@ -189,7 +189,7 @@ _events_reindex_state: Dict[str, Any] = {
     "started_at": None,
     "finished_at": None,
     "updated_at": None,
-    "total_target": None,  # best-effort: number of items we intend to process (after filters/max_files)
+    "total_target": None,
     "scanned": 0,
     "processed": 0,
     "skipped": 0,
@@ -197,6 +197,19 @@ _events_reindex_state: Dict[str, Any] = {
     "error_count": 0,
     "eta_seconds": None,
     "cloud": {"enabled": False, "max_calls": 0, "calls": 0, "provider": None, "model": None},
+    "config": {},
+}
+_events_relabel_lock = threading.Lock()
+_events_relabel_state: Dict[str, Any] = {
+    "running": False,
+    "job_id": None,
+    "started_at": None,
+    "finished_at": None,
+    "updated_at": None,
+    "matched": 0,
+    "processed": 0,
+    "errors": [],
+    "error_count": 0,
     "config": {},
 }
 
@@ -421,7 +434,8 @@ def events_search():
         data = request.get_json() or {}
         query = str(data.get("query") or data.get("text") or "").strip()
         limit = int(data.get("limit", 25) or 25)
-        camera_ref = data.get("camera_name") or data.get("cameraName") or data.get("cameraRef") or data.get("camera")
+        offset = int(data.get("offset", 0) or 0)
+        before_ts = data.get("before_ts") or data.get("beforeTs")
         filters = data.get("filters") if isinstance(data.get("filters"), dict) else {}
         dominant_color = (filters.get("dominant_color") or filters.get("color") or data.get("dominant_color") or data.get("color"))
         trigger_type = (filters.get("trigger_type") or data.get("trigger_type"))
@@ -521,7 +535,9 @@ def events_search():
             return None
         start_ts_i = _to_ts(start_ts)
         end_ts_i = _to_ts(end_ts)
+        before_ts_i = _to_ts(before_ts)
 
+        camera_ref = data.get("camera_name") or data.get("cameraName") or data.get("cameraRef") or data.get("camera")
         min_conf_f = None
         min_area_f = None
         try:
@@ -535,6 +551,7 @@ def events_search():
         except Exception:
             min_area_f = None
 
+        fetch_limit = max(1, min(int(limit or 25), 5000))
         hits = event_index_service.search(
             query=query,
             camera_name=str(camera_ref).strip() if isinstance(camera_ref, str) and str(camera_ref).strip() else None,
@@ -547,8 +564,13 @@ def events_search():
             min_area=min_area_f,
             start_ts=start_ts_i,
             end_ts=end_ts_i,
-            limit=limit,
+            before_ts=before_ts_i,
+            offset=offset,
+            limit=fetch_limit + 1,
         )
+        has_more = len(hits) > fetch_limit
+        if has_more:
+            hits = hits[:fetch_limit]
 
         # Auto-refresh (bounded): if 0 hits, try ingesting the most recent captures for this camera
         # and retry once. This fixes the "just captured but not indexed yet" case (e.g., backend restart).
@@ -611,8 +633,13 @@ def events_search():
                         min_area=min_area_f,
                         start_ts=start_ts_i,
                         end_ts=end_ts_i,
-                        limit=limit,
+                        before_ts=before_ts_i,
+                        offset=offset,
+                        limit=fetch_limit + 1,
                     )
+                    has_more = len(hits) > fetch_limit
+                    if has_more:
+                        hits = hits[:fetch_limit]
         except Exception:
             pass
 
@@ -674,7 +701,15 @@ def events_search():
                     timeline[-1]["detections"] = []
 
         summary = f"Found {len(timeline)} event(s)."
-        return jsonify({'success': True, 'data': {'message': summary, 'timeline': timeline}})
+        return jsonify({
+            'success': True,
+            'data': {
+                'message': summary,
+                'timeline': timeline,
+                'has_more': has_more,
+                'next_before_ts': timeline[-1]['captured_ts'] if timeline and has_more else None,
+            },
+        })
     except Exception as e:
         logger.error(f"Events search error: {e}")
         return jsonify({'success': False, 'message': 'Failed to search events'}), 500
@@ -1369,8 +1404,13 @@ def events_report():
             min_area=min_area_f,
             start_ts=start_ts_i,
             end_ts=end_ts_i,
-            limit=limit,
+            before_ts=before_ts_i,
+            offset=offset,
+            limit=fetch_limit + 1,
         )
+        has_more = len(hits) > fetch_limit
+        if has_more:
+            hits = hits[:fetch_limit]
 
         relaxed_note = None
         # If the user asked for a very specific color and we got 0 matches, still generate a useful report:
@@ -2969,6 +3009,171 @@ def events_override():
     except Exception as e:
         logger.error(f"Events override error: {e}")
         return jsonify({'success': False, 'message': 'Failed to save override'}), 500
+
+
+@api_bp.route('/events/tags', methods=['POST'])
+def events_set_tags():
+    """
+    Operator correction: merge or replace event-level tags for Events search.
+    """
+    try:
+        if not event_index_service:
+            return jsonify({'success': False, 'message': 'Event index not available'}), 503
+        data = request.get_json() or {}
+        event_id = data.get("event_id") or data.get("eventId") or data.get("id")
+        tags = data.get("tags")
+        merge = bool(data.get("merge", True))
+        updated_by = data.get("updated_by") or data.get("updatedBy") or data.get("source")
+
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+        if not event_id:
+            return jsonify({'success': False, 'message': 'event_id is required'}), 400
+        if not isinstance(tags, list):
+            return jsonify({'success': False, 'message': 'tags must be a list or comma-separated string'}), 400
+
+        result = event_index_service.set_event_tags(
+            str(event_id),
+            tags=tags,
+            merge=merge,
+            updated_by=str(updated_by) if updated_by else None,
+        )
+        return jsonify({'success': True, 'data': result})
+    except ValueError as e:
+        return jsonify({'success': False, 'message': str(e)}), 400
+    except Exception as e:
+        logger.error(f"Events tags error: {e}")
+        return jsonify({'success': False, 'message': 'Failed to update tags'}), 500
+
+
+def _events_relabel_status_payload() -> Dict[str, Any]:
+    with _events_relabel_lock:
+        return dict(_events_relabel_state)
+
+
+@api_bp.route('/events/relabel', methods=['GET', 'POST'])
+def events_relabel():
+    """
+    Re-run object detection on a bounded subset of indexed events.
+    """
+    try:
+        if not event_index_service:
+            return jsonify({'success': False, 'message': 'Event index not available'}), 503
+
+        if request.method == 'GET':
+            return jsonify({'success': True, 'data': _events_relabel_status_payload()})
+
+        data = request.get_json() or {}
+        model = str(data.get("model") or data.get("capture_label_model") or "auto").strip()
+        dry_run = bool(data.get("dry_run", data.get("dryRun", False)))
+        max_items = int(data.get("max_items") or data.get("maxItems") or 250)
+        event_ids = data.get("event_ids") or data.get("eventIds") or []
+        if isinstance(event_ids, str):
+            event_ids = [event_ids]
+        if not isinstance(event_ids, list):
+            event_ids = []
+
+        filters = data.get("filters") if isinstance(data.get("filters"), dict) else {}
+        start_ts = data.get("start_ts") or data.get("startTs") or filters.get("start_ts")
+        end_ts = data.get("end_ts") or data.get("endTs") or filters.get("end_ts")
+        camera_name = data.get("camera_name") or filters.get("camera_name")
+        camera_id = data.get("camera_id") or filters.get("camera_id")
+        trigger_type = data.get("trigger_type") or filters.get("trigger_type")
+        shape_name = data.get("shape_name") or filters.get("shape_name")
+        query = str(data.get("query") or filters.get("query") or "").strip()
+        media_type = data.get("media_type") or filters.get("media_type")
+
+        def _parse_ts(v):
+            if v is None or str(v).strip() == "":
+                return None
+            try:
+                return int(v)
+            except Exception:
+                return None
+
+        relabel_kwargs = dict(
+            model_id=model,
+            event_ids=[str(x) for x in event_ids if str(x).strip()] or None,
+            camera_name=str(camera_name).strip() if camera_name else None,
+            camera_id=str(camera_id).strip() if camera_id else None,
+            trigger_type=str(trigger_type).strip() if trigger_type else None,
+            shape_name=str(shape_name).strip() if shape_name else None,
+            start_ts=_parse_ts(start_ts),
+            end_ts=_parse_ts(end_ts),
+            query=query,
+            media_type=str(media_type).strip() if media_type else None,
+            max_items=max_items,
+        )
+
+        if dry_run:
+            result = event_index_service.relabel_events(**relabel_kwargs, dry_run=True)
+            return jsonify({'success': True, 'data': result})
+
+        with _events_relabel_lock:
+            if _events_relabel_state.get("running"):
+                return jsonify({'success': True, 'data': _events_relabel_status_payload()})
+
+        import hashlib
+
+        job_id = hashlib.sha1(f"relabel|{time.time()}|{model}".encode()).hexdigest()[:16]
+        with _events_relabel_lock:
+            _events_relabel_state.update(
+                {
+                    "running": True,
+                    "job_id": job_id,
+                    "started_at": int(time.time()),
+                    "finished_at": None,
+                    "updated_at": int(time.time()),
+                    "matched": 0,
+                    "processed": 0,
+                    "errors": [],
+                    "error_count": 0,
+                    "config": {**relabel_kwargs, "dry_run": False},
+                }
+            )
+
+        def _worker():
+            try:
+                result = event_index_service.relabel_events(**relabel_kwargs, dry_run=False)
+                with _events_relabel_lock:
+                    if _events_relabel_state.get("job_id") == job_id:
+                        _events_relabel_state["matched"] = int(result.get("matched") or 0)
+                        _events_relabel_state["processed"] = int(result.get("processed") or 0)
+                        _events_relabel_state["errors"] = (result.get("errors") or [])[:25]
+                        _events_relabel_state["error_count"] = int(result.get("error_count") or 0)
+                        _events_relabel_state["updated_at"] = int(time.time())
+            except Exception as exc:
+                with _events_relabel_lock:
+                    if _events_relabel_state.get("job_id") == job_id:
+                        _events_relabel_state["errors"] = [str(exc)]
+                        _events_relabel_state["error_count"] = 1
+                        _events_relabel_state["updated_at"] = int(time.time())
+            finally:
+                with _events_relabel_lock:
+                    if _events_relabel_state.get("job_id") == job_id:
+                        _events_relabel_state["running"] = False
+                        _events_relabel_state["finished_at"] = int(time.time())
+                        _events_relabel_state["updated_at"] = int(time.time())
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return jsonify({'success': True, 'data': _events_relabel_status_payload()})
+    except Exception as e:
+        logger.error(f"Events relabel error: {e}")
+        return jsonify({'success': False, 'message': 'Failed to relabel events'}), 500
+
+
+@api_bp.route('/events/capture-label-models', methods=['GET'])
+def events_capture_label_models():
+    """List capture labeling models and hardware recommendation for desktop UI."""
+    try:
+        from core.capture_label_model import CAPTURE_LABEL_MODELS, probe_hardware
+
+        hw = probe_hardware()
+        models = [{"id": mid, "label": lbl} for mid, lbl in CAPTURE_LABEL_MODELS]
+        return jsonify({'success': True, 'data': {'models': models, 'hardware': hw}})
+    except Exception as e:
+        logger.error(f"Capture label models error: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 
 def _events_reindex_status_payload() -> Dict[str, Any]:
@@ -5450,16 +5655,38 @@ def trigger_manual_recovery(camera_id):
 
 # ==================== STREAMING ENDPOINTS ====================
 
+def _load_camera_dict_for_stream(camera_id: str) -> Optional[Dict[str, Any]]:
+    """Best-effort camera lookup when camera_manager is unavailable."""
+    if camera_manager is not None:
+        cam = safe_service_call(camera_manager, 'get_camera', None, camera_id)
+        if isinstance(cam, dict):
+            return cam
+        if cam is not None:
+            return {
+                'id': getattr(cam, 'id', camera_id),
+                'rtsp_url': getattr(cam, 'rtsp_url', None),
+                'substream_rtsp_url': getattr(cam, 'substream_rtsp_url', None),
+                'mediamtx_path': getattr(cam, 'mediamtx_path', None),
+                'mediamtx_sub_path': getattr(cam, 'mediamtx_sub_path', None),
+                'stream_priority': getattr(cam, 'stream_priority', None),
+                'substream_capable': getattr(cam, 'substream_capable', None),
+            }
+    try:
+        cameras_path = 'data/cameras.json' if os.path.exists('data/cameras.json') else 'cameras.json'
+        with open(cameras_path, 'r', encoding='utf-8') as f:
+            cameras_db = json.load(f)
+        for cam in cameras_db:
+            if cam.get('id') == camera_id:
+                return cam
+    except Exception:
+        pass
+    return None
+
+
 @api_bp.route('/cameras/<camera_id>/stream', methods=['GET'])
 def get_video_stream(camera_id):
     """Get video stream for camera"""
     try:
-        if not camera_manager:
-            return jsonify({
-                "success": False,
-                "message": "Camera manager not available"
-            }), 503
-
         stream_format = request.args.get('format', 'mjpeg')
         quality = request.args.get('quality', 'medium')
         fmt = stream_format.lower()
@@ -5467,7 +5694,7 @@ def get_video_stream(camera_id):
         # HLS/WHEP/WebRTC warmup: MediaMTX-only — do not require an active
         # OpenCV capture or stream_server session (avoids duplicate upstream).
         if fmt in {'hls', 'webrtc', 'whep'}:
-            cam = safe_service_call(camera_manager, 'get_camera', None, camera_id)
+            cam = _load_camera_dict_for_stream(camera_id)
             if not cam:
                 return jsonify({
                     "success": False,
@@ -5553,6 +5780,12 @@ def get_video_stream(camera_id):
                 "data": stream_info,
                 "message": "Stream info retrieved"
             })
+
+        if not camera_manager:
+            return jsonify({
+                "success": False,
+                "message": "Camera manager not available"
+            }), 503
 
         # Get stream info (MJPEG and legacy paths)
         stream_info = safe_service_call(camera_manager, 'get_stream_info', None, camera_id, stream_format, quality)

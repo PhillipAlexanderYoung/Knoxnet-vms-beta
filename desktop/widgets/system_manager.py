@@ -825,6 +825,7 @@ class SystemManagerDialog(QDialog):
         self._on_disk_protect_toggled(self._disk_protect_chk.isChecked())
 
         # ── Knoxnet Security Post portal ──
+        self._build_events_index_panel(root)
         self._build_security_post_panel(root)
 
         # ── Optional Services (collapsed by default) ──
@@ -1577,6 +1578,196 @@ class SystemManagerDialog(QDialog):
         except Exception:
             pass
         self.health_lbl.setText("  ·  ".join(parts) if parts else "")
+
+    # ----------------------------------------------------------------
+    # Events index / Motion Watch labeling defaults
+    # ----------------------------------------------------------------
+
+    def _build_events_index_panel(self, root):
+        box = QGroupBox("Events Search (Motion Watch labeling)")
+        box.setToolTip(
+            "Default object-detection model for Motion Watch captures. "
+            "Per-camera overrides are available in each camera's Motion Watch dialog."
+        )
+        form = QFormLayout(box)
+
+        prefs = self._load_prefs()
+        events_cfg = prefs.get("events_index") if isinstance(prefs.get("events_index"), dict) else {}
+
+        self._events_label_combo = QComboBox()
+        try:
+            from core.capture_label_model import CAPTURE_LABEL_MODELS, probe_hardware
+
+            for model_id, label in CAPTURE_LABEL_MODELS:
+                self._events_label_combo.addItem(label, model_id)
+            hw = probe_hardware()
+            self._events_hw_lbl = QLabel(hw.get("detail") or "")
+            self._events_hw_lbl.setWordWrap(True)
+            self._events_hw_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        except Exception:
+            self._events_hw_lbl = QLabel("")
+            self._events_label_combo.addItem("Auto", "auto")
+
+        current = str(events_cfg.get("capture_label_model") or prefs.get("capture_label_model") or "auto")
+        idx = self._events_label_combo.findData(current)
+        if idx >= 0:
+            self._events_label_combo.setCurrentIndex(idx)
+        form.addRow("Default capture model:", self._events_label_combo)
+        form.addRow("", self._events_hw_lbl)
+
+        save_btn = QPushButton("Save")
+        save_btn.setFixedWidth(70)
+        save_btn.clicked.connect(self._save_events_index_settings)
+        form.addRow("", save_btn)
+
+        # Re-classify existing events
+        relabel_group = QGroupBox("Re-run detection on past events")
+        relabel_layout = QFormLayout()
+        self._relabel_model_combo = QComboBox()
+        try:
+            from core.capture_label_model import CAPTURE_LABEL_MODELS
+
+            for model_id, label in CAPTURE_LABEL_MODELS:
+                if model_id == "off":
+                    continue
+                self._relabel_model_combo.addItem(label, model_id)
+        except Exception:
+            self._relabel_model_combo.addItem("Auto", "auto")
+        relabel_layout.addRow("Detection model:", self._relabel_model_combo)
+
+        self._relabel_start_ts = QLineEdit()
+        self._relabel_start_ts.setPlaceholderText("Unix start (optional)")
+        self._relabel_end_ts = QLineEdit()
+        self._relabel_end_ts.setPlaceholderText("Unix end (optional)")
+        ts_row = QHBoxLayout()
+        ts_row.addWidget(self._relabel_start_ts)
+        ts_row.addWidget(self._relabel_end_ts)
+        relabel_layout.addRow("Time range:", ts_row)
+
+        self._relabel_camera_edit = QLineEdit()
+        self._relabel_camera_edit.setPlaceholderText("Camera name (optional)")
+        relabel_layout.addRow("Camera:", self._relabel_camera_edit)
+
+        self._relabel_trigger_combo = QComboBox()
+        self._relabel_trigger_combo.addItem("Any trigger", "")
+        for tid, tlabel in (
+            ("entered_zone", "Zone"),
+            ("crossed_line", "Line"),
+            ("near_tag", "Tag"),
+            ("motion_watch", "Motion watch"),
+        ):
+            self._relabel_trigger_combo.addItem(tlabel, tid)
+        relabel_layout.addRow("Event type:", self._relabel_trigger_combo)
+
+        self._relabel_shape_edit = QLineEdit()
+        self._relabel_shape_edit.setPlaceholderText("Zone/line/tag name (optional)")
+        relabel_layout.addRow("Shape name:", self._relabel_shape_edit)
+
+        self._relabel_max_spin = QSpinBox()
+        self._relabel_max_spin.setRange(1, 5000)
+        self._relabel_max_spin.setValue(250)
+        relabel_layout.addRow("Max events:", self._relabel_max_spin)
+
+        self._relabel_status_lbl = QLabel("")
+        self._relabel_status_lbl.setWordWrap(True)
+        self._relabel_status_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        relabel_layout.addRow("", self._relabel_status_lbl)
+
+        btn_row = QHBoxLayout()
+        preview_btn = QPushButton("Preview count")
+        preview_btn.clicked.connect(self._preview_relabel_events)
+        run_btn = QPushButton("Re-run detection")
+        run_btn.clicked.connect(self._run_relabel_events)
+        btn_row.addWidget(preview_btn)
+        btn_row.addWidget(run_btn)
+        relabel_layout.addRow("", btn_row)
+
+        relabel_group.setLayout(relabel_layout)
+        form.addRow(relabel_group)
+
+        root.addWidget(box)
+
+    def _save_events_index_settings(self):
+        try:
+            prefs = self._load_prefs()
+            events_cfg = prefs.get("events_index") if isinstance(prefs.get("events_index"), dict) else {}
+            model_id = str(self._events_label_combo.currentData() or "auto")
+            events_cfg["capture_label_model"] = model_id
+            prefs["events_index"] = events_cfg
+            if self._app:
+                self._app._save_prefs(prefs)
+            self._events_hw_lbl.setText("Saved default capture labeling model.")
+        except Exception as e:
+            try:
+                self._events_hw_lbl.setText(f"Save failed: {e}")
+            except Exception:
+                pass
+
+    def _relabel_events_payload(self) -> dict:
+        def _parse_ts(text: str):
+            s = str(text or "").strip()
+            if not s:
+                return None
+            if s.isdigit():
+                return int(s)
+            return None
+
+        return {
+            "model": str(self._relabel_model_combo.currentData() or "auto"),
+            "max_items": int(self._relabel_max_spin.value()),
+            "start_ts": _parse_ts(self._relabel_start_ts.text()),
+            "end_ts": _parse_ts(self._relabel_end_ts.text()),
+            "camera_name": self._relabel_camera_edit.text().strip() or None,
+            "trigger_type": str(self._relabel_trigger_combo.currentData() or "").strip() or None,
+            "shape_name": self._relabel_shape_edit.text().strip() or None,
+        }
+
+    def _preview_relabel_events(self):
+        payload = self._relabel_events_payload()
+        payload["dry_run"] = True
+        self._relabel_status_lbl.setText("Counting matching events…")
+        threading.Thread(target=self._relabel_events_request, args=(payload, True), daemon=True).start()
+
+    def _run_relabel_events(self):
+        payload = self._relabel_events_payload()
+        payload["dry_run"] = False
+        self._relabel_status_lbl.setText("Starting re-detection job…")
+        threading.Thread(target=self._relabel_events_request, args=(payload, False), daemon=True).start()
+
+    def _relabel_events_request(self, payload: dict, preview: bool):
+        try:
+            if preview:
+                res = requests.post("http://localhost:5000/api/events/relabel", json=payload, timeout=60)
+                if not res.ok:
+                    self._relabel_status_lbl.setText(f"Preview failed ({res.status_code})")
+                    return
+                data = (res.json() or {}).get("data") or {}
+                matched = int(data.get("matched") or 0)
+                self._relabel_status_lbl.setText(f"Would re-label {matched} event(s) with model '{payload.get('model')}'.")
+                return
+
+            res = requests.post("http://localhost:5000/api/events/relabel", json=payload, timeout=30)
+            if not res.ok:
+                self._relabel_status_lbl.setText(f"Relabel start failed ({res.status_code})")
+                return
+            for _ in range(120):
+                time.sleep(2)
+                st = requests.get("http://localhost:5000/api/events/relabel", timeout=15)
+                if not st.ok:
+                    continue
+                state = (st.json() or {}).get("data") or {}
+                if state.get("running"):
+                    proc = int(state.get("processed") or 0)
+                    matched = int(state.get("matched") or 0)
+                    self._relabel_status_lbl.setText(f"Re-labeling… {proc}/{matched}")
+                    continue
+                proc = int(state.get("processed") or 0)
+                errs = int(state.get("error_count") or 0)
+                self._relabel_status_lbl.setText(f"Done: processed {proc}, errors {errs}.")
+                return
+            self._relabel_status_lbl.setText("Relabel job timed out while polling status.")
+        except Exception as e:
+            self._relabel_status_lbl.setText(f"Relabel error: {e}")
 
     # ----------------------------------------------------------------
     # Knoxnet Security Post panel

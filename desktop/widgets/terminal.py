@@ -81,6 +81,8 @@ class GhostLineEdit(QLineEdit):
         "alerts",
         "tools",
         "events backfill",
+        "events relabel",
+        "events tags ",
         "events reindex",
         "events enrich",
         "events report ",
@@ -636,6 +638,7 @@ class TerminalWidget(BaseDesktopWidget):
                 "\n"
                 "  Events:\n"
                 "  events enrich [N]      – classify unprocessed captures with YOLO\n"
+                "  events tags <id> t1,t2 – add searchable tags to an event\n"
                 "  live report            – open live security report dashboard\n"
                 "  events live            – open live security report dashboard"
             )
@@ -647,9 +650,36 @@ class TerminalWidget(BaseDesktopWidget):
             # Syntax:
             #   events <free text query>
             #   events backfill [N]
+            #   events tags <event_id> tag1, tag2
             #   events reindex [max_files] [--force] [--cloud <max_calls>]
             #   events report <free text query>
             parts = text.split()
+            if len(parts) >= 2 and parts[1].lower() == "relabel":
+                model = "auto"
+                max_items = 250
+                for tok in parts[2:]:
+                    if tok.startswith("model="):
+                        model = tok.split("=", 1)[1].strip()
+                    elif tok.isdigit():
+                        max_items = max(1, min(int(tok), 5000))
+                payload = {"model": model, "max_items": max_items, "dry_run": False}
+                self._add_system(f"Re-labeling up to {max_items} events with model={model}…")
+                threading.Thread(target=self._events_relabel, args=(payload,), daemon=True).start()
+                return
+            if len(parts) >= 2 and parts[1].lower() == "tags":
+                # events tags <event_id> tag1, tag2, ...
+                if len(parts) < 3:
+                    self._add_warning("Usage: events tags <event_id> tag1, tag2, ...")
+                    return
+                event_id = parts[2].strip()
+                tag_str = text.split(" ", 3)[3].strip() if len(parts) >= 4 else ""
+                if not event_id or not tag_str:
+                    self._add_warning("Usage: events tags <event_id> tag1, tag2, ...")
+                    return
+                tags = [t.strip() for t in tag_str.split(",") if t.strip()]
+                self._add_system(f"Updating tags for event {event_id}…")
+                threading.Thread(target=self._events_set_tags, args=(event_id, tags), daemon=True).start()
+                return
             if len(parts) >= 2 and parts[1].lower() == "backfill":
                 n = 250
                 if len(parts) >= 3 and parts[2].isdigit():
@@ -2310,6 +2340,54 @@ class TerminalWidget(BaseDesktopWidget):
             )
         except Exception as e:
             self._post_error(f"Events backfill error: {e}", tool="events_backfill")
+
+    def _events_set_tags(self, event_id: str, tags: List[str]):
+        try:
+            if not self._ensure_backend_running():
+                self._post_error("Backend API is not running (http://localhost:5000). Start it with: python app.py", tool="events_tags")
+                return
+            res = requests.post(
+                f"{self.API_BASE}/events/tags",
+                json={"event_id": event_id, "tags": tags, "merge": True, "updated_by": "pyqt-terminal"},
+                timeout=15,
+            )
+            if not res.ok:
+                self._post_error(f"Events tags update failed ({res.status_code})", tool="events_tags")
+                return
+            j = res.json() or {}
+            if not j.get("success"):
+                self._post_error(j.get("message") or "Events tags update failed", tool="events_tags")
+                return
+            data = j.get("data") or {}
+            merged = data.get("tags") or tags
+            self._post_success(f"Tags updated: {', '.join(merged)}", tool="events_tags")
+        except Exception as e:
+            self._post_error(f"Events tags error: {e}", tool="events_tags")
+
+    def _events_relabel(self, payload: dict):
+        try:
+            if not self._ensure_backend_running():
+                self._post_error("Backend API is not running (http://localhost:5000). Start it with: python app.py", tool="events_relabel")
+                return
+            res = requests.post(f"{self.API_BASE}/events/relabel", json=payload, timeout=30)
+            if not res.ok:
+                self._post_error(f"Events relabel failed ({res.status_code})", tool="events_relabel")
+                return
+            for _ in range(120):
+                time.sleep(2)
+                st = requests.get(f"{self.API_BASE}/events/relabel", timeout=15)
+                if not st.ok:
+                    continue
+                state = (st.json() or {}).get("data") or {}
+                if state.get("running"):
+                    continue
+                proc = int(state.get("processed") or 0)
+                errs = int(state.get("error_count") or 0)
+                self._post_success(f"Relabel complete: processed={proc}, errors={errs}", tool="events_relabel")
+                return
+            self._post_error("Relabel job timed out", tool="events_relabel")
+        except Exception as e:
+            self._post_error(f"Events relabel error: {e}", tool="events_relabel")
 
     def _events_reindex(self, max_files: Optional[int], force: bool, cloud_enrich: bool, cloud_max_calls: int):
         """
