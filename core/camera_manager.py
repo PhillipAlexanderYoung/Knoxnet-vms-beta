@@ -2239,6 +2239,9 @@ class CameraManager:
         if not want_sub and config.substream_rtsp_url and config.substream_capable is not False:
             candidates.append((sub_path, config.substream_rtsp_url))
 
+        mtx_only = bool(config.webrtc_enabled and self.mediamtx_client)
+        effective_wait = max(wait_timeout, 12.0) if mtx_only else wait_timeout
+
         mtx_host = self.mediamtx_client.mediamtx_host or "localhost"
         seen: set[str] = set()
         for path, direct_url in candidates:
@@ -2251,13 +2254,23 @@ class CameraManager:
                 ready = bool(info and info.get("ready"))
             except Exception:
                 pass
-            if not ready and wait_timeout > 0:
+            if not ready and effective_wait > 0:
                 ready = await self._wait_for_mediamtx_path_ready(
-                    path, total_timeout=wait_timeout
+                    path, total_timeout=effective_wait
                 )
             if ready:
                 local_url = f"rtsp://{mtx_host}:8554/{path}"
                 return local_url, direct_url, True
+
+        if mtx_only and candidates:
+            path, direct_url = candidates[0]
+            local_url = f"rtsp://{mtx_host}:8554/{path}"
+            logger.warning(
+                "MediaMTX path not ready for %s after %.1fs; refusing direct camera RTSP",
+                camera_id,
+                effective_wait,
+            )
+            return local_url, direct_url, True
 
         if want_sub and config.substream_rtsp_url:
             return config.substream_rtsp_url, config.substream_rtsp_url, False
@@ -2279,7 +2292,7 @@ class CameraManager:
             if camera_id in self.active_streams:
                 return  # Already streaming
 
-            wait_timeout = 5.0 if config.webrtc_enabled else 3.0
+            wait_timeout = 12.0 if config.webrtc_enabled else 3.0
             stream_url, direct_url, use_local = await self._pick_local_mediamtx_read(
                 camera_id, config, wait_timeout=wait_timeout
             )
@@ -2288,6 +2301,11 @@ class CameraManager:
                 logger.info(
                     "MediaMTX path ready - reading from local re-stream %s",
                     stream_url,
+                )
+            elif config.webrtc_enabled:
+                logger.warning(
+                    "No ready MediaMTX path for %s; direct camera RTSP is disabled (webrtc_enabled)",
+                    camera_id,
                 )
             else:
                 logger.info(
@@ -2301,20 +2319,41 @@ class CameraManager:
                 self._open_capture_with_retry, stream_url, max_attempts=3
             )
 
-            # If the local re-stream failed, fall back to the direct camera URL.
+            # If the local re-stream failed, retry localhost only when webrtc is
+            # enabled — never open a second direct camera session.
             if use_local and (not cap or not cap.isOpened()):
-                logger.warning(
-                    "Local re-stream failed for %s – falling back to direct camera URL",
-                    camera_id,
-                )
-                try:
-                    if cap:
-                        cap.release()
-                except Exception:
-                    pass
-                cap = await asyncio.to_thread(
-                    self._open_capture_with_retry, direct_url, max_attempts=3
-                )
+                if config.webrtc_enabled:
+                    logger.warning(
+                        "Local re-stream failed for %s – waiting and retrying MediaMTX (no direct fallback)",
+                        camera_id,
+                    )
+                    try:
+                        if cap:
+                            cap.release()
+                    except Exception:
+                        pass
+                    cap = None
+                    mtx_path = stream_url.rsplit("/", 1)[-1] if stream_url else ""
+                    if mtx_path:
+                        await self._wait_for_mediamtx_path_ready(
+                            mtx_path, total_timeout=8.0,
+                        )
+                    cap = await asyncio.to_thread(
+                        self._open_capture_with_retry, stream_url, max_attempts=5
+                    )
+                else:
+                    logger.warning(
+                        "Local re-stream failed for %s – falling back to direct camera URL",
+                        camera_id,
+                    )
+                    try:
+                        if cap:
+                            cap.release()
+                    except Exception:
+                        pass
+                    cap = await asyncio.to_thread(
+                        self._open_capture_with_retry, direct_url, max_attempts=3
+                    )
 
             if not cap or not cap.isOpened():
                 try:

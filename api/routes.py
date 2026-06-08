@@ -5510,18 +5510,29 @@ def get_video_stream(camera_id):
                         mt = getattr(stream_server, 'mediamtx_client', None)
                     if not mt and camera_manager:
                         mt = getattr(camera_manager, 'mediamtx_client', None)
-                    if mt and hasattr(mt, 'configure_stream_source'):
-                        ok = bool(_run_coro_safe(mt.configure_stream_source(
-                            str(mediamtx_path),
-                            str(source_url),
-                            force_recreate=False,
-                        )))
-                        if not ok:
-                            logger.warning(
-                                "HLS warmup configure_stream_source returned False for %s -> %s",
-                                camera_id,
-                                mediamtx_path,
+                    if mt:
+                        path_ready = False
+                        try:
+                            if hasattr(mt, 'get_path_info'):
+                                info = _run_coro_safe(mt.get_path_info(str(mediamtx_path)))
+                                path_ready = bool(info and info.get('ready'))
+                        except Exception:
+                            path_ready = False
+                        if not path_ready:
+                            ensure_fn = getattr(mt, 'ensure_stream_source', None) or getattr(
+                                mt, 'configure_stream_source', None,
                             )
+                            if ensure_fn:
+                                ok = bool(_run_coro_safe(ensure_fn(
+                                    str(mediamtx_path),
+                                    str(source_url),
+                                )))
+                                if not ok:
+                                    logger.warning(
+                                        "HLS warmup ensure_stream_source returned False for %s -> %s",
+                                        camera_id,
+                                        mediamtx_path,
+                                    )
 
                 stream_info.update({
                     "mediamtx_path": mediamtx_path,
@@ -6217,17 +6228,20 @@ def force_start_camera_stream(camera_id):
                 mt = getattr(camera_manager, 'mediamtx_client', None)
 
             if mt and stream_config.get('webrtc_enabled') and mediamtx_path and rtsp_url:
+                ensure_fn = getattr(mt, 'ensure_stream_source', None) or getattr(
+                    mt, 'configure_stream_source', None,
+                )
                 priority = str((camera.get('stream_priority') if isinstance(camera, dict) else '') or '').strip().lower()
                 recording = bool(camera.get('recording') or camera.get('is_recording')) if isinstance(camera, dict) else False
-                if priority != 'sub' or recording:
-                    mediamtx_ok = bool(_run_coro_safe(mt.configure_stream_source(str(mediamtx_path), str(rtsp_url), force_recreate=False)))
+                if ensure_fn and (priority != 'sub' or recording):
+                    mediamtx_ok = bool(_run_coro_safe(ensure_fn(str(mediamtx_path), str(rtsp_url))))
                     if not mediamtx_ok:
-                        logger.warning(f"force-start: mediamtx_client.configure_stream_source returned False for {camera_id} -> {mediamtx_path}")
+                        logger.warning(f"force-start: ensure_stream_source returned False for {camera_id} -> {mediamtx_path}")
                 sub_rtsp = camera.get('substream_rtsp_url') if isinstance(camera, dict) else None
                 sub_path = (camera.get('mediamtx_sub_path') or f"{mediamtx_path}_sub") if isinstance(camera, dict) else f"{mediamtx_path}_sub"
                 sub_capable = camera.get('substream_capable') if isinstance(camera, dict) else None
-                if sub_rtsp and sub_capable is not False:
-                    sub_ok = bool(_run_coro_safe(mt.configure_stream_source(str(sub_path), str(sub_rtsp), force_recreate=False)))
+                if ensure_fn and sub_rtsp and sub_capable is not False:
+                    sub_ok = bool(_run_coro_safe(ensure_fn(str(sub_path), str(sub_rtsp))))
                     if priority == 'sub':
                         mediamtx_ok = bool(sub_ok)
                     else:

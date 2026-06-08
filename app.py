@@ -1420,6 +1420,36 @@ class MediaMTXClient:
     def create_path(self, path_name: str, rtsp_source: str) -> bool:
         """Create or update a MediaMTX path with an RTSP source"""
         try:
+            path_name = str(path_name or "").lstrip("/").rstrip("/")
+            rtsp_source = str(rtsp_source or "").strip()
+            if not path_name or not rtsp_source:
+                return False
+
+            # Skip redundant PATCH — MediaMTX reconnects upstream RTSP on every
+            # config PATCH, which kicks desktop viewers on single-session cameras.
+            try:
+                cfg_resp = self.session.get(
+                    f"{self.api_url}/config/paths/get/{path_name}",
+                    timeout=5,
+                )
+                if cfg_resp.status_code == 200:
+                    existing = cfg_resp.json() if cfg_resp.content else {}
+                    if str(existing.get("source") or "").strip() == rtsp_source:
+                        path_info = self.get_path_info(path_name)
+                        if path_info.get("ready"):
+                            logger.debug(
+                                "[SKIP] MediaMTX path %s already ready; no PATCH",
+                                path_name,
+                            )
+                        else:
+                            logger.debug(
+                                "[SKIP] MediaMTX path %s same source configured; no PATCH",
+                                path_name,
+                            )
+                        return True
+            except Exception:
+                pass
+
             # When source is an RTSP URL, MediaMTX pulls from it (sourceOnDemand works)
             # When source is "publisher", something pushes TO MediaMTX (sourceOnDemand is invalid)
             path_config = {
@@ -6481,7 +6511,7 @@ def force_start_camera(camera_id):
                         api_username=MEDIAMTX_API_USERNAME,
                         api_password=MEDIAMTX_API_PASSWORD
                     )
-                    _run_coro_safe(mt.configure_stream_source(str(mediamtx_path), str(rtsp_url), force_recreate=False))
+                    _run_coro_safe(mt.ensure_stream_source(str(mediamtx_path), str(rtsp_url)))
             except Exception as e:
                 logger.warning(f"⚠️ Failed to configure MediaMTX path for {camera_id}: {e}")
             

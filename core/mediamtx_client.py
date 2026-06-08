@@ -573,6 +573,17 @@ class MediaMTXWebRTCClient:
             logger.error(f"Error deleting stream path {stream_path}: {e}")
             return False
 
+    async def ensure_stream_source(self, stream_path: str, rtsp_url: str) -> bool:
+        """Attach to an existing MediaMTX path or create one.
+
+        Never PATCHes when the path is already configured with the same
+        source URL — redundant PATCHes make MediaMTX reconnect upstream RTSP
+        and drop other viewers (desktop UI, recording, etc.).
+        """
+        return await self.configure_stream_source(
+            stream_path, rtsp_url, force_recreate=False,
+        )
+
     async def configure_stream_source(self, stream_path: str, rtsp_url: str, force_recreate: bool = False) -> bool:
         """
         Configure MediaMTX to use an RTSP source for a stream path.
@@ -580,10 +591,35 @@ class MediaMTXWebRTCClient:
         Preserves the current ``record`` flag when PATCHing an existing path
         so that starting/reconnecting a live stream never silently disables
         an ongoing recording.
+
+        When ``force_recreate`` is false and the path already uses the same
+        RTSP source, skips PATCH/ADD so an active upstream pull is not
+        restarted (critical for single-session IP cameras).
         """
         try:
+            stream_path = str(stream_path or "").lstrip("/").rstrip("/")
+            rtsp_url = str(rtsp_url or "").strip()
+            if not stream_path or not rtsp_url:
+                return False
+
             if force_recreate:
                 await self.delete_stream_path(stream_path)
+            elif not force_recreate:
+                existing_cfg = await self._get_path_config(stream_path)
+                existing_source = str(existing_cfg.get("source") or "").strip()
+                if existing_source == rtsp_url:
+                    path_info = await self.get_path_info(stream_path)
+                    if path_info.get("ready"):
+                        logger.debug(
+                            "Stream %s already ready with same source; skipping PATCH",
+                            stream_path,
+                        )
+                    else:
+                        logger.debug(
+                            "Stream %s already configured with same source (not ready); skipping PATCH",
+                            stream_path,
+                        )
+                    return True
 
             base = f"http://{self.mediamtx_host}:{self.mediamtx_api_port}/v3"
             api_url_patch = f"{base}/config/paths/patch/{stream_path}"
