@@ -368,6 +368,106 @@ def _security_post_health_url() -> str:
     return _security_post_hooks().health_url(env)
 
 
+def is_security_post_running() -> bool:
+    """Return True when the Security Post health endpoint reports ok."""
+    try:
+        res = requests.get(_security_post_health_url(), timeout=2.0)
+        payload = res.json() if res.status_code == 200 else {}
+        return (
+            res.status_code == 200
+            and str(payload.get("service") or "") == "security_post"
+            and str(payload.get("status") or "").lower() == "ok"
+        )
+    except Exception:
+        return False
+
+
+def _service_python_for_sidecar(repo_root: Path) -> str:
+    override = str(os.environ.get("KNOXNET_SERVICE_PYTHON") or "").strip()
+    if override and ".venv-sp-test" not in override.replace("\\", "/"):
+        return override
+    for rel in ("venv/bin/python", ".venv/bin/python"):
+        candidate = repo_root / rel
+        if candidate.is_file():
+            return str(candidate)
+    py3 = shutil.which("python3") or shutil.which("python") or sys.executable
+    if ".venv-sp-test" in str(py3).replace("\\", "/"):
+        py3 = shutil.which("python3") or shutil.which("python") or sys.executable
+    return py3
+
+
+def start_security_post_silent(app) -> None:
+    """Best-effort background start for desktop autostart (no UI prompts)."""
+    if is_security_post_running():
+        return
+    hooks = _security_post_hooks()
+    try:
+        repo_root = Path(app._repo_root() if app and hasattr(app, "_repo_root") else ".").resolve()
+    except Exception:
+        repo_root = Path(__file__).resolve().parents[2]
+    ep = repo_root / hooks.script_entrypoint()
+    if not ep.is_file():
+        return
+    py = _service_python_for_sidecar(repo_root)
+    if ".venv-sp-test" in py.replace("\\", "/"):
+        return
+    runtime_err = hooks.verify_runtime(py)
+    if runtime_err:
+        return
+    env = dict(os.environ)
+    env["KNOXNET_SERVICE_PYTHON"] = py
+    hooks.configure_service_env(env)
+    log_dir = _writable_log_dir(repo_root=repo_root)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / hooks.service_log_name()
+    popen_kwargs: Dict[str, Any] = {}
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(f"\n--- Auto-starting Knoxnet Security Post at {time.ctime()} ---\n")
+        f.flush()
+        if ep.suffix == ".sh":
+            cmd = ["bash", str(ep), "start"]
+        else:
+            cmd = [str(ep), "start"]
+        subprocess.Popen(
+            cmd,
+            cwd=str(repo_root),
+            env=env,
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            **popen_kwargs,
+        )
+
+
+def stop_security_post_silent(app) -> None:
+    """Best-effort stop on desktop quit (no UI prompts)."""
+    hooks = _security_post_hooks()
+    try:
+        repo_root = Path(app._repo_root() if app and hasattr(app, "_repo_root") else ".").resolve()
+    except Exception:
+        repo_root = Path(__file__).resolve().parents[2]
+    ep = repo_root / hooks.script_entrypoint()
+    if not ep.is_file():
+        return
+    env = dict(os.environ)
+    hooks.configure_service_env(env)
+    try:
+        if ep.suffix == ".sh":
+            stop_cmd = ["bash", str(ep), "stop"]
+        else:
+            stop_cmd = [str(ep), "stop"]
+        subprocess.run(
+            stop_cmd,
+            cwd=str(repo_root),
+            env=env,
+            timeout=20,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
 def _default_state_dir() -> Path:
     """
     Per-user writable state directory.
@@ -1776,10 +1876,10 @@ class SystemManagerDialog(QDialog):
     def _build_security_post_panel(self, root):
         box = QGroupBox("Knoxnet Security Post")
         box.setToolTip(
-            "Knoxnet Security Post customer portal sidecar (default port 8090). "
-            "If 8090 is in use, the service auto-falls back "
-            "to the next free port (8091, …). Configure portal access and operator PIN; "
-            "start the service under Optional Services."
+            "Knoxnet Security Post is the customer Events portal sidecar (default port 8090). "
+            "Customers can review events while operators use the desktop app or after it closes. "
+            "If 8090 is in use, the service auto-falls back to the next free port (8091, …). "
+            "Configure portal access and operator PIN here; start/stop the process under Optional Services."
         )
         form = QFormLayout(box)
 
@@ -1787,8 +1887,20 @@ class SystemManagerDialog(QDialog):
         sp = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
 
         self._sp_enabled_chk = QCheckBox("Enable Knoxnet Security Post portal")
+        self._sp_enabled_chk.setToolTip(
+            "Allow the customer Events portal sidecar to run on this machine."
+        )
         self._sp_enabled_chk.setChecked(bool(sp.get("enabled", False)))
         form.addRow("", self._sp_enabled_chk)
+
+        self._sp_autostart_chk = QCheckBox("Start Security Post when Knoxnet VMS launches")
+        self._sp_autostart_chk.setToolTip(
+            "Automatically start the Knoxnet Security Post customer Events portal "
+            "when the desktop app opens (same as Optional Services → Start)."
+        )
+        self._sp_autostart_chk.setChecked(bool(sp.get("autostart", False)))
+        self._sp_autostart_chk.toggled.connect(self._save_security_post_autostart_pref)
+        form.addRow("", self._sp_autostart_chk)
 
         self._sp_wifi_enabled_chk = QCheckBox("Customer WiFi/AP configured on this box")
         self._sp_wifi_enabled_chk.setChecked(bool(sp.get("wifi_enabled", False)))
@@ -1853,6 +1965,20 @@ class SystemManagerDialog(QDialog):
                 return
 
         QMessageBox.information(self, "Knoxnet Security Post", "Knoxnet Security Post settings saved.")
+
+    def _save_security_post_autostart_pref(self, checked: bool):
+        if not self._app:
+            return
+        try:
+            prefs = self._app._load_prefs()
+            if not isinstance(prefs, dict):
+                prefs = {}
+            sp = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
+            sp["autostart"] = bool(checked)
+            prefs["security_post"] = sp
+            self._app._save_prefs(prefs)
+        except Exception:
+            pass
 
     # ----------------------------------------------------------------
     # Auto Protection panel

@@ -322,6 +322,16 @@ class KnoxnetDesktopApp(QApplication):
         else:
             logger.info("MediaMTX not running (auto-start disabled).")
 
+        sp_prefs = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
+        sp_up = self.is_security_post_running()
+        if sp_prefs.get("autostart") and sp_prefs.get("enabled") and not sp_up:
+            logger.info("Auto-starting Knoxnet Security Post (pref enabled)…")
+            threading.Thread(target=self._autostart_security_post, daemon=True).start()
+        elif sp_up:
+            logger.info("Knoxnet Security Post already running.")
+        elif sp_prefs.get("autostart") and not sp_prefs.get("enabled"):
+            logger.info("Security Post auto-start skipped (portal disabled in settings).")
+
         # Show system manager if both core services are down and no auto-start is configured
         if not backend_up and not mediamtx_up and not prefs.get("autostart_backend") and not prefs.get("autostart_mediamtx"):
             QTimer.singleShot(2000, self._prompt_services_down)
@@ -397,6 +407,22 @@ class KnoxnetDesktopApp(QApplication):
                 logger.info("MediaMTX auto-started.")
         except Exception as e:
             logger.warning("Auto-start %s failed: %s", name, e)
+
+    def _autostart_security_post(self):
+        """Start Security Post in the background when autostart pref is enabled."""
+        try:
+            from desktop.widgets.system_manager import start_security_post_silent
+            start_security_post_silent(self)
+            logger.info("Knoxnet Security Post auto-start requested.")
+        except Exception as e:
+            logger.warning("Security Post auto-start failed: %s", e)
+
+    def is_security_post_running(self) -> bool:
+        try:
+            from desktop.widgets.system_manager import is_security_post_running
+            return bool(is_security_post_running())
+        except Exception:
+            return False
 
     def is_backend_running(self, host="127.0.0.1", port=5000):
         """Check if the backend API is accessible."""
@@ -2089,21 +2115,29 @@ class KnoxnetDesktopApp(QApplication):
 
             sub = layouts_menu.addMenu(label)
 
-            load_act = QAction("Load layout", self)
+            load_act = QAction("Load", self)
+            load_act.setToolTip(
+                "Apply saved layout (replaces current). Restores cameras, overlays, shapes, and motion watch."
+            )
             load_act.triggered.connect(lambda checked=False, x=lid: self.load_layout(x))
             sub.addAction(load_act)
 
-            start_act = QAction("Start / Resume", self)
+            start_act = QAction("Run in background", self)
+            start_act.setToolTip(
+                "Open this layout alongside the current one without switching away. Resumes cameras if paused."
+            )
             start_act.setEnabled(not current)
             start_act.triggered.connect(lambda checked=False, x=lid: self._layout_start_in_background(x))
             sub.addAction(start_act)
 
-            pause_act = QAction("Pause", self)
+            pause_act = QAction("Pause cameras", self)
+            pause_act.setToolTip("Release camera streams but keep widgets open. Motion watch stays armed.")
             pause_act.setEnabled(running and not paused)
             pause_act.triggered.connect(lambda checked=False, x=lid: self._layout_pause(x))
             sub.addAction(pause_act)
 
-            stop_act = QAction("Stop", self)
+            stop_act = QAction("Close", self)
+            stop_act.setToolTip("Close layout widgets and end any background session.")
             stop_act.setEnabled(running)
             stop_act.triggered.connect(lambda checked=False, x=lid: self._layout_stop(x))
             sub.addAction(stop_act)
@@ -2622,7 +2656,7 @@ class KnoxnetDesktopApp(QApplication):
             self._terminal_broadcast(f"Layout '{ref}' not found.")
             return
         self.load_layout(layout.id)
-        self._terminal_broadcast(f"Loaded layout '{layout.name}'.")
+        self._terminal_broadcast(f"Loaded layout '{layout.name}' (cameras, overlays, motion watch restored).")
 
     def _ipc_layout_run(self, command):
         ref = str(command.get("layout_ref") or "").strip()
@@ -2631,7 +2665,7 @@ class KnoxnetDesktopApp(QApplication):
             self._terminal_broadcast(f"Layout '{ref}' not found.")
             return
         self._layout_start_in_background(layout.id)
-        self._terminal_broadcast(f"Started layout '{layout.name}' in background.")
+        self._terminal_broadcast(f"Opened layout '{layout.name}' in background.")
 
     def _ipc_layout_stop(self, command):
         ref = str(command.get("layout_ref") or "").strip()
@@ -2640,7 +2674,7 @@ class KnoxnetDesktopApp(QApplication):
             self._terminal_broadcast(f"Layout '{ref}' not found.")
             return
         self._layout_stop(layout.id)
-        self._terminal_broadcast(f"Stopped layout '{layout.name}'.")
+        self._terminal_broadcast(f"Closed layout '{layout.name}'.")
 
     def _terminal_broadcast(self, message: str):
         """Best-effort send a system message to all open terminal widgets."""
@@ -4067,6 +4101,49 @@ class KnoxnetDesktopApp(QApplication):
         leave_backend_cb.setChecked(quit_prefs.get("leave_backend", True))
         layout.addWidget(leave_backend_cb)
 
+        sp_prefs = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
+        sp_running = self.is_security_post_running()
+        sp_remembered = bool(sp_prefs.get("remember_exit_choice"))
+        keep_sp_running = bool(sp_prefs.get("keep_running_on_exit", True))
+        leave_sp_cb = None
+        remember_sp_cb = None
+
+        if sp_running:
+            sep_sp = QFrame()
+            sep_sp.setFrameShape(QFrame.Shape.HLine)
+            sep_sp.setStyleSheet("color: #334155;")
+            layout.addWidget(sep_sp)
+
+            sp_label = QLabel("Knoxnet Security Post")
+            sp_label.setStyleSheet("font-weight: bold; font-size: 12px; color: #94a3b8;")
+            sp_label.setToolTip(
+                "Customer Events portal sidecar — lets customers review events "
+                "while the operator desktop is closed."
+            )
+            layout.addWidget(sp_label)
+
+            if sp_remembered:
+                sp_hint = QLabel(
+                    "Keep Security Post running in the background"
+                    if keep_sp_running
+                    else "Stop Security Post when the desktop closes"
+                )
+                sp_hint.setStyleSheet("font-size: 11px; color: #64748b;")
+                sp_hint.setWordWrap(True)
+                layout.addWidget(sp_hint)
+            else:
+                leave_sp_cb = QCheckBox("Keep Security Post running in the background")
+                leave_sp_cb.setToolTip(
+                    "Leave the customer Events portal sidecar running after you close "
+                    "the desktop app so customers can still access events."
+                )
+                leave_sp_cb.setChecked(keep_sp_running)
+                layout.addWidget(leave_sp_cb)
+
+                remember_sp_cb = QCheckBox("Remember my choice")
+                remember_sp_cb.setChecked(False)
+                layout.addWidget(remember_sp_cb)
+
         # Auto-logic: recording requires backend
         def _sync_toggles():
             if continue_rec_cb.isChecked():
@@ -4088,8 +4165,15 @@ class KnoxnetDesktopApp(QApplication):
                 hint.setText("Desktop closes. Backend stays up (API, streaming). No active recordings.")
             else:
                 hint.setText("Everything shuts down: desktop, backend, MediaMTX, and recordings.")
+            if sp_running and leave_sp_cb is not None:
+                if leave_sp_cb.isChecked():
+                    hint.setText(hint.text() + " Security Post keeps serving the customer portal.")
+                else:
+                    hint.setText(hint.text() + " Security Post will stop.")
         continue_rec_cb.toggled.connect(lambda: _update_hint())
         leave_backend_cb.toggled.connect(lambda: _update_hint())
+        if leave_sp_cb is not None:
+            leave_sp_cb.toggled.connect(lambda: _update_hint())
         _update_hint()
         layout.addWidget(hint)
 
@@ -4115,6 +4199,17 @@ class KnoxnetDesktopApp(QApplication):
         quit_prefs["continue_recording"] = continue_rec_cb.isChecked()
         quit_prefs["leave_backend"] = leave_backend_cb.isChecked()
         prefs["quit_options"] = quit_prefs
+
+        if sp_running:
+            if leave_sp_cb is not None:
+                keep_sp_running = leave_sp_cb.isChecked()
+            if remember_sp_cb is not None and remember_sp_cb.isChecked():
+                sp_prefs["remember_exit_choice"] = True
+                sp_prefs["keep_running_on_exit"] = keep_sp_running
+            elif not sp_remembered and remember_sp_cb is None:
+                pass
+            prefs["security_post"] = sp_prefs
+
         self._save_prefs(prefs)
 
         # ── Execute choices ──
@@ -4173,6 +4268,14 @@ class KnoxnetDesktopApp(QApplication):
                 self.server_manager.stop_servers()
             # Kill Flask and MediaMTX if we started them
             self._kill_backend_services()
+
+        if sp_running and not keep_sp_running:
+            logger.info("Stopping Knoxnet Security Post before quit…")
+            try:
+                from desktop.widgets.system_manager import stop_security_post_silent
+                stop_security_post_silent(self)
+            except Exception as exc:
+                logger.warning("Security Post stop on quit failed: %s", exc)
 
         self.quit()
 
@@ -4429,6 +4532,25 @@ class KnoxnetDesktopApp(QApplication):
                         "optimize": bool(getattr(getattr(w, "depth_overlay_config", None), "optimize", True)),
                         "memory_fraction": getattr(getattr(w, "depth_overlay_config", None), "memory_fraction", None),
                     },
+                    # Motion watch (layout-scoped; restored on load)
+                    "motion_watch_settings": dict(getattr(w, "motion_watch_settings", {}) or {}),
+                    "motion_watch_active": bool(getattr(w, "motion_watch_active", False)),
+                    **(
+                        {
+                            "motion_watch_infinite": getattr(w, "motion_watch_end_ts", 0) is None,
+                            "motion_watch_remaining_sec": max(
+                                0,
+                                int(getattr(w, "motion_watch_end_ts", 0) - time.time()),
+                            ),
+                        }
+                        if getattr(w, "motion_watch_active", False)
+                        and getattr(w, "motion_watch_end_ts", None) is not None
+                        else (
+                            {"motion_watch_infinite": True}
+                            if getattr(w, "motion_watch_active", False)
+                            else {}
+                        )
+                    ),
                 }
             # elif isinstance(w, WebWidget):
             #    entry["type"] = "web"
@@ -4587,6 +4709,38 @@ class KnoxnetDesktopApp(QApplication):
                         continue
         except Exception:
             return
+
+    def _restore_motion_watch_from_layout(self, widget, settings: dict) -> None:
+        """Restore per-camera motion watch settings and armed state from a layout snapshot."""
+        if not settings:
+            return
+        mw_settings = settings.get("motion_watch_settings")
+        if isinstance(mw_settings, dict) and mw_settings:
+            try:
+                widget.motion_watch_settings.update(mw_settings)
+                if hasattr(widget, "_persist_motion_watch_settings"):
+                    widget._persist_motion_watch_settings()
+            except Exception:
+                pass
+
+        if not settings.get("motion_watch_active"):
+            return
+
+        try:
+            infinite = bool(settings.get("motion_watch_infinite", False))
+            remaining = settings.get("motion_watch_remaining_sec")
+            if infinite or (
+                remaining is None
+                and int(widget.motion_watch_settings.get("duration_sec", 30)) < 0
+            ):
+                widget.start_motion_watch()
+            elif isinstance(remaining, (int, float)) and int(remaining) > 0:
+                widget.start_motion_watch(remaining_sec=int(remaining))
+            else:
+                # Saved timer expired — re-arm with configured duration
+                widget.start_motion_watch()
+        except Exception as e:
+            logger.warning(f"Failed to restore motion watch: {e}")
 
     def _list_layouts_v2(self) -> list[LayoutDefinition]:
         try:
@@ -4748,6 +4902,9 @@ class KnoxnetDesktopApp(QApplication):
             # Knoxnet Security Post customer portal
             "security_post": {
                 "enabled": False,
+                "autostart": False,
+                "keep_running_on_exit": True,
+                "remember_exit_choice": False,
                 "wifi_enabled": False,
                 "wifi_ssid": "KNOXNET_SECURITY_POST",
                 "portal_host": "post.knoxnetvms.com",
@@ -6139,6 +6296,12 @@ class KnoxnetDesktopApp(QApplication):
                 try:
                     if entry.type == "camera":
                         self._restore_camera_extras(w, entry.view or {})
+                except Exception:
+                    pass
+                # Restore motion watch after widget geometry and overlays are applied.
+                try:
+                    if entry.type == "camera":
+                        self._restore_motion_watch_from_layout(w, entry.view or {})
                 except Exception:
                     pass
                 created_widgets.append(w)

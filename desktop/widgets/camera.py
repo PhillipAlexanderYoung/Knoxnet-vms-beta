@@ -8629,9 +8629,17 @@ class CameraWidget(BaseDesktopWidget):
         except Exception as e:
             print(f"Motion watch terminal spawn error: {e}")
 
-    def start_motion_watch(self):
-        """Arm motion watch for the configured duration."""
-        duration = int(self.motion_watch_settings.get("duration_sec", 30))
+    def start_motion_watch(self, remaining_sec: int | None = None):
+        """Arm motion watch for the configured duration.
+
+        Args:
+            remaining_sec: When set, arm for this many seconds instead of reading
+                duration_sec from settings (used when restoring layout snapshots).
+        """
+        if remaining_sec is not None:
+            duration = int(remaining_sec)
+        else:
+            duration = int(self.motion_watch_settings.get("duration_sec", 30))
         # Make sure a terminal is up to display countdown/images
         self._ensure_terminal_widget()
         self.motion_watch_active = True

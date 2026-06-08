@@ -632,9 +632,9 @@ class TerminalWidget(BaseDesktopWidget):
                 "\n"
                 "  Layouts:\n"
                 "  layouts                – list all layouts with status\n"
-                "  layout <name>          – load a layout (replaces current)\n"
-                "  layout run <name>      – run layout in background\n"
-                "  layout stop <name>     – stop a running layout\n"
+                "  layout <name>          – load layout (full restore: cameras, overlays, motion watch)\n"
+                "  layout run <name>      – open layout in background (keeps current layout)\n"
+                "  layout stop <name>     – close a background layout\n"
                 "\n"
                 "  Events:\n"
                 "  events enrich [N]      – classify unprocessed captures with YOLO\n"
@@ -3192,21 +3192,21 @@ class TerminalWidget(BaseDesktopWidget):
         if not ref:
             self._add_warning("Usage: layout <name>")
             return
-        self._add_system(f"Loading layout '{ref}'…")
+        self._add_system(f"Loading layout '{ref}' (full restore)…")
         self._send_ipc({"cmd": "layout_load", "layout_ref": ref})
 
     def _handle_layout_run(self, ref: str):
         if not ref:
             self._add_warning("Usage: layout run <name>")
             return
-        self._add_system(f"Running layout '{ref}' in background…")
+        self._add_system(f"Opening layout '{ref}' in background…")
         self._send_ipc({"cmd": "layout_run", "layout_ref": ref})
 
     def _handle_layout_stop(self, ref: str):
         if not ref:
             self._add_warning("Usage: layout stop <name>")
             return
-        self._add_system(f"Stopping layout '{ref}'…")
+        self._add_system(f"Closing layout '{ref}'…")
         self._send_ipc({"cmd": "layout_stop", "layout_ref": ref})
 
     # Tool execution helpers ---------------------------------------------

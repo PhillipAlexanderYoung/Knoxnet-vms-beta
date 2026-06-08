@@ -100,22 +100,31 @@ class LayoutManagerDialog(QDialog):
         root.addLayout(row)
 
         self.load_btn = QPushButton("Load")
+        self.load_btn.setToolTip(
+            "Apply saved layout (replaces current). Restores cameras, overlays, shapes, and motion watch."
+        )
         self.load_btn.clicked.connect(self._load_selected)
         row.addWidget(self.load_btn)
 
         self.run_bg_btn = QPushButton("Run in background")
+        self.run_bg_btn.setToolTip(
+            "Open layout alongside the current one without switching away. Resumes cameras if paused."
+        )
         self.run_bg_btn.clicked.connect(self._run_selected_background)
         row.addWidget(self.run_bg_btn)
 
-        self.pause_btn = QPushButton("Pause")
+        self.pause_btn = QPushButton("Pause cameras")
+        self.pause_btn.setToolTip("Release camera streams but keep widgets open. Motion watch stays armed.")
         self.pause_btn.clicked.connect(self._pause_selected)
         row.addWidget(self.pause_btn)
 
-        self.resume_btn = QPushButton("Resume")
+        self.resume_btn = QPushButton("Resume cameras")
+        self.resume_btn.setToolTip("Reconnect cameras for a paused layout.")
         self.resume_btn.clicked.connect(self._resume_selected)
         row.addWidget(self.resume_btn)
 
-        self.stop_btn = QPushButton("Stop")
+        self.stop_btn = QPushButton("Close")
+        self.stop_btn.setToolTip("Close layout widgets and end any background session.")
         self.stop_btn.clicked.connect(self._stop_selected)
         row.addWidget(self.stop_btn)
 
