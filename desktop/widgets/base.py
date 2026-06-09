@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
-from PySide6.QtCore import QEvent, Qt, QPoint, QSize, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import QEvent, Qt, QPoint, QPointF, QSize, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QColor, QIcon
 from desktop.utils.app_icon import apply_window_icon
 from desktop.utils.qt_helpers import KnoxnetStyle
@@ -45,6 +45,7 @@ class BaseDesktopWidget(QMainWindow):
         # Resizing logic
         self.resize_margin = 8
         self.resize_edge = None
+        self.is_resizing = False
         self.keep_aspect_ratio = False
         self.aspect_ratio = 16/9
         self.setMouseTracking(True)
@@ -145,9 +146,147 @@ class BaseDesktopWidget(QMainWindow):
             pass
         return False
 
+    def _child_event_window_pos(self, watched, event) -> QPointF:
+        """Map a child-widget mouse event to this window's local coordinates."""
+        if hasattr(event, "position"):
+            local = event.position()
+        else:
+            local = QPointF(event.pos())
+        global_pos = watched.mapToGlobal(local.toPoint())
+        return QPointF(self.mapFromGlobal(global_pos))
+
+    def _update_resize_edge_at(self, pos: QPointF) -> None:
+        """Update resize_edge and cursor from a position in window coordinates."""
+        margin = self.resize_margin
+        rect = self.rect()
+        on_left = pos.x() <= margin
+        on_right = pos.x() >= rect.width() - margin
+        on_top = pos.y() <= margin
+        on_bottom = pos.y() >= rect.height() - margin
+
+        if on_left and on_top:
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            self.resize_edge = "top-left"
+        elif on_right and on_bottom:
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            self.resize_edge = "bottom-right"
+        elif on_right and on_top:
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            self.resize_edge = "top-right"
+        elif on_left and on_bottom:
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            self.resize_edge = "bottom-left"
+        elif on_left:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            self.resize_edge = "left"
+        elif on_right:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            self.resize_edge = "right"
+        elif on_top:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+            self.resize_edge = "top"
+        elif on_bottom:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+            self.resize_edge = "bottom"
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.resize_edge = None
+
+    def _apply_resize_drag(self, global_pos: QPoint) -> None:
+        """Apply resize geometry update during an active resize drag."""
+        delta = global_pos - self.resize_start_pos
+        geo = self.resize_start_geo
+
+        new_x = geo.x()
+        new_y = geo.y()
+        new_w = geo.width()
+        new_h = geo.height()
+
+        if "left" in self.resize_edge:
+            new_w = max(200, geo.width() - delta.x())
+        elif "right" in self.resize_edge:
+            new_w = max(200, geo.width() + delta.x())
+
+        if "top" in self.resize_edge:
+            new_h = max(150, geo.height() - delta.y())
+        elif "bottom" in self.resize_edge:
+            new_h = max(150, geo.height() + delta.y())
+
+        if self.keep_aspect_ratio:
+            if "left" in self.resize_edge or "right" in self.resize_edge:
+                new_h = int(new_w / self.aspect_ratio)
+            elif "top" in self.resize_edge or "bottom" in self.resize_edge:
+                new_w = int(new_h * self.aspect_ratio)
+
+        if "left" in self.resize_edge:
+            new_x = (geo.x() + geo.width()) - new_w
+
+        if "top" in self.resize_edge:
+            new_y = (geo.y() + geo.height()) - new_h
+
+        self.setGeometry(new_x, new_y, new_w, new_h)
+
+    def _handle_child_resize_event(self, watched, event) -> bool:
+        """Handle resize interactions originating from a child widget."""
+        if self.is_pinned:
+            return False
+
+        etype = event.type()
+        if etype not in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseMove,
+            QEvent.Type.MouseButtonRelease,
+        ):
+            return False
+
+        win_pos = self._child_event_window_pos(watched, event)
+
+        if etype == QEvent.Type.MouseMove:
+            if self.is_resizing:
+                self._apply_resize_drag(event.globalPosition().toPoint())
+                event.accept()
+                return True
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                self._update_resize_edge_at(win_pos)
+                if self.resize_edge:
+                    event.accept()
+                    return True
+            return False
+
+        if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            self._update_resize_edge_at(win_pos)
+            if self.resize_edge:
+                self.is_resizing = True
+                self.resize_start_pos = event.globalPosition().toPoint()
+                self.resize_start_geo = self.geometry()
+                event.accept()
+                return True
+            return False
+
+        if etype == QEvent.Type.MouseButtonRelease:
+            if self.is_resizing:
+                self.is_resizing = False
+                self.resize_edge = None
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                self._try_snap()
+                event.accept()
+                return True
+            return False
+
+        return False
+
     def eventFilter(self, watched, event):
         if id(watched) in self._drag_handles:
             etype = event.type()
+            if etype in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseMove,
+                QEvent.Type.MouseButtonRelease,
+            ):
+                if self._handle_child_resize_event(watched, event):
+                    if etype == QEvent.Type.MouseButtonPress:
+                        self._reset_child_drag()
+                    return True
             if etype == QEvent.Type.MouseButtonPress and self._can_start_child_drag(watched, event):
                 if self._start_system_move(event):
                     return True
@@ -197,81 +336,11 @@ class BaseDesktopWidget(QMainWindow):
 
     def mouseMoveEvent(self, event):
         # Only update cursor/edge detection if NOT currently resizing
-        if not (hasattr(self, 'is_resizing') and self.is_resizing) and not self.is_pinned:
-            pos = event.position()
-            rect = self.rect()
-            margin = self.resize_margin
-            
-            on_left = pos.x() <= margin
-            on_right = pos.x() >= rect.width() - margin
-            on_top = pos.y() <= margin
-            on_bottom = pos.y() >= rect.height() - margin
-            
-            if on_left and on_top:
-                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-                self.resize_edge = "top-left"
-            elif on_right and on_bottom:
-                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-                self.resize_edge = "bottom-right"
-            elif on_right and on_top:
-                self.setCursor(Qt.CursorShape.SizeBDiagCursor)
-                self.resize_edge = "top-right"
-            elif on_left and on_bottom:
-                self.setCursor(Qt.CursorShape.SizeBDiagCursor)
-                self.resize_edge = "bottom-left"
-            elif on_left:
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                self.resize_edge = "left"
-            elif on_right:
-                self.setCursor(Qt.CursorShape.SizeHorCursor)
-                self.resize_edge = "right"
-            elif on_top:
-                self.setCursor(Qt.CursorShape.SizeVerCursor)
-                self.resize_edge = "top"
-            elif on_bottom:
-                self.setCursor(Qt.CursorShape.SizeVerCursor)
-                self.resize_edge = "bottom"
-            else:
-                self.setCursor(Qt.CursorShape.ArrowCursor)
-                self.resize_edge = None
+        if not self.is_resizing and not self.is_pinned:
+            self._update_resize_edge_at(event.position())
 
-        if hasattr(self, 'is_resizing') and self.is_resizing:
-            delta = event.globalPosition().toPoint() - self.resize_start_pos
-            geo = self.resize_start_geo
-            
-            new_x = geo.x()
-            new_y = geo.y()
-            new_w = geo.width()
-            new_h = geo.height()
-
-            # 1. Calculate new dimensions based on mouse movement and edge
-            if "left" in self.resize_edge:
-                new_w = max(200, geo.width() - delta.x())
-            elif "right" in self.resize_edge:
-                new_w = max(200, geo.width() + delta.x())
-            
-            if "top" in self.resize_edge:
-                new_h = max(150, geo.height() - delta.y())
-            elif "bottom" in self.resize_edge:
-                new_h = max(150, geo.height() + delta.y())
-
-            # 2. Apply Aspect Ratio Constraint
-            if self.keep_aspect_ratio:
-                if "left" in self.resize_edge or "right" in self.resize_edge:
-                    # Width drives height
-                    new_h = int(new_w / self.aspect_ratio)
-                elif "top" in self.resize_edge or "bottom" in self.resize_edge:
-                    # Pure vertical drag -> Height drives width
-                    new_w = int(new_h * self.aspect_ratio)
-
-            # 3. Apply Anchors to calculate Position
-            if "left" in self.resize_edge:
-                new_x = (geo.x() + geo.width()) - new_w
-            
-            if "top" in self.resize_edge:
-                new_y = (geo.y() + geo.height()) - new_h
-
-            self.setGeometry(new_x, new_y, new_w, new_h)
+        if self.is_resizing:
+            self._apply_resize_drag(event.globalPosition().toPoint())
 
         elif self.old_pos:
             delta = event.globalPosition().toPoint() - self.old_pos
@@ -281,7 +350,7 @@ class BaseDesktopWidget(QMainWindow):
 
     def mouseReleaseEvent(self, event):
         was_moving = self.old_pos is not None
-        was_resizing = hasattr(self, 'is_resizing') and self.is_resizing
+        was_resizing = self.is_resizing
         self.old_pos = None
         self._reset_child_drag()
         if was_resizing:

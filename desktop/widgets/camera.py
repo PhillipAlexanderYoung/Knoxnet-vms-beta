@@ -469,12 +469,19 @@ class CameraOpenGLWidget(QWidget):
         self.detection_hit_pulses: List[Dict[str, object]] = []  # recent detection hit boxes for visual feedback
         self._detection_last_emit_ts: float = 0.0
 
+        # Scroll-wheel view zoom/pan (matches Security Post portal: 1x–4x).
+        self.view_zoom: float = 1.0
+        self.view_pan_x: float = 0.0
+        self.view_pan_y: float = 0.0
+        self.view_pan_drag: Optional[Dict[str, float]] = None
+        self._paint_view_transform_open: bool = False
+
         # FPS Counter
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_fps)
         self.timer.start(1000)
         self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_aspect_ratio_mode(self, mode):
         self.aspect_ratio_mode = mode
@@ -626,6 +633,7 @@ class CameraOpenGLWidget(QWidget):
         return (x_off + pt['x'] * w, y_off + pt['y'] * h)
 
     def _widget_to_norm(self, pos: QPointF) -> Optional[Pt]:
+        pos = self._unmap_view_point(pos)
         # Prefer normalized coords within the video draw rect; if unavailable, fall back to whole widget.
         if not self.last_draw_rect:
             # Fallback: map to full widget area
@@ -643,8 +651,69 @@ class CameraOpenGLWidget(QWidget):
         # Clamp instead of discarding; allows drawing even if slightly outside the video bounds.
         return {'x': clamp01(nx), 'y': clamp01(ny)}
 
+    VIEW_MIN_ZOOM = 1.0
+    VIEW_MAX_ZOOM = 4.0
+
+    def _view_center(self) -> Tuple[float, float]:
+        if self.last_draw_rect:
+            x_off, y_off, w, h = self.last_draw_rect
+            return x_off + w * 0.5, y_off + h * 0.5
+        return self.width() * 0.5, self.height() * 0.5
+
+    def _clamp_view_zoom(self, zoom: float) -> float:
+        return max(self.VIEW_MIN_ZOOM, min(self.VIEW_MAX_ZOOM, float(zoom)))
+
+    def _clamp_view_pan(self, pan_x: float, pan_y: float, zoom: float) -> Tuple[float, float]:
+        if zoom <= self.VIEW_MIN_ZOOM:
+            return 0.0, 0.0
+        max_x = self.width() * (zoom - 1.0) / 2.0
+        max_y = self.height() * (zoom - 1.0) / 2.0
+        return (
+            max(-max_x, min(max_x, pan_x)),
+            max(-max_y, min(max_y, pan_y)),
+        )
+
+    def _apply_view_painter_transform(self, painter: QPainter) -> None:
+        cx, cy = self._view_center()
+        painter.translate(cx + self.view_pan_x, cy + self.view_pan_y)
+        painter.scale(self.view_zoom, self.view_zoom)
+        painter.translate(-cx, -cy)
+
+    def _unmap_view_point(self, pos: QPointF) -> QPointF:
+        if self.view_zoom <= self.VIEW_MIN_ZOOM and not self.view_pan_x and not self.view_pan_y:
+            return pos
+        cx, cy = self._view_center()
+        z = self.view_zoom if self.view_zoom else 1.0
+        return QPointF(
+            cx + (pos.x() - cx - self.view_pan_x) / z,
+            cy + (pos.y() - cy - self.view_pan_y) / z,
+        )
+
+    def reset_view_zoom(self) -> None:
+        self.view_zoom = self.VIEW_MIN_ZOOM
+        self.view_pan_x = 0.0
+        self.view_pan_y = 0.0
+        self.view_pan_drag = None
+        self.update()
+
+    def _apply_view_zoom(self, factor: float, mx: float, my: float) -> None:
+        z1 = self.view_zoom
+        z2 = self._clamp_view_zoom(z1 * factor)
+        if abs(z2 - z1) < 1e-6:
+            return
+        cx, cy = self._view_center()
+        px_new = mx - cx - z2 * (mx - cx - self.view_pan_x) / z1
+        py_new = my - cy - z2 * (my - cy - self.view_pan_y) / z1
+        self.view_zoom = z2
+        self.view_pan_x, self.view_pan_y = self._clamp_view_pan(px_new, py_new, z2)
+        if z2 <= self.VIEW_MIN_ZOOM:
+            self.view_pan_x = 0.0
+            self.view_pan_y = 0.0
+        self.update()
+
     def _hit_test_vertex(self, pos: QPointF) -> Optional[Tuple[str, int]]:
         """Return (shape_id, index) if pointer is near a zone vertex."""
+        pos = self._unmap_view_point(pos)
         for sh in self.shapes:
             if sh.get('kind') != 'zone' or sh.get('locked'):
                 continue
@@ -660,6 +729,7 @@ class CameraOpenGLWidget(QWidget):
         return None
 
     def _hit_test_line_end(self, pos: QPointF) -> Optional[Tuple[str, str]]:
+        pos = self._unmap_view_point(pos)
         for sh in self.shapes:
             if sh.get('kind') != 'line' or sh.get('locked'):
                 continue
@@ -1407,6 +1477,9 @@ class CameraOpenGLWidget(QWidget):
             y_offset = (self.height() - scaled_img.height()) // 2
             # Track draw rect for hit-testing and normalized conversions
             self.last_draw_rect = (float(x_offset), float(y_offset), float(scaled_img.width()), float(scaled_img.height()))
+            self._paint_view_transform_open = True
+            painter.save()
+            self._apply_view_painter_transform(painter)
             is_pointcloud = bool(getattr(self, "depth_overlay_is_pointcloud", False))
 
             # POINTCLOUD MODE:
@@ -2313,6 +2386,10 @@ class CameraOpenGLWidget(QWidget):
 
             painter.restore()
 
+        if getattr(self, "_paint_view_transform_open", False):
+            painter.restore()
+            self._paint_view_transform_open = False
+
         # ── Debug Overlay (drawn LAST so nothing can cover it) ──
         if self.show_debug:
             painter.save()
@@ -2448,6 +2525,19 @@ class CameraOpenGLWidget(QWidget):
         self.selected_shapes = []
         self.selected_track_id = None
         self.update()
+        if (
+            self.view_zoom > self.VIEW_MIN_ZOOM
+            and norm
+            and not self._in_parent_resize_zone(event)
+        ):
+            pos = event.position()
+            self.view_pan_drag = {
+                'x': float(pos.x()),
+                'y': float(pos.y()),
+                'pan_x': self.view_pan_x,
+                'pan_y': self.view_pan_y,
+            }
+            return
         return super().mousePressEvent(event)
 
     def _hit_test_track(self, pos) -> Optional[int]:
@@ -2462,6 +2552,7 @@ class CameraOpenGLWidget(QWidget):
         if not self.last_draw_rect or self.frame_dims[0] <= 0 or self.frame_dims[1] <= 0:
             return None
         try:
+            pos = self._unmap_view_point(QPointF(float(pos.x()), float(pos.y())))
             x_off, y_off, draw_w, draw_h = self.last_draw_rect
             px = float(pos.x())
             py = float(pos.y())
@@ -2502,6 +2593,10 @@ class CameraOpenGLWidget(QWidget):
         """Only allow window dragging from empty camera-space clicks."""
         if event.button() != Qt.MouseButton.LeftButton:
             return False
+        if self._in_parent_resize_zone(event):
+            return False
+        if self.view_zoom > self.VIEW_MIN_ZOOM:
+            return False
         if self.draw_mode != 'idle':
             return False
         pos = event.position()
@@ -2541,6 +2636,16 @@ class CameraOpenGLWidget(QWidget):
 
         # If we're in drawing mode, handle locally (don't bubble to allow precise cursor/ghost)
         if self.draw_mode != 'idle' and not self.drag_meta:
+            self.update()
+            return
+
+        if self.view_pan_drag and self.view_zoom > self.VIEW_MIN_ZOOM:
+            pos = event.position()
+            dx = float(pos.x()) - self.view_pan_drag['x']
+            dy = float(pos.y()) - self.view_pan_drag['y']
+            px = self.view_pan_drag['pan_x'] + dx
+            py = self.view_pan_drag['pan_y'] + dy
+            self.view_pan_x, self.view_pan_y = self._clamp_view_pan(px, py, self.view_zoom)
             self.update()
             return
 
@@ -2597,6 +2702,9 @@ class CameraOpenGLWidget(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self.view_pan_drag:
+            self.view_pan_drag = None
+            return
         if self.drag_meta:
             self.drag_meta = None
         parent = self.parent()
@@ -2605,12 +2713,29 @@ class CameraOpenGLWidget(QWidget):
             return
         super().mouseReleaseEvent(event)
 
+    def wheelEvent(self, event):
+        if self._in_parent_resize_zone(event):
+            event.ignore()
+            return
+        if self.draw_mode != 'idle' or self.drag_meta:
+            return super().wheelEvent(event)
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.12 if delta > 0 else 0.88
+        pos = event.position()
+        self._apply_view_zoom(factor, float(pos.x()), float(pos.y()))
+        event.accept()
+
     def leaveEvent(self, event):
         self.cursor_norm = None
         return super().leaveEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
+            if self.view_zoom > self.VIEW_MIN_ZOOM or self.view_pan_x or self.view_pan_y:
+                self.reset_view_zoom()
+                return
             self.cancel_draw_mode()
             self.drag_meta = None
             self.update()
