@@ -1990,6 +1990,10 @@ class KnoxnetDesktopApp(QApplication):
             self._layout_paused.discard(layout_id)
         except Exception:
             pass
+        try:
+            self._recover_motion_watch_streams()
+        except Exception:
+            pass
 
     def _layout_stop(self, layout_id: str) -> None:
         """Stop a layout: close its widgets and stop any associated background session."""
@@ -4742,6 +4746,31 @@ class KnoxnetDesktopApp(QApplication):
         except Exception as e:
             logger.warning(f"Failed to restore motion watch: {e}")
 
+    def _recover_motion_watch_streams(self) -> None:
+        """Ensure armed motion-watch cameras retry stream connect after layout load or camera sync."""
+        try:
+            from desktop.widgets.camera import CameraWidget
+        except Exception:
+            return
+        widgets = list(getattr(self, "active_widgets", []) or [])
+        widgets.extend(list(getattr(self, "_current_layout_widgets", []) or []))
+        seen: set[str] = set()
+        for w in widgets:
+            try:
+                if not isinstance(w, CameraWidget):
+                    continue
+                cam_id = str(getattr(w, "camera_id", "") or "")
+                if not cam_id or cam_id in seen:
+                    continue
+                seen.add(cam_id)
+                if not getattr(w, "motion_watch_active", False):
+                    continue
+                recover = getattr(w, "_ensure_motion_watch_stream_recovery", None)
+                if callable(recover):
+                    recover()
+            except Exception:
+                continue
+
     def _list_layouts_v2(self) -> list[LayoutDefinition]:
         try:
             return self.layouts_store.list_layouts()
@@ -6317,6 +6346,10 @@ class KnoxnetDesktopApp(QApplication):
         if set_current:
             self.current_layout_name = layout.id
             self._current_layout_widgets = list(created_widgets)
+        try:
+            self._recover_motion_watch_streams()
+        except Exception:
+            pass
         self.tray_icon.showMessage("Knoxnet VMS Beta", f"Layout '{layout.name}' restored", QSystemTrayIcon.MessageIcon.Information)
         # Apply persisted hidden flag (if any)
         try:
@@ -6959,6 +6992,8 @@ class KnoxnetDesktopApp(QApplication):
             self.refresh_cameras_from_json()
             self._initial_sync_done = True
             self._initial_sync_timer.stop()
+            # Camera configs may have landed after startup layout; retry motion-watch streams.
+            QTimer.singleShot(500, self._recover_motion_watch_streams)
         except Exception as e:
             logger.error(f"Initial camera sync failed: {e}")
 

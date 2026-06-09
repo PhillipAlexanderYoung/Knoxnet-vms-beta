@@ -5391,6 +5391,11 @@ class CameraWidget(BaseDesktopWidget):
         self.motion_watch_last_trigger = 0.0
         self.motion_watch_timer = QTimer(self)
         self.motion_watch_timer.timeout.connect(self._tick_motion_watch)
+        # Retry live stream connect while motion watch is armed but video is offline.
+        self._stream_retry_timer = QTimer(self)
+        self._stream_retry_timer.setSingleShot(True)
+        self._stream_retry_timer.timeout.connect(self._retry_stream_connect)
+        self._stream_retry_attempt = 0
         # Avoid UI stalls during motion-watch captures (zone/line/tag triggers) by doing heavy
         # image encode + disk + base64 work off the UI thread, and prevent overlapping captures.
         self._motion_watch_capture_lock = threading.Lock()
@@ -8657,6 +8662,7 @@ class CameraWidget(BaseDesktopWidget):
         self.motion_watch_last_trigger = 0.0
         if not self.motion_watch_timer.isActive():
             self.motion_watch_timer.start(1000)
+        self._ensure_motion_watch_stream_recovery()
         self._post_motion_watch_to_terminal(
             "Motion watch armed",
             countdown=duration if duration >= 0 else None,
@@ -8668,6 +8674,7 @@ class CameraWidget(BaseDesktopWidget):
             return
         self.motion_watch_active = False
         self.motion_watch_timer.stop()
+        self._stop_motion_watch_stream_recovery()
         try:
             with self._motion_watch_ring_lock:
                 self._motion_watch_snapshot_ring.clear()
@@ -8699,6 +8706,74 @@ class CameraWidget(BaseDesktopWidget):
             remaining_seconds=remaining,
             suppress_log=True,
         )
+
+    def _ensure_stream_connect(self, *, force_reconnect: bool = False) -> None:
+        """Ask CameraManager to connect/reconnect this camera."""
+        try:
+            import asyncio
+            cm = getattr(self, "camera_manager", None)
+            loop = getattr(cm, "_loop", None) if cm else None
+            if not (cm and loop and getattr(loop, "is_running", lambda: False)()):
+                return
+            cam_id = str(self.camera_id)
+            in_stream = cam_id in getattr(cm, "active_streams", {})
+            has_viewers = int(getattr(cm, "_viewer_counts", {}).get(cam_id, 0)) > 0
+            if force_reconnect or in_stream or has_viewers:
+                asyncio.run_coroutine_threadsafe(cm.reconnect_camera(cam_id), loop)
+            else:
+                asyncio.run_coroutine_threadsafe(cm.acquire_camera(cam_id), loop)
+        except Exception:
+            pass
+
+    def _schedule_stream_retry(self, *, initial: bool = False) -> None:
+        """Schedule the next stream reconnect attempt with capped backoff."""
+        if not self.motion_watch_active:
+            return
+        if not initial:
+            self._stream_retry_attempt += 1
+        delays_ms = [6000, 10000, 20000, 30000]
+        idx = min(self._stream_retry_attempt, len(delays_ms) - 1)
+        try:
+            self._stream_retry_timer.start(int(delays_ms[idx]))
+        except Exception:
+            pass
+
+    def _ensure_motion_watch_stream_recovery(self) -> None:
+        """Kick off acquire/reconnect retries while motion watch needs live video."""
+        if not self.motion_watch_active:
+            return
+        now = time.time()
+        stale = (self.last_frame_time is None) or (now - float(self.last_frame_time) > 8)
+        if not stale:
+            return
+        self._ensure_stream_connect(force_reconnect=False)
+        if not self._stream_retry_timer.isActive():
+            self._stream_retry_attempt = 0
+            self._schedule_stream_retry(initial=True)
+
+    def _stop_motion_watch_stream_recovery(self) -> None:
+        try:
+            if self._stream_retry_timer.isActive():
+                self._stream_retry_timer.stop()
+        except Exception:
+            pass
+        self._stream_retry_attempt = 0
+
+    def _retry_stream_connect(self) -> None:
+        """Periodic reconnect while motion watch is armed but frames are stale."""
+        if not self.motion_watch_active or not bool(getattr(self, "running", True)):
+            return
+        try:
+            if not self.isVisible():
+                return
+        except Exception:
+            pass
+        now = time.time()
+        if self.last_frame_time is not None and (now - float(self.last_frame_time)) <= 8:
+            self._stop_motion_watch_stream_recovery()
+            return
+        self._ensure_stream_connect(force_reconnect=True)
+        self._schedule_stream_retry()
 
     def _motion_watch_cooldown_seconds(self) -> float:
         settings = self.motion_watch_settings or {}
@@ -11037,7 +11112,7 @@ class CameraWidget(BaseDesktopWidget):
             pass
 
         # Stop periodic timers (in case the widget isn't deleted immediately on close).
-        for tname in ["timer", "offline_timer", "motion_watch_timer", "loading_timer"]:
+        for tname in ["timer", "offline_timer", "motion_watch_timer", "loading_timer", "_stream_retry_timer"]:
             try:
                 t = getattr(self, tname, None)
                 if t is not None and hasattr(t, "isActive") and t.isActive():
@@ -11616,6 +11691,8 @@ class CameraWidget(BaseDesktopWidget):
                 self._stop_loading()
             if self.motion_watch_active:
                 self._push_motion_watch_snapshot_ring(frame)
+                if self._stream_retry_timer.isActive():
+                    self._stop_motion_watch_stream_recovery()
             self.gl_widget.update_frame(frame)
 
             # Feed clip ring buffer when clip recording is enabled (encode off UI thread).
@@ -11811,3 +11888,5 @@ class CameraWidget(BaseDesktopWidget):
             self.offline_label.show()
         elif not stale and self.offline_label.isVisible():
             self.offline_label.hide()
+        if stale and self.motion_watch_active:
+            self._ensure_motion_watch_stream_recovery()
