@@ -70,9 +70,14 @@ def proxy_hls(path):
         )
         
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        headers = [(name, value) for (name, value) in resp.headers.items()
-                   if name.lower() not in excluded_headers]
-        
+        headers = [
+            (name, value)
+            for (name, value) in resp.headers.items()
+            if name.lower() not in excluded_headers and name.lower() not in ('cache-control', 'pragma')
+        ]
+        headers.append(('Cache-Control', 'no-store, no-cache, must-revalidate'))
+        headers.append(('Pragma', 'no-cache'))
+
         return Response(
             stream_with_context(resp.iter_content(chunk_size=8192)),
             status=resp.status_code,
