@@ -6858,8 +6858,19 @@ if __name__ == '__main__':
                 if automation_engine is not None:
                     automation_engine.stream_server = stream_server
                     from core.automation.actions.email import EmailAction
+                    from core.automation.actions.snapshot import SnapshotAction
+                    from core.automation.actions.script import ScriptAction
                     email_action = EmailAction(db_manager=db_manager, stream_server=stream_server)
+                    snapshot_action = SnapshotAction(
+                        db_manager=db_manager,
+                        stream_server=stream_server,
+                        socketio=socketio,
+                    )
+                    script_action = ScriptAction()
                     automation_engine.action_handlers["email"] = email_action.handler()
+                    automation_engine.action_handlers["snapshot"] = snapshot_action.handler()
+                    automation_engine.action_handlers["script"] = script_action.handler()
+                    automation_engine.action_handlers["run_script"] = script_action.handler()
             except Exception as e:
                 logger.warning(f"⚠️ Failed to register automation actions: {e}")
             
@@ -7276,6 +7287,17 @@ if __name__ == '__main__':
                     except Exception as e:
                         logger.debug(f"Tracks emit error for {camera_id}: {e}")
 
+                def _emit_track_event(camera_id: str, payload: Dict[str, Any]) -> None:
+                    """Emit semantic track events (zone_enter, line_cross, dwell_met, etc.)."""
+                    try:
+                        if automation_engine:
+                            try:
+                                automation_engine.submit("track_event", camera_id, payload)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.debug(f"Track event emit error for {camera_id}: {e}")
+
                 def _emit_detections(camera_id: str, payload: Dict[str, Any]) -> None:
                     """Emit object detection data with ultra-low latency"""
                     try:
@@ -7306,6 +7328,7 @@ if __name__ == '__main__':
 
                 stream_server.on_motion_update = _emit_motion
                 stream_server.on_tracks_update = _emit_tracks
+                stream_server.on_track_event = _emit_track_event
                 stream_server.on_detection_update = _emit_detections
 
                 # Attach AI verifier (Tier-2) if available

@@ -288,6 +288,9 @@ class StreamServer:
         self.on_bandwidth_exceeded: Optional[Callable] = None
         # Simple motion detection callback
         self.on_motion_update: Optional[Callable[[str, Dict[str, Any]], None]] = None
+        # Semantic track events from TrackSceneEngine (zone_enter, line_cross, etc.)
+        self.on_track_event: Optional[Callable[[str, Dict[str, Any]], None]] = None
+        self._track_scene_engine = None
 
         # Background tasks
         self.executor = ThreadPoolExecutor(max_workers=20)
@@ -1189,6 +1192,24 @@ class StreamServer:
                                         'confidence': 0.99,
                                     })
                                 self._tracks_state[camera_id] = tracks_out
+                                if tracks_out and not moving_flag:
+                                    try:
+                                        from core.automation.track_state import MOTION_BOX_NAMESPACE
+
+                                        self._emit_track_scene_events(
+                                            camera_id,
+                                            tracks_out,
+                                            frame_w,
+                                            frame_h,
+                                            frame_bgr=frame,
+                                            tracker_namespace=MOTION_BOX_NAMESPACE,
+                                        )
+                                    except Exception as _mte:
+                                        logger.debug(
+                                            "TrackSceneEngine motion error for %s: %s",
+                                            camera_id,
+                                            _mte,
+                                        )
                                 motion_payload = {
                                     "camera_id": camera_id,
                                     "motion": {
@@ -1593,71 +1614,79 @@ class StreamServer:
                                         pass
                             except Exception:
                                 pass
-                        if tracks and not suppress_outputs:
-                            # Slightly higher alpha for snappier overlay response from detector tracks
-                            ema_alpha = 0.45
-                            cam_smooth = self._detector_bbox_ema.setdefault(camera_id, {})
+                        if not suppress_outputs:
                             smoothed_tracks: List[Dict[str, Any]] = []
-                            for tr in tracks:
+                            if tracks:
+                                # Slightly higher alpha for snappier overlay response from detector tracks
+                                ema_alpha = 0.45
+                                cam_smooth = self._detector_bbox_ema.setdefault(camera_id, {})
+                                for tr in tracks:
+                                    try:
+                                        tid = int(tr.get('id', 0))
+                                        bb = tr.get('bbox') or {}
+                                        bx = int(bb.get('x', 0))
+                                        by = int(bb.get('y', 0))
+                                        bw = int(bb.get('w', 0))
+                                        bh = int(bb.get('h', 0))
+                                        prev = cam_smooth.get(tid)
+                                        if prev:
+                                            bx = int(prev['x'] * (1 - ema_alpha) + bx * ema_alpha)
+                                            by = int(prev['y'] * (1 - ema_alpha) + by * ema_alpha)
+                                            bw = int(prev['w'] * (1 - ema_alpha) + bw * ema_alpha)
+                                            bh = int(prev['h'] * (1 - ema_alpha) + bh * ema_alpha)
+                                        # Update normalized center and velocity for predictive client-side smoothing
+                                        cx = float(bx) + float(bw) / 2.0
+                                        cy = float(by) + float(bh) / 2.0
+                                        nx = float(cx) / max(1.0, float(frame_w))
+                                        ny = float(cy) / max(1.0, float(frame_h))
+                                        now_secs = time.time()
+                                        prev_nx = float(prev.get('nx', nx)) if prev else nx
+                                        prev_ny = float(prev.get('ny', ny)) if prev else ny
+                                        prev_ts = float(prev.get('ts', now_secs)) if prev else now_secs
+                                        dt = max(1e-3, now_secs - prev_ts)
+                                        vx_nps = (nx - prev_nx) / dt
+                                        vy_nps = (ny - prev_ny) / dt
+                                        cam_smooth[tid] = {
+                                            'x': float(bx), 'y': float(by), 'w': float(bw), 'h': float(bh),
+                                            'nx': float(nx), 'ny': float(ny), 'ts': float(now_secs),
+                                            'vx_nps': float(vx_nps), 'vy_nps': float(vy_nps),
+                                        }
+                                        st = dict(tr)
+                                        st['bbox'] = {'x': bx, 'y': by, 'w': bw, 'h': bh}
+                                        st['center'] = {'nx': float(nx), 'ny': float(ny)}
+                                        st['velocity'] = {'vx_norm_per_sec': float(vx_nps), 'vy_norm_per_sec': float(vy_nps)}
+                                        smoothed_tracks.append(st)
+                                    except Exception:
+                                        smoothed_tracks.append(tr)
                                 try:
-                                    tid = int(tr.get('id', 0))
-                                    bb = tr.get('bbox') or {}
-                                    bx = int(bb.get('x', 0))
-                                    by = int(bb.get('y', 0))
-                                    bw = int(bb.get('w', 0))
-                                    bh = int(bb.get('h', 0))
-                                    prev = cam_smooth.get(tid)
-                                    if prev:
-                                        bx = int(prev['x'] * (1 - ema_alpha) + bx * ema_alpha)
-                                        by = int(prev['y'] * (1 - ema_alpha) + by * ema_alpha)
-                                        bw = int(prev['w'] * (1 - ema_alpha) + bw * ema_alpha)
-                                        bh = int(prev['h'] * (1 - ema_alpha) + bh * ema_alpha)
-                                    # Update normalized center and velocity for predictive client-side smoothing
-                                    cx = float(bx) + float(bw) / 2.0
-                                    cy = float(by) + float(bh) / 2.0
-                                    nx = float(cx) / max(1.0, float(frame_w))
-                                    ny = float(cy) / max(1.0, float(frame_h))
-                                    now_secs = time.time()
-                                    prev_nx = float(prev.get('nx', nx)) if prev else nx
-                                    prev_ny = float(prev.get('ny', ny)) if prev else ny
-                                    prev_ts = float(prev.get('ts', now_secs)) if prev else now_secs
-                                    dt = max(1e-3, now_secs - prev_ts)
-                                    vx_nps = (nx - prev_nx) / dt
-                                    vy_nps = (ny - prev_ny) / dt
-                                    cam_smooth[tid] = {
-                                        'x': float(bx), 'y': float(by), 'w': float(bw), 'h': float(bh),
-                                        'nx': float(nx), 'ny': float(ny), 'ts': float(now_secs),
-                                        'vx_nps': float(vx_nps), 'vy_nps': float(vy_nps),
-                                    }
-                                    st = dict(tr)
-                                    st['bbox'] = {'x': bx, 'y': by, 'w': bw, 'h': bh}
-                                    st['center'] = {'nx': float(nx), 'ny': float(ny)}
-                                    st['velocity'] = {'vx_norm_per_sec': float(vx_nps), 'vy_norm_per_sec': float(vy_nps)}
-                                    smoothed_tracks.append(st)
-                                except Exception:
-                                    smoothed_tracks.append(tr)
-                            try:
-                                if target_classes:
-                                    smoothed_tracks = [t for t in smoothed_tracks if str(t.get('class','')) in target_classes]
-                            except Exception:
-                                pass
-                            tracks_payload = {
-                                'camera_id': camera_id,
-                                'tracks': smoothed_tracks,
-                                'timestamp': datetime.now().isoformat(),
-                                'frame_width': frame_w,
-                                'frame_height': frame_h,
-                                'camera_moving': False,
-                            }
-                            if self.on_tracks_update:
-                                try:
-                                    self.on_tracks_update(camera_id, tracks_payload)
+                                    if target_classes:
+                                        smoothed_tracks = [t for t in smoothed_tracks if str(t.get('class','')) in target_classes]
                                 except Exception:
                                     pass
-                            if hasattr(self, '_loop') and self._loop and self._loop.is_running():
-                                self._loop.call_soon_threadsafe(
-                                    lambda: asyncio.create_task(self._broadcast_tracks_data(camera_id, tracks_payload))
+                            try:
+                                self._emit_track_scene_events(
+                                    camera_id, smoothed_tracks, frame_w, frame_h, frame_bgr=frame
                                 )
+                            except Exception as _tse:
+                                logger.debug(f"TrackSceneEngine error for {camera_id}: {_tse}")
+                            if smoothed_tracks:
+                                tracks_payload = {
+                                    'camera_id': camera_id,
+                                    'tracks': smoothed_tracks,
+                                    'timestamp': datetime.now().isoformat(),
+                                    'frame_width': frame_w,
+                                    'frame_height': frame_h,
+                                    'camera_moving': False,
+                                }
+                                if self.on_tracks_update:
+                                    try:
+                                        self.on_tracks_update(camera_id, tracks_payload)
+                                    except Exception:
+                                        pass
+                                if hasattr(self, '_loop') and self._loop and self._loop.is_running():
+                                    self._loop.call_soon_threadsafe(
+                                        lambda: asyncio.create_task(self._broadcast_tracks_data(camera_id, tracks_payload))
+                                    )
                         elif tracks and suppress_outputs:
                             # When suppressing, immediately clear smoothing so no stale boxes persist
                             try:
@@ -1908,6 +1937,46 @@ class StreamServer:
     def get_camera_shapes(self, camera_id: str) -> Dict[str, List[Any]]:
         """Retrieve user-drawn shapes for a camera."""
         return self._camera_shapes.get(camera_id, {'zones': [], 'lines': [], 'tags': []})
+
+    def _ensure_track_scene_engine(self):
+        if self._track_scene_engine is None:
+            from core.automation.track_state import TrackSceneEngine
+            self._track_scene_engine = TrackSceneEngine()
+        return self._track_scene_engine
+
+    def _emit_track_scene_events(
+        self,
+        camera_id: str,
+        tracks: List[Dict[str, Any]],
+        frame_w: int,
+        frame_h: int,
+        frame_bgr: Any = None,
+        *,
+        tracker_namespace: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Evaluate backend tracks against camera shapes and emit semantic events."""
+        from core.automation.track_state import BACKEND_SORT_NAMESPACE
+
+        engine = self._ensure_track_scene_engine()
+        shapes = self.get_camera_shapes(camera_id)
+        ns = str(tracker_namespace or BACKEND_SORT_NAMESPACE)
+        events = engine.update(
+            camera_id=str(camera_id),
+            tracks=tracks or [],
+            shapes=shapes,
+            frame_w=int(frame_w),
+            frame_h=int(frame_h),
+            frame_bgr=frame_bgr,
+            tracker_namespace=ns,
+        )
+        cb = getattr(self, 'on_track_event', None)
+        if cb and events:
+            for ev in events:
+                try:
+                    cb(camera_id, ev)
+                except Exception:
+                    pass
+        return events
     
     def _compute_shape_rois(self, camera_id: str, frame_w: int, frame_h: int) -> List[Tuple[int, int, int, int]]:
         """Compute ROI bounding boxes from user shapes (zones/lines/tags). Returns list of (x, y, w, h) in pixels."""

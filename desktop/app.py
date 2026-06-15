@@ -47,6 +47,16 @@ import numpy as np
 # Import local modules
 from desktop.ipc_server import IPCServer
 from desktop.utils.app_icon import apply_app_icon, load_knoxnet_icon
+from desktop.utils.motion_overlay_styles import (
+    TRAIL_COLOR_MODES,
+    TRAIL_STYLES,
+    normalize_motion_animation,
+    normalize_motion_style,
+)
+from desktop.widgets.motion_style_picker import (
+    motion_animation_picker,
+    motion_style_picker,
+)
 
 # Import CameraManager from core
 import os
@@ -54,6 +64,23 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.camera_manager import CameraManager
 from core.layout_models import LayoutDefinition, WidgetDefinition
 from core.layout_store import LayoutsAndProfilesStore
+from desktop.utils.camera_profiles import (
+    build_ai_pipeline_payload,
+    build_camera_profile_payload,
+    build_monitoring_tools_payload,
+    build_overlays_payload,
+    export_rules_for_profile,
+    merge_profile_dicts,
+    profile_to_widget_view,
+)
+from desktop.utils.event_rules_api import (
+    DEFAULT_API_BASE,
+    apply_backend_detection_config,
+    get_backend_detection_config,
+    list_rules,
+    replace_camera_rules,
+    sync_camera_shapes,
+)
 from core.session_manager import SessionManager
 from core.load_shedder import (
     LoadShedder,
@@ -842,7 +869,7 @@ class KnoxnetDesktopApp(QApplication):
         detect_toggle.toggled.connect(lambda on: self._ipc_set_object_detection_all({"enabled": on}))
         profiles_menu.addAction(detect_toggle)
 
-        watch_toggle = QAction("Motion Watch (all cameras)", self)
+        watch_toggle = QAction("Event Rules (all cameras)", self)
         watch_toggle.setCheckable(True)
         watch_toggle.setChecked(_any_cam_has("motion_watch_active"))
         def _toggle_watch(on):
@@ -2260,8 +2287,11 @@ class KnoxnetDesktopApp(QApplication):
             for w in list(self.active_widgets):
                 if isinstance(w, CameraWidget) and str(w.camera_id).lower() == str(camera_id).lower():
                     try:
-                        w.stop_motion_watch("stopped via terminal")
-                        logger.info(f"Stopped motion watch for {camera_id}")
+                        if hasattr(w, "disarm_event_rules"):
+                            w.disarm_event_rules("stopped via terminal")
+                        else:
+                            w.stop_motion_watch("stopped via terminal")
+                        logger.info(f"Stopped Event Rules for {camera_id}")
                         return
                     except Exception as e:
                         logger.error(f"Failed to stop motion watch for {camera_id}: {e}")
@@ -2284,8 +2314,11 @@ class KnoxnetDesktopApp(QApplication):
                         w.motion_watch_settings["duration_sec"] = int(duration)
                     except Exception:
                         pass
-                w.start_motion_watch()
-                logger.info(f"Started motion watch for {camera_ref}")
+                if hasattr(w, "arm_event_rules"):
+                    w.arm_event_rules()
+                else:
+                    w.start_motion_watch()
+                logger.info(f"Started Event Rules for {camera_ref}")
             except Exception as e:
                 logger.error(f"Failed to start motion watch for {camera_ref}: {e}")
         elif cmd_type == "set_motion_boxes":
@@ -2494,11 +2527,14 @@ class KnoxnetDesktopApp(QApplication):
                         w.motion_watch_settings["duration_sec"] = int(duration)
                     except Exception:
                         pass
-                w.start_motion_watch()
+                if hasattr(w, "arm_event_rules"):
+                    w.arm_event_rules()
+                else:
+                    w.start_motion_watch()
                 count += 1
             except Exception as e:
-                logger.error(f"Failed to start motion watch for {getattr(w, 'camera_id', '?')}: {e}")
-        logger.info(f"Started motion watch on {count} camera(s)")
+                logger.error(f"Failed to start Event Rules for {getattr(w, 'camera_id', '?')}: {e}")
+        logger.info(f"Started Event Rules on {count} camera(s)")
 
     def _ipc_stop_motion_watch_all(self):
         widgets = self._ipc_camera_widgets()
@@ -2506,11 +2542,14 @@ class KnoxnetDesktopApp(QApplication):
         for w in widgets:
             try:
                 if getattr(w, "motion_watch_active", False):
-                    w.stop_motion_watch("stopped via terminal (all)")
+                    if hasattr(w, "disarm_event_rules"):
+                        w.disarm_event_rules("stopped via terminal (all)")
+                    else:
+                        w.stop_motion_watch("stopped via terminal (all)")
                     count += 1
             except Exception as e:
-                logger.error(f"Failed to stop motion watch for {getattr(w, 'camera_id', '?')}: {e}")
-        logger.info(f"Stopped motion watch on {count} camera(s)")
+                logger.error(f"Failed to stop Event Rules for {getattr(w, 'camera_id', '?')}: {e}")
+        logger.info(f"Stopped Event Rules on {count} camera(s)")
 
     def _ipc_toggle_recording(self, command):
         camera_ref = command.get("camera_ref") or command.get("camera_id") or ""
@@ -3933,18 +3972,20 @@ class KnoxnetDesktopApp(QApplication):
         if not settings:
             return {}
         safe = dict(settings)
-        color = safe.get("color")
-        if isinstance(color, QColor):
-            safe["color"] = color.name()
+        for key in ("color", "trail_color"):
+            color = safe.get(key)
+            if isinstance(color, QColor):
+                safe[key] = color.name()
         return safe
 
     def _deserialize_motion_settings(self, settings: dict) -> dict:
         if not settings:
             return {}
         ms = dict(settings)
-        color = ms.get("color")
-        if isinstance(color, str):
-            ms["color"] = QColor(color)
+        for key in ("color", "trail_color"):
+            color = ms.get(key)
+            if isinstance(color, str) and color:
+                ms[key] = QColor(color)
         return ms
 
     def _resolve_camera_id(self, camera_ref: str) -> str | None:
@@ -4539,6 +4580,8 @@ class KnoxnetDesktopApp(QApplication):
                     # Motion watch (layout-scoped; restored on load)
                     "motion_watch_settings": dict(getattr(w, "motion_watch_settings", {}) or {}),
                     "motion_watch_active": bool(getattr(w, "motion_watch_active", False)),
+                    # Server-side state snapshot (rules + backend detection)
+                    **self._capture_camera_server_snapshot(str(w.camera_id)),
                     **(
                         {
                             "motion_watch_infinite": getattr(w, "motion_watch_end_ts", 0) is None,
@@ -4777,10 +4820,209 @@ class KnoxnetDesktopApp(QApplication):
         except Exception:
             return []
 
+    def _api_base(self) -> str:
+        try:
+            from desktop.widgets.camera import ObjectDetectionSettingsDialog
+            return str(ObjectDetectionSettingsDialog.API_BASE).rstrip("/")
+        except Exception:
+            return DEFAULT_API_BASE.rstrip("/")
+
+    def _capture_camera_server_snapshot(self, camera_id: str) -> dict:
+        """Best-effort snapshot of server-side rules and backend detection for layout save."""
+        out: dict = {}
+        if not camera_id:
+            return out
+        try:
+            api_base = self._api_base()
+            rules = list_rules(api_base, camera_id)
+            exported = export_rules_for_profile(
+                rules,
+                include_legacy=False,
+                source_camera_id=camera_id,
+            )
+            if exported:
+                out["event_rules"] = exported
+            cfg = get_backend_detection_config(api_base, camera_id)
+            if cfg:
+                out["backend_detection"] = cfg
+        except Exception as e:
+            logger.debug("Server snapshot failed for %s: %s", camera_id, e)
+        return out
+
+    def _restore_camera_server_state(self, widget, settings: dict) -> None:
+        """Sync shapes, event rules, and backend detection from saved settings to the server."""
+        if not settings or not widget:
+            return
+        cam_id = str(getattr(widget, "camera_id", "") or "")
+        if not cam_id:
+            return
+        api_base = self._api_base()
+        try:
+            from desktop.utils.camera_profiles import (
+                build_shape_id_map,
+                remap_shape_ids,
+                rewrite_rules_for_camera,
+                sanitize_shapes,
+            )
+
+            shapes = settings.get("shapes")
+            if isinstance(shapes, list) and shapes:
+                profile_shapes = sanitize_shapes(shapes)
+                id_map = build_shape_id_map(profile_shapes, preserve_ids=True)
+                applied_shapes = remap_shape_ids(profile_shapes, id_map)
+                try:
+                    widget.gl_widget.set_shapes(applied_shapes)
+                except Exception:
+                    pass
+                sync_camera_shapes(api_base, cam_id, applied_shapes)
+
+            event_rules = settings.get("event_rules")
+            if isinstance(event_rules, list) and event_rules:
+                id_map = build_shape_id_map(
+                    sanitize_shapes(shapes or []) if isinstance(shapes, list) else [],
+                    preserve_ids=True,
+                )
+                rewritten = rewrite_rules_for_camera(event_rules, cam_id, id_map)
+                replace_camera_rules(api_base, cam_id, rewritten, delete_existing=True)
+                try:
+                    if hasattr(widget, "_refresh_shape_counter_config"):
+                        widget._refresh_shape_counter_config(force=True)
+                except Exception:
+                    pass
+
+            backend_detection = settings.get("backend_detection")
+            if isinstance(backend_detection, dict) and backend_detection:
+                apply_backend_detection_config(api_base, cam_id, backend_detection)
+        except Exception as e:
+            logger.warning("Failed to restore camera server state for %s: %s", cam_id, e)
+
+    def _capture_widget_profile_state(self, widget, *, include: dict) -> dict:
+        """Build a full camera profile payload from a live CameraWidget."""
+        gl = getattr(widget, "gl_widget", None)
+        cam_id = str(getattr(widget, "camera_id", "") or "")
+        api_base = self._api_base()
+
+        exclude_kinds: set[str] = set()
+        if include.get("exclude_zones"):
+            exclude_kinds.add("zone")
+        if include.get("exclude_lines"):
+            exclude_kinds.add("line")
+        if include.get("exclude_tags"):
+            exclude_kinds.add("tag")
+
+        overlays = build_overlays_payload()
+        if include.get("shapes", True):
+            from desktop.utils.camera_profiles import sanitize_shapes
+            raw_shapes = list(getattr(gl, "shapes", []) or [])
+            overlays = build_overlays_payload(
+                shapes=sanitize_shapes(raw_shapes, exclude_kinds=exclude_kinds or None),
+            )
+        if include.get("motion_style") and gl:
+            overlays.update(
+                build_overlays_payload(
+                    motion_settings=self._serialize_settings_dict(
+                        dict(getattr(gl, "motion_settings", {}) or {})
+                    )
+                )
+            )
+        if include.get("motion_boxes_enabled"):
+            overlays.update(build_overlays_payload(motion_boxes_enabled=bool(getattr(widget, "motion_boxes_enabled", False))))
+        if include.get("detection_style") and gl:
+            overlays.update(
+                build_overlays_payload(
+                    detection_settings=self._serialize_settings_dict(
+                        dict(getattr(gl, "detection_settings", {}) or {})
+                    )
+                )
+            )
+        if include.get("debug_overlay"):
+            overlays.update(build_overlays_payload(debug_overlay_enabled=bool(getattr(widget, "debug_overlay_enabled", False))))
+        if include.get("show_shape_labels") and gl:
+            overlays.update(build_overlays_payload(show_shape_labels=bool(getattr(gl, "show_shape_labels", True))))
+        if include.get("stream_display"):
+            overlays.update(
+                build_overlays_payload(
+                    aspect_ratio_locked=bool(getattr(widget, "aspect_ratio_locked", True)),
+                    stream_quality=str(getattr(widget, "stream_quality", "medium")),
+                )
+            )
+
+        ai = build_ai_pipeline_payload()
+        if include.get("object_detection_enabled"):
+            ai.update(
+                build_ai_pipeline_payload(
+                    object_detection_enabled=bool(getattr(widget, "object_detection_enabled", False)),
+                    desktop_object_detection_enabled=bool(getattr(widget, "desktop_object_detection_enabled", False)),
+                )
+            )
+        if include.get("desktop_detector"):
+            ai.update(
+                build_ai_pipeline_payload(
+                    desktop_detector_config=self._serialize_desktop_detector_config(
+                        getattr(widget, "desktop_detector_config", None)
+                    )
+                )
+            )
+        if include.get("backend_detection"):
+            cfg = get_backend_detection_config(api_base, cam_id)
+            if cfg:
+                ai.update(build_ai_pipeline_payload(backend_detection=cfg))
+
+        mt = build_monitoring_tools_payload()
+        if include.get("motion_watch"):
+            mt.update(
+                build_monitoring_tools_payload(
+                    motion_watch_settings=dict(getattr(widget, "motion_watch_settings", {}) or {})
+                )
+            )
+        if include.get("event_rules"):
+            rules = list_rules(api_base, cam_id)
+            exported = export_rules_for_profile(
+                rules,
+                include_legacy=bool(include.get("include_legacy_rules")),
+                source_camera_id=cam_id,
+            )
+            if exported:
+                mt["event_rules"] = exported
+
+        return build_camera_profile_payload(
+            name=str(include.get("name") or cam_id or "Camera Profile"),
+            source_camera_id=cam_id,
+            overlays=overlays,
+            ai_pipeline=ai,
+            monitoring_tools=mt,
+        )
+
+    def _apply_camera_profile_payload(self, widget, profile_dict: dict, *, sync_server: bool = True) -> None:
+        """Apply a profile dict to a CameraWidget (local + optional server sync)."""
+        if not widget or not isinstance(profile_dict, dict):
+            return
+        view = profile_to_widget_view(profile_dict)
+        self._apply_camera_settings(widget, view)
+
+        mw = view.get("motion_watch_settings")
+        if isinstance(mw, dict) and mw:
+            try:
+                widget.motion_watch_settings.update(mw)
+                if hasattr(widget, "_persist_motion_watch_settings"):
+                    widget._persist_motion_watch_settings()
+            except Exception:
+                pass
+
+        if sync_server:
+            self._restore_camera_server_state(widget, view)
+
+        try:
+            if hasattr(widget, "_apply_overlay_settings"):
+                widget._apply_overlay_settings()
+            if getattr(widget, "gl_widget", None):
+                widget.gl_widget.update()
+        except Exception:
+            pass
+
     def _apply_assigned_profile_overlays(self, camera_id: str, widget) -> None:
         """
-        Apply all profile features (shapes, overlay styles, toggles, monitoring)
-        from the camera's assigned profile(s) to a CameraWidget.
+        Apply all profile features from the camera's assigned profile(s) to a CameraWidget.
         """
         try:
             assigns = self.layouts_store.get_assignments()
@@ -4793,75 +5035,15 @@ class KnoxnetDesktopApp(QApplication):
             if not profile_ids:
                 return
 
-            shapes: list = []
+            prof_dicts: list[dict] = []
             for pid in profile_ids:
                 prof = self.layouts_store.get_profile(pid)
-                if not prof:
-                    continue
-                ov = prof.overlays or {}
-
-                # Shapes
-                s = ov.get("shapes")
-                if isinstance(s, list):
-                    shapes.extend(s)
-
-                gl = getattr(widget, "gl_widget", None)
-
-                # Motion overlay style
-                ms = ov.get("motion_settings")
-                if isinstance(ms, dict) and gl:
-                    merged = dict(getattr(gl, "motion_settings", {}) or {})
-                    merged.update(self._deserialize_settings_dict(ms))
-                    gl.motion_settings = merged
-
-                # Motion boxes enabled
-                if "motion_boxes_enabled" in ov:
-                    try:
-                        widget.motion_boxes_enabled = bool(ov["motion_boxes_enabled"])
-                        widget._apply_overlay_settings()
-                    except Exception:
-                        pass
-
-                # Detection overlay style
-                ds = ov.get("detection_settings")
-                if isinstance(ds, dict) and gl:
-                    merged = dict(getattr(gl, "detection_settings", {}) or {})
-                    merged.update(self._deserialize_settings_dict(ds))
-                    gl.detection_settings = merged
-
-                # Debug overlay
-                if "debug_overlay_enabled" in ov:
-                    try:
-                        widget.debug_overlay_enabled = bool(ov["debug_overlay_enabled"])
-                        widget._apply_overlay_settings()
-                    except Exception:
-                        pass
-
-                # AI pipeline settings
-                ai = prof.ai_pipeline or {}
-                if "object_detection_enabled" in ai:
-                    try:
-                        if bool(ai["object_detection_enabled"]) and not widget.desktop_object_detection_enabled:
-                            widget.toggle_object_detection()
-                        elif not bool(ai["object_detection_enabled"]) and widget.desktop_object_detection_enabled:
-                            widget.toggle_object_detection()
-                    except Exception:
-                        pass
-
-                # Monitoring tools
-                mt = prof.monitoring_tools or {}
-                mw = mt.get("motion_watch_settings")
-                if isinstance(mw, dict):
-                    try:
-                        widget.motion_watch_settings.update(mw)
-                    except Exception:
-                        pass
-
-            if shapes:
-                try:
-                    widget.gl_widget.set_shapes(shapes)
-                except Exception:
-                    pass
+                if prof:
+                    prof_dicts.append(prof.to_dict())
+            if not prof_dicts:
+                return
+            merged = merge_profile_dicts(prof_dicts)
+            self._apply_camera_profile_payload(widget, merged, sync_server=True)
         except Exception:
             return
 
@@ -6328,6 +6510,12 @@ class KnoxnetDesktopApp(QApplication):
                         self._restore_camera_extras(w, entry.view or {})
                 except Exception:
                     pass
+                # Sync shapes, rules, and backend detection to server after local restore.
+                try:
+                    if entry.type == "camera":
+                        self._restore_camera_server_state(w, entry.view or {})
+                except Exception:
+                    pass
                 # Restore motion watch after widget geometry and overlays are applied.
                 try:
                     if entry.type == "camera":
@@ -6472,17 +6660,7 @@ class KnoxnetDesktopApp(QApplication):
 
     def prompt_save_profile_from_camera(self):
         """Capture a profile from a visible camera widget with fine-grained include/exclude options."""
-        from PySide6.QtWidgets import (
-            QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QCheckBox,
-            QDialogButtonBox, QLabel, QLineEdit, QComboBox, QScrollArea, QFrame,
-        )
-        from PySide6.QtCore import Qt
-
-        try:
-            from desktop.widgets.camera import CameraWidget
-        except Exception:
-            QMessageBox.warning(None, "Profiles", "Camera widgets are unavailable.")
-            return
+        from desktop.widgets.camera import CameraWidget
 
         cameras = []
         for w in list(self.active_widgets):
@@ -6494,27 +6672,50 @@ class KnoxnetDesktopApp(QApplication):
         if not cameras:
             QMessageBox.information(None, "Profiles", "No active camera widgets found.")
             return
+        self._prompt_save_camera_profile_dialog(cameras[0], cameras=cameras)
 
+    def prompt_save_camera_profile_for_widget(self, widget):
+        """Save a profile from a specific camera widget (context menu entry point)."""
+        if widget is None:
+            return
+        from desktop.widgets.camera import CameraWidget
+        if not isinstance(widget, CameraWidget):
+            return
+        cameras = [w for w in self._collect_target_widgets("camera") if isinstance(w, CameraWidget)]
+        if widget not in cameras:
+            cameras.insert(0, widget)
+        self._prompt_save_camera_profile_dialog(widget, cameras=cameras)
+
+    def _prompt_save_camera_profile_dialog(self, default_widget, *, cameras=None):
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QGroupBox, QCheckBox,
+            QDialogButtonBox, QLabel, QLineEdit, QComboBox, QScrollArea, QFrame,
+        )
+
+        from desktop.widgets.camera import CameraWidget
+
+        cameras = list(cameras or [default_widget])
         dlg = QDialog()
-        dlg.setWindowTitle("Save Profile from Camera")
-        dlg.setMinimumWidth(420)
+        dlg.setWindowTitle("Save Camera Profile")
+        dlg.setMinimumWidth(440)
         root = QVBoxLayout(dlg)
 
-        # Camera selector
         root.addWidget(QLabel("Source camera:"))
         cam_combo = QComboBox()
-        for w in cameras:
+        default_idx = 0
+        for i, w in enumerate(cameras):
             title = w.windowTitle() or str(getattr(w, "camera_id", "camera"))
             cam_combo.addItem(title)
+            if w is default_widget:
+                default_idx = i
+        cam_combo.setCurrentIndex(default_idx)
         root.addWidget(cam_combo)
 
-        # Profile name
         root.addWidget(QLabel("Profile name:"))
         name_edit = QLineEdit()
         name_edit.setPlaceholderText("My Camera Profile")
         root.addWidget(name_edit)
 
-        # Scrollable options area
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -6522,7 +6723,6 @@ class KnoxnetDesktopApp(QApplication):
         opts_layout = QVBoxLayout(opts_widget)
         opts_layout.setContentsMargins(0, 0, 0, 0)
 
-        # --- Exclude section (shapes by kind) ---
         exclude_group = QGroupBox("Exclude shape types")
         eg_layout = QVBoxLayout(exclude_group)
         exclude_zones = QCheckBox("Zones")
@@ -6532,27 +6732,35 @@ class KnoxnetDesktopApp(QApplication):
             eg_layout.addWidget(cb)
         opts_layout.addWidget(exclude_group)
 
-        # --- Include section (overlay & monitoring features) ---
         include_group = QGroupBox("Include features")
         ig_layout = QVBoxLayout(include_group)
+        inc_shapes = QCheckBox("Zones / Lines / Tags (shapes)")
+        inc_shapes.setChecked(True)
         inc_motion_style = QCheckBox("Motion box overlay style")
         inc_motion_enabled = QCheckBox("Motion boxes enabled state")
         inc_detection_style = QCheckBox("Detection overlay style")
         inc_detection_enabled = QCheckBox("Object detection enabled state")
-        inc_motion_watch = QCheckBox("Motion watch settings")
+        inc_desktop_detector = QCheckBox("Desktop detector config")
+        inc_backend_detection = QCheckBox("Backend detection config")
+        inc_motion_watch = QCheckBox("Capture / Motion Watch settings")
+        inc_event_rules = QCheckBox("Event rules (actions, paths, counters config)")
+        inc_event_rules.setChecked(True)
+        inc_legacy_rules = QCheckBox("Include legacy Motion Watch rule")
         inc_debug = QCheckBox("Debug overlay enabled state")
-        inc_shapes = QCheckBox("Zones / Lines / Tags (shapes)")
-        inc_shapes.setChecked(True)
-        for cb in (inc_shapes, inc_motion_style, inc_motion_enabled,
-                   inc_detection_style, inc_detection_enabled,
-                   inc_motion_watch, inc_debug):
+        inc_shape_labels = QCheckBox("Show shape labels state")
+        inc_stream = QCheckBox("Stream quality & aspect ratio")
+        for cb in (
+            inc_shapes, inc_motion_style, inc_motion_enabled, inc_detection_style,
+            inc_detection_enabled, inc_desktop_detector, inc_backend_detection,
+            inc_motion_watch, inc_event_rules, inc_legacy_rules, inc_debug,
+            inc_shape_labels, inc_stream,
+        ):
             ig_layout.addWidget(cb)
         opts_layout.addWidget(include_group)
 
         scroll.setWidget(opts_widget)
         root.addWidget(scroll)
 
-        # Auto-assign checkbox
         auto_assign = QCheckBox("Assign this profile to the source camera immediately")
         auto_assign.setChecked(True)
         root.addWidget(auto_assign)
@@ -6574,57 +6782,32 @@ class KnoxnetDesktopApp(QApplication):
         if idx < 0 or idx >= len(cameras):
             return
         chosen = cameras[idx]
-        gl = getattr(chosen, "gl_widget", None)
 
-        # Build profile payload
-        overlays: dict = {}
-        ai_pipeline: dict = {}
-        monitoring_tools: dict = {}
+        include = {
+            "name": name,
+            "shapes": inc_shapes.isChecked(),
+            "exclude_zones": exclude_zones.isChecked(),
+            "exclude_lines": exclude_lines.isChecked(),
+            "exclude_tags": exclude_tags.isChecked(),
+            "motion_style": inc_motion_style.isChecked(),
+            "motion_boxes_enabled": inc_motion_enabled.isChecked(),
+            "detection_style": inc_detection_style.isChecked(),
+            "object_detection_enabled": inc_detection_enabled.isChecked(),
+            "desktop_detector": inc_desktop_detector.isChecked(),
+            "backend_detection": inc_backend_detection.isChecked(),
+            "motion_watch": inc_motion_watch.isChecked(),
+            "event_rules": inc_event_rules.isChecked(),
+            "include_legacy_rules": inc_legacy_rules.isChecked(),
+            "debug_overlay": inc_debug.isChecked(),
+            "show_shape_labels": inc_shape_labels.isChecked(),
+            "stream_display": inc_stream.isChecked(),
+        }
 
-        # Shapes (with exclusion filtering)
-        if inc_shapes.isChecked():
-            all_shapes = list(getattr(gl, "shapes", []) or [])
-            excluded_kinds = set()
-            if exclude_zones.isChecked():
-                excluded_kinds.add("zone")
-            if exclude_lines.isChecked():
-                excluded_kinds.add("line")
-            if exclude_tags.isChecked():
-                excluded_kinds.add("tag")
-            if excluded_kinds:
-                all_shapes = [s for s in all_shapes if (s.get("kind") or "") not in excluded_kinds]
-            if all_shapes:
-                overlays["shapes"] = all_shapes
-
-        # Motion overlay style
-        if inc_motion_style.isChecked() and gl:
-            overlays["motion_settings"] = self._serialize_settings_dict(
-                dict(getattr(gl, "motion_settings", {}) or {})
-            )
-
-        # Motion boxes enabled
-        if inc_motion_enabled.isChecked():
-            overlays["motion_boxes_enabled"] = bool(getattr(chosen, "motion_boxes_enabled", False))
-
-        # Detection overlay style
-        if inc_detection_style.isChecked() and gl:
-            overlays["detection_settings"] = self._serialize_settings_dict(
-                dict(getattr(gl, "detection_settings", {}) or {})
-            )
-
-        # Object detection enabled
-        if inc_detection_enabled.isChecked():
-            ai_pipeline["object_detection_enabled"] = bool(getattr(chosen, "desktop_object_detection_enabled", False))
-
-        # Motion watch settings
-        if inc_motion_watch.isChecked():
-            monitoring_tools["motion_watch_settings"] = dict(getattr(chosen, "motion_watch_settings", {}) or {})
-
-        # Debug overlay
-        if inc_debug.isChecked():
-            overlays["debug_overlay_enabled"] = bool(getattr(chosen, "debug_overlay_enabled", False))
-
-        if not overlays and not ai_pipeline and not monitoring_tools:
+        payload = self._capture_widget_profile_state(chosen, include=include)
+        overlays = payload.get("overlays") or {}
+        ai = payload.get("ai_pipeline") or {}
+        mt = payload.get("monitoring_tools") or {}
+        if not overlays and not ai and not mt:
             QMessageBox.information(None, "Save Profile", "No features selected – nothing to save.")
             return
 
@@ -6632,9 +6815,9 @@ class KnoxnetDesktopApp(QApplication):
             prof = self.layouts_store.create_profile(
                 name=name,
                 overlays=overlays,
-                ai_pipeline=ai_pipeline,
-                monitoring_tools=monitoring_tools,
-                meta={"source": "desktop_camera_widget"},
+                ai_pipeline=ai,
+                monitoring_tools=mt,
+                meta=payload.get("meta") or {"source": "desktop_camera_widget"},
             )
             if auto_assign.isChecked():
                 self.layouts_store.set_assignment(str(chosen.camera_id), prof.id)
@@ -6646,15 +6829,92 @@ class KnoxnetDesktopApp(QApplication):
             logger.error(f"Failed to save profile: {e}")
             QMessageBox.warning(None, "Save Profile", f"Failed to save profile: {e}")
 
-    # ---- Apply Profile to Cameras ----
-
     def prompt_apply_profile_to_cameras(self):
         """Bulk-apply an existing profile to selected (or all) cameras."""
+        self._prompt_apply_camera_profile_dialog(target_widget=None)
+
+    def prompt_apply_camera_profile_for_widget(self, widget):
+        """Apply a saved profile to the given camera widget."""
+        if widget is None:
+            return
+        self._prompt_apply_camera_profile_dialog(target_widget=widget)
+
+    def prompt_copy_settings_from_camera(self, target_widget):
+        """Copy all settings from another camera onto *target_widget*."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox, QLabel, QComboBox
+        from desktop.widgets.camera import CameraWidget
+
+        if target_widget is None or not isinstance(target_widget, CameraWidget):
+            return
+
+        sources = [
+            w for w in self._collect_target_widgets("camera")
+            if isinstance(w, CameraWidget) and w is not target_widget
+        ]
+        if not sources:
+            all_cams = getattr(self.camera_manager, "cameras", {}) if self.camera_manager else {}
+            if not all_cams:
+                QMessageBox.information(None, "Copy Settings", "No other cameras available.")
+                return
+            QMessageBox.information(
+                None,
+                "Copy Settings",
+                "Open the source camera widget first, or use Apply Camera Profile for saved profiles.",
+            )
+            return
+
+        dlg = QDialog()
+        dlg.setWindowTitle("Copy Settings From Camera")
+        dlg.setMinimumWidth(360)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel("Copy all settings from:"))
+        combo = QComboBox()
+        for w in sources:
+            combo.addItem(w.windowTitle() or str(getattr(w, "camera_id", "camera")))
+        v.addWidget(combo)
+        v.addWidget(QLabel(f"Target: {target_widget.windowTitle() or target_widget.camera_id}"))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        v.addWidget(buttons)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        idx = combo.currentIndex()
+        if idx < 0 or idx >= len(sources):
+            return
+        source = sources[idx]
+        include = {
+            "name": f"copy:{getattr(source, 'camera_id', 'source')}",
+            "shapes": True,
+            "motion_style": True,
+            "motion_boxes_enabled": True,
+            "detection_style": True,
+            "object_detection_enabled": True,
+            "desktop_detector": True,
+            "backend_detection": True,
+            "motion_watch": True,
+            "event_rules": True,
+            "include_legacy_rules": False,
+            "debug_overlay": True,
+            "show_shape_labels": True,
+            "stream_display": True,
+        }
+        payload = self._capture_widget_profile_state(source, include=include)
+        self._apply_camera_profile_payload(target_widget, payload, sync_server=True)
+        self.tray_icon.showMessage(
+            "Knoxnet VMS Beta",
+            f"Copied settings to {target_widget.windowTitle() or target_widget.camera_id}",
+            QSystemTrayIcon.MessageIcon.Information,
+        )
+
+    def _prompt_apply_camera_profile_dialog(self, *, target_widget=None):
         from PySide6.QtWidgets import (
             QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
             QDialogButtonBox, QLabel, QComboBox, QPushButton,
         )
         from PySide6.QtCore import Qt
+        from desktop.widgets.camera import CameraWidget
 
         profiles = []
         try:
@@ -6666,7 +6926,7 @@ class KnoxnetDesktopApp(QApplication):
             return
 
         dlg = QDialog()
-        dlg.setWindowTitle("Apply Profile to Cameras")
+        dlg.setWindowTitle("Apply Camera Profile")
         dlg.setMinimumWidth(400)
         v = QVBoxLayout(dlg)
 
@@ -6676,37 +6936,40 @@ class KnoxnetDesktopApp(QApplication):
             prof_combo.addItem(p.name, p.id)
         v.addWidget(prof_combo)
 
-        v.addWidget(QLabel("Select cameras:"))
+        if target_widget is not None:
+            v.addWidget(QLabel(f"Target camera: {target_widget.windowTitle() or target_widget.camera_id}"))
+            cam_ids = [str(getattr(target_widget, "camera_id", ""))]
+            lst = None
+        else:
+            v.addWidget(QLabel("Select cameras:"))
+            btn_row = QHBoxLayout()
+            select_all_btn = QPushButton("Select All")
+            deselect_all_btn = QPushButton("Deselect All")
+            btn_row.addWidget(select_all_btn)
+            btn_row.addWidget(deselect_all_btn)
+            btn_row.addStretch()
+            v.addLayout(btn_row)
 
-        # Select All / Deselect All buttons
-        btn_row = QHBoxLayout()
-        select_all_btn = QPushButton("Select All")
-        deselect_all_btn = QPushButton("Deselect All")
-        btn_row.addWidget(select_all_btn)
-        btn_row.addWidget(deselect_all_btn)
-        btn_row.addStretch()
-        v.addLayout(btn_row)
+            lst = QListWidget()
+            lst.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+            cams = getattr(self.camera_manager, "cameras", {}) if self.camera_manager else {}
+            for cam_id, cfg in (cams or {}).items():
+                label = getattr(cfg, "name", None) or str(cam_id)
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, cam_id)
+                lst.addItem(item)
+            v.addWidget(lst)
 
-        lst = QListWidget()
-        lst.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        cams = getattr(self.camera_manager, "cameras", {}) if self.camera_manager else {}
-        for cam_id, cfg in (cams or {}).items():
-            label = getattr(cfg, "name", None) or str(cam_id)
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, cam_id)
-            lst.addItem(item)
-        v.addWidget(lst)
+            def _select_all():
+                for i in range(lst.count()):
+                    lst.item(i).setSelected(True)
 
-        def _select_all():
-            for i in range(lst.count()):
-                lst.item(i).setSelected(True)
+            def _deselect_all():
+                for i in range(lst.count()):
+                    lst.item(i).setSelected(False)
 
-        def _deselect_all():
-            for i in range(lst.count()):
-                lst.item(i).setSelected(False)
-
-        select_all_btn.clicked.connect(_select_all)
-        deselect_all_btn.clicked.connect(_deselect_all)
+            select_all_btn.clicked.connect(_select_all)
+            deselect_all_btn.clicked.connect(_deselect_all)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         v.addWidget(buttons)
@@ -6717,24 +6980,34 @@ class KnoxnetDesktopApp(QApplication):
             return
 
         profile_id = str(prof_combo.currentData() or "").strip()
-        cam_ids = [i.data(Qt.ItemDataRole.UserRole) for i in lst.selectedItems()]
-        cam_ids = [str(x) for x in cam_ids if x]
+        if target_widget is not None:
+            cam_ids = [str(getattr(target_widget, "camera_id", ""))]
+        else:
+            cam_ids = [i.data(Qt.ItemDataRole.UserRole) for i in lst.selectedItems()]
+            cam_ids = [str(x) for x in cam_ids if x]
         if not profile_id or not cam_ids:
             return
+
+        prof = self.layouts_store.get_profile(profile_id)
+        if not prof:
+            QMessageBox.warning(None, "Apply Profile", "Profile not found.")
+            return
+
         try:
             self.layouts_store.bulk_apply_profile(profile_id, cam_ids, mode="replace")
-            self.tray_icon.showMessage(
-                "Knoxnet VMS Beta",
-                f"Applied profile to {len(cam_ids)} camera(s)",
-                QSystemTrayIcon.MessageIcon.Information,
-            )
+            prof_dict = prof.to_dict()
+            applied_widgets = 0
             for w in list(self.active_widgets):
                 try:
-                    from desktop.widgets.camera import CameraWidget
                     if w.isVisible() and isinstance(w, CameraWidget) and str(w.camera_id) in cam_ids:
-                        self._apply_assigned_profile_overlays(str(w.camera_id), w)
+                        self._apply_camera_profile_payload(w, prof_dict, sync_server=True)
+                        applied_widgets += 1
                 except Exception:
                     continue
+            msg = f"Applied profile to {len(cam_ids)} camera(s)"
+            if applied_widgets:
+                msg += f" ({applied_widgets} open widget(s) updated)"
+            self.tray_icon.showMessage("Knoxnet VMS Beta", msg, QSystemTrayIcon.MessageIcon.Information)
         except Exception as e:
             logger.error(f"Failed to apply profile: {e}")
             QMessageBox.warning(None, "Apply Profile", f"Failed to apply profile: {e}")
@@ -6764,13 +7037,13 @@ class KnoxnetDesktopApp(QApplication):
             QMessageBox.information(None, "Global Overlay", "No active camera widgets found.")
             return
 
-        STYLES = ["Box", "Fill", "Corners", "Circle", "Bracket", "Underline", "Crosshair"]
-        ANIMATIONS = ["None", "Pulse", "Flash", "Glitch", "Rainbow"]
+        DETECTION_STYLES = ["Box", "Fill", "Corners", "Circle", "Bracket", "Underline", "Crosshair"]
         DETECTION_ANIMATIONS = ["None", "Pulse", "Flash", "Glitch", "Rainbow", "Glow"]
 
         dlg = QDialog()
         dlg.setWindowTitle("Global Overlay Settings")
-        dlg.setMinimumWidth(440)
+        dlg.setMinimumWidth(420)
+        dlg.setMinimumHeight(640)
         root = QVBoxLayout(dlg)
 
         tabs = QTabWidget()
@@ -6778,6 +7051,7 @@ class KnoxnetDesktopApp(QApplication):
 
         # Track user-chosen colours (mutable in closures)
         motion_color_holder = [QColor(255, 0, 0)]
+        trail_color_holder = [QColor(255, 200, 0)]
         detection_color_holder = [QColor(0, 255, 255)]
 
         # Grab defaults from first visible camera
@@ -6790,23 +7064,34 @@ class KnoxnetDesktopApp(QApplication):
                 ds0 = dict(getattr(gl0, "detection_settings", {}) or {})
                 if isinstance(ms0.get("color"), QColor):
                     motion_color_holder[0] = QColor(ms0["color"])
+                tc0 = ms0.get("trail_color")
+                if isinstance(tc0, QColor) and tc0.isValid():
+                    trail_color_holder[0] = QColor(tc0)
                 if isinstance(ds0.get("color"), QColor):
                     detection_color_holder[0] = QColor(ds0["color"])
 
         # ---- Motion tab ----
         motion_tab = QWidget()
-        mf = QFormLayout(motion_tab)
+        mv = QVBoxLayout(motion_tab)
+        mv.setSpacing(6)
 
         motion_apply_cb = QCheckBox("Apply motion overlay changes")
         motion_apply_cb.setChecked(True)
-        mf.addRow(motion_apply_cb)
+        mv.addWidget(motion_apply_cb)
 
-        m_style = QComboBox()
-        m_style.addItems(STYLES)
-        cur_style = ms0.get("style", "Box")
-        if cur_style in STYLES:
-            m_style.setCurrentText(cur_style)
-        mf.addRow("Style:", m_style)
+        cur_m_style = normalize_motion_style(str(ms0.get("style", "Box")))
+        cur_m_anim = normalize_motion_animation(str(ms0.get("animation", "None")))
+
+        mv.addWidget(QLabel("Style"))
+        m_style_picker = motion_style_picker(cur_m_style, motion_tab)
+        mv.addWidget(m_style_picker)
+
+        mv.addWidget(QLabel("Animation"))
+        m_anim_picker = motion_animation_picker(cur_m_anim, motion_tab)
+        mv.addWidget(m_anim_picker)
+
+        mf = QFormLayout()
+        mf.setContentsMargins(0, 0, 0, 0)
 
         m_color_btn = QPushButton()
         m_color_btn.setStyleSheet(f"background-color: {motion_color_holder[0].name()};")
@@ -6826,18 +7111,76 @@ class KnoxnetDesktopApp(QApplication):
         m_thickness.setValue(int(ms0.get("thickness", 2)))
         mf.addRow("Thickness:", m_thickness)
 
-        m_anim = QComboBox()
-        m_anim.addItems(ANIMATIONS)
-        cur_anim = ms0.get("animation", "None")
-        if cur_anim in ANIMATIONS:
-            m_anim.setCurrentText(cur_anim)
-        mf.addRow("Animation:", m_anim)
-
-        m_trails = QCheckBox("Show trails")
+        m_trails = QCheckBox("Show motion trails")
         m_trails.setChecked(bool(ms0.get("trails", False)))
         mf.addRow(m_trails)
 
-        m_color_speed = QCheckBox("Color by speed")
+        m_trail_len_label = QLabel(f"Trail length: {int(ms0.get('trail_length', 20))} pts")
+        m_trail_len = QSlider(Qt.Orientation.Horizontal)
+        m_trail_len.setRange(5, 60)
+        m_trail_len.setValue(int(ms0.get("trail_length", 20)))
+        m_trail_len.valueChanged.connect(
+            lambda v: m_trail_len_label.setText(f"Trail length: {v} pts")
+        )
+        mf.addRow(m_trail_len_label, m_trail_len)
+
+        m_trail_width = QSpinBox()
+        m_trail_width.setRange(1, 8)
+        m_trail_width.setValue(int(ms0.get("trail_width", 2)))
+        mf.addRow("Trail width:", m_trail_width)
+
+        m_trail_style = QComboBox()
+        m_trail_style.addItems(TRAIL_STYLES)
+        cur_trail_style = str(ms0.get("trail_style", "Solid"))
+        if cur_trail_style in TRAIL_STYLES:
+            m_trail_style.setCurrentText(cur_trail_style)
+        mf.addRow("Trail style:", m_trail_style)
+
+        m_trail_color_mode = QComboBox()
+        m_trail_color_mode.addItems(TRAIL_COLOR_MODES)
+        cur_trail_mode = str(ms0.get("trail_color_mode", "Match Box"))
+        if cur_trail_mode in TRAIL_COLOR_MODES:
+            m_trail_color_mode.setCurrentText(cur_trail_mode)
+        mf.addRow("Trail color:", m_trail_color_mode)
+
+        m_trail_color_btn = QPushButton()
+        m_trail_color_btn.setStyleSheet(f"background-color: {trail_color_holder[0].name()};")
+        m_trail_color_btn.setFixedHeight(28)
+
+        def pick_trail_color():
+            c = QColorDialog.getColor(trail_color_holder[0], dlg, "Trail Color")
+            if c.isValid():
+                trail_color_holder[0] = c
+                m_trail_color_btn.setStyleSheet(f"background-color: {c.name()};")
+
+        m_trail_color_btn.clicked.connect(pick_trail_color)
+        mf.addRow("Trail custom:", m_trail_color_btn)
+
+        def _sync_trail_color_btn():
+            m_trail_color_btn.setEnabled(
+                m_trails.isChecked() and m_trail_color_mode.currentText() == "Custom"
+            )
+
+        m_trails.toggled.connect(lambda _=None: _sync_trail_color_btn())
+        m_trail_color_mode.currentTextChanged.connect(lambda _=None: _sync_trail_color_btn())
+        _sync_trail_color_btn()
+
+        m_trail_opacity_label = QLabel(
+            f"Trail opacity: {int(round(int(ms0.get('trail_opacity', 180)) / 255 * 100))}%"
+        )
+        m_trail_opacity = QSlider(Qt.Orientation.Horizontal)
+        m_trail_opacity.setRange(20, 255)
+        m_trail_opacity.setValue(int(ms0.get("trail_opacity", 180)))
+        m_trail_opacity.valueChanged.connect(
+            lambda v: m_trail_opacity_label.setText(f"Trail opacity: {int(round(v / 255 * 100))}%")
+        )
+        mf.addRow(m_trail_opacity_label, m_trail_opacity)
+
+        m_trail_fade = QCheckBox("Fade older trail segments")
+        m_trail_fade.setChecked(bool(ms0.get("trail_fade", True)))
+        mf.addRow(m_trail_fade)
+
+        m_color_speed = QCheckBox("Color box by speed")
         m_color_speed.setChecked(bool(ms0.get("color_speed", False)))
         mf.addRow(m_color_speed)
 
@@ -6856,6 +7199,7 @@ class KnoxnetDesktopApp(QApplication):
         m_merge.setSuffix(" px")
         mf.addRow("Merge size:", m_merge)
 
+        mv.addLayout(mf)
         tabs.addTab(motion_tab, "Motion Overlay")
 
         # ---- Detection tab ----
@@ -6867,9 +7211,9 @@ class KnoxnetDesktopApp(QApplication):
         df.addRow(det_apply_cb)
 
         d_style = QComboBox()
-        d_style.addItems(STYLES)
+        d_style.addItems(DETECTION_STYLES)
         cur_ds = ds0.get("style", "Box")
-        if cur_ds in STYLES:
+        if cur_ds in DETECTION_STYLES:
             d_style.setCurrentText(cur_ds)
         df.addRow("Style:", d_style)
 
@@ -6925,11 +7269,18 @@ class KnoxnetDesktopApp(QApplication):
 
                     if motion_apply_cb.isChecked():
                         ms = getattr(gl, "motion_settings", {})
-                        ms["style"] = m_style.currentText()
+                        ms["style"] = normalize_motion_style(m_style_picker.value())
+                        ms["animation"] = normalize_motion_animation(m_anim_picker.value())
                         ms["color"] = QColor(motion_color_holder[0])
                         ms["thickness"] = m_thickness.value()
-                        ms["animation"] = m_anim.currentText()
                         ms["trails"] = m_trails.isChecked()
+                        ms["trail_length"] = m_trail_len.value()
+                        ms["trail_width"] = m_trail_width.value()
+                        ms["trail_style"] = m_trail_style.currentText()
+                        ms["trail_color_mode"] = m_trail_color_mode.currentText()
+                        ms["trail_color"] = QColor(trail_color_holder[0])
+                        ms["trail_opacity"] = m_trail_opacity.value()
+                        ms["trail_fade"] = m_trail_fade.isChecked()
                         ms["color_speed"] = m_color_speed.isChecked()
                         ms["sensitivity"] = m_sens.value()
                         ms["merge_size"] = m_merge.value()

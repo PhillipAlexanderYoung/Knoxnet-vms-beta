@@ -3402,6 +3402,7 @@ class TerminalWidget(BaseDesktopWidget):
         stopped: bool = False,
         camera_label: Optional[str] = None,
         suppress_log: bool = False,
+        kind: Optional[str] = None,
     ):
         """
         Send motion watch updates (countdown ticks, captures) to all terminal widgets.
@@ -3410,7 +3411,7 @@ class TerminalWidget(BaseDesktopWidget):
         label = camera_label or camera_id
         payload = {
             "text": text,
-            "kind": "info" if countdown is not None else "success",
+            "kind": kind or ("info" if countdown is not None else "success"),
             "image_b64": image_b64,
             "link": link,
             "link_label": link_label,
@@ -3423,7 +3424,7 @@ class TerminalWidget(BaseDesktopWidget):
         }
         # Only send countdown text if provided
         if countdown is not None:
-            payload["text"] = f"[Motion Watch] {label}: {countdown}s remaining — {text}"
+            payload["text"] = f"[Event Rules] {label}: {countdown}s remaining — {text}"
         for inst in list(cls._instances):
             try:
                 if not suppress_log:

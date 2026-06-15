@@ -386,30 +386,17 @@ def events_ingest():
         data = request.get_json() or {}
         result = event_index_service.ingest(data)
 
-        # Emit real-time event for live security report consumers
+        # Emit real-time event for live security report + desktop terminal consumers
         try:
             sio = current_app.extensions.get("socketio")
             if sio is not None:
-                file_p = str(result.get("file_path") or "")
-                thumb_p = str(result.get("thumb_path") or "")
-                def _file_uri_local(p: str) -> str:
-                    if not p:
-                        return ""
-                    from pathlib import Path as _P
-                    return _P(p).as_uri() if _P(p).is_absolute() else f"file:///{_P(p).as_posix()}"
-                sio.emit('new_capture', {
-                    'event_id': str(result.get("event_id") or ""),
-                    'captured_ts': int(result.get("captured_ts") or 0),
-                    'camera_name': str(result.get("camera_name") or ""),
-                    'caption': str(result.get("caption") or ""),
-                    'file_uri': _file_uri_local(file_p),
-                    'thumb_uri': _file_uri_local(thumb_p) if thumb_p else _file_uri_local(file_p),
-                    'shape_name': str(result.get("shape_name") or ""),
-                    'trigger_type': str(result.get("trigger_type") or ""),
-                    'media_type': str(result.get("media_type") or "image"),
-                    'tags': [str(t) for t in (result.get("tags") or [])],
-                    'detection_classes': [str(c) for c in (result.get("detection_classes") or [])],
-                }, namespace='/realtime')
+                from core.capture_events import emit_new_capture
+
+                emit_new_capture(
+                    sio,
+                    result,
+                    camera_id=str(data.get("camera_id") or result.get("camera_id") or ""),
+                )
         except Exception:
             pass
 

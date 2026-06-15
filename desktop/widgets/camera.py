@@ -2,6 +2,7 @@ import asyncio
 import cv2
 import json
 import base64
+import math
 import numpy as np
 import threading
 import random
@@ -13,7 +14,7 @@ from collections import deque
 from pathlib import Path
 import re as _re
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from PySide6.QtGui import QImage, QPainter, QColor, QAction, QPen, QPolygonF, QFont
 from PySide6.QtWidgets import (QVBoxLayout, QLabel, QDialog, QFormLayout, QComboBox, QPushButton, 
@@ -41,12 +42,65 @@ from desktop.widgets.ptz_overlay import (
     load_ptz_overlay_settings,
     save_ptz_overlay_settings,
 )
+from desktop.widgets.event_rules_editor import EventRulesEditorDialog
+from desktop.widgets.shape_trigger_dialog import (
+    ShapeTriggerDialog,
+    draw_motion_path,
+    draw_rule_ghost_overlay,
+    _draw_counter_pill,
+)
+from desktop.widgets.shape_trigger_preview import (
+    build_counter_pill_render_items,
+    counter_pill_bbox_from_frame,
+    counter_pill_configs_from_rules,
+    counter_pill_frame_coords,
+    normalize_counter_mode,
+    parse_counter_pill_anchor,
+    preview_animation_params,
+    prune_trigger_counts,
+    resolve_counter_pill_label,
+    rule_to_hover_ghost_entry,
+    rules_for_shape,
+    shape_trigger_dialog_key,
+)
+from core.automation.conditions import local_motion_matches_counter_rule
+from desktop.utils.rule_trigger_side_effects import RuleTriggerSideEffects
+from desktop.utils.event_rules_api import (
+    DEFAULT_MOTION_MERGE_SIZE,
+    DEFAULT_MOTION_SENSITIVITY,
+    DEFAULT_RULE_COOLDOWN_MS,
+    DEFAULT_RULE_COOLDOWN_SEC,
+    cooldown_ms_from_sec,
+    ensure_backend_detection_for_rules,
+    filter_desktop_capture_events,
+    list_rules,
+    migrate_motion_watch_settings,
+    set_rules_enabled,
+    sync_camera_shapes,
+)
 from desktop.widgets.audio_eq import (
     AudioEQOverlayWidget,
     AudioEQSettings,
     AudioPlayback,
     AudioWHEPReceiver,
     AudioEQWindow,
+)
+from desktop.widgets.motion_style_picker import (
+    motion_animation_picker,
+    motion_style_picker,
+)
+from desktop.utils.motion_overlay_styles import (
+    MOTION_STYLE_QUICK_PICK,
+    TRAIL_COLOR_MODES,
+    TRAIL_STYLES,
+    all_motion_animations,
+    apply_motion_animation,
+    draw_motion_box_style,
+    draw_motion_trail,
+    motion_trail_history_limit,
+    normalize_motion_animation,
+    normalize_motion_style,
+    normalize_motion_trail_settings,
 )
 
 # Shared geometry helpers and color palettes (mirrors React camera widget)
@@ -324,6 +378,8 @@ class CameraOpenGLWidget(QWidget):
     shapes_changed = Signal(list)
     shape_triggered = Signal(dict)
     shape_double_clicked = Signal(str)
+    shape_added = Signal(str)
+    hover_shape_changed = Signal(object)
 
     def __init__(self, parent=None, camera_id: Optional[str] = None):
         super().__init__(parent)
@@ -376,8 +432,12 @@ class CameraOpenGLWidget(QWidget):
         self.depth_overlay_is_pointcloud: bool = False
         self._debug_extra_lines: List[str] = []
         self.prev_gray = None
-        self.motion_boxes = [] # List of (x, y, w, h) relative to source frame
-        self.tracked_objects = {} # { id: {box, history, speed, missing} }
+        self.motion_boxes = []  # Confirmed boxes for overlay fallback (see raw_motion_boxes)
+        self.raw_motion_boxes: List[Tuple[int, int, int, int]] = []  # Immediate, pre-persistence
+        self.tracked_objects = {}  # { id: {box, history, speed, missing} } — confirmed only
+        self._motion_persist_candidates: Dict[int, dict] = {}
+        self._motion_persist_next_id: int = 0
+        self._motion_global_illumination: bool = False
         # Object detections (two independent sources):
         # - backend_detections: Socket.IO (/realtime) detections from backend/React pipeline
         # - desktop_detections: Desktop-local YOLO worker detections
@@ -407,9 +467,16 @@ class CameraOpenGLWidget(QWidget):
             'thickness': 2,
             'animation': 'None', # None, Pulse, Flash, Glitch, Rainbow
             'trails': False,
+            'trail_length': 20,
+            'trail_width': 2,
+            'trail_style': 'Solid',
+            'trail_color_mode': 'Match Box',
+            'trail_color': None,
+            'trail_opacity': 180,
+            'trail_fade': True,
             'color_speed': False,
-            'sensitivity': 50,
-            'merge_size': 0
+            'sensitivity': DEFAULT_MOTION_SENSITIVITY,
+            'merge_size': DEFAULT_MOTION_MERGE_SIZE
         }
 
         # Object detection overlay style settings (separate from motion settings)
@@ -463,6 +530,24 @@ class CameraOpenGLWidget(QWidget):
         self.zone_pulses: Dict[str, float] = {}
         self.line_pulses: Dict[str, Dict[str, float]] = {}
         self.tag_pulses: Dict[str, float] = {}
+        self.trigger_preview: Optional[Dict[str, object]] = None
+        self.path_draw_mode: bool = False
+        self.pill_anchor_move_mode: bool = False
+        self._path_draw_points: List[Dict[str, float]] = []
+        self._path_draw_active: bool = False
+        self._path_draw_pill_drag: bool = False
+        self._path_draw_callback: Optional[Callable[[List[Dict[str, float]]], None]] = None
+        self._path_draw_pill_callback: Optional[Callable[[Dict[str, float]], None]] = None
+        self._pill_move_pill_callback: Optional[Callable[[Dict[str, float]], None]] = None
+        self._path_draw_min_dist: float = 0.012
+        self.hover_rule_ghost: Optional[List[Dict[str, object]]] = None
+        self._hover_ghost_phase: float = 0.0
+        self._event_rules_cache: List[Dict[str, object]] = []
+        self._event_rules_cache_ts: float = 0.0
+        self.rule_trigger_counts: Dict[str, int] = {}
+        self._rule_counter_last_emit: Dict[str, float] = {}
+        self.counter_pill_configs: List[Dict[str, object]] = []
+        self.rule_counter_pulses: Dict[str, float] = {}
         self.cursor_norm: Optional[Pt] = None
         self.hover_shape: Optional[str] = None
         self.motion_hit_pulses: List[Dict[str, object]] = []  # recent motion hit boxes for visual feedback
@@ -479,6 +564,8 @@ class CameraOpenGLWidget(QWidget):
         # FPS Counter
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_fps)
+        self._trigger_preview_timer = QTimer(self)
+        self._trigger_preview_timer.timeout.connect(self._tick_trigger_preview)
         self.timer.start(1000)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -492,8 +579,12 @@ class CameraOpenGLWidget(QWidget):
         self.show_motion = motion
         if not motion:
             self.motion_boxes = []
+            self.raw_motion_boxes = []
             self.tracked_objects = {}
             self.prev_gray = None
+            self._motion_persist_candidates = {}
+            self._motion_persist_next_id = 0
+            self._motion_global_illumination = False
         self.update()
 
     def set_depth_overlay(
@@ -588,6 +679,392 @@ class CameraOpenGLWidget(QWidget):
 
     def _emit_shapes(self):
         self.shapes_changed.emit(self.shapes)
+
+    def set_trigger_preview(self, state: Optional[Dict[str, object]]) -> None:
+        """Show animated event-rule preview on a shape while trigger dialog is open."""
+        self.trigger_preview = state
+        if state:
+            self.hover_rule_ghost = None
+            if not self._trigger_preview_timer.isActive():
+                self._trigger_preview_timer.start(50)
+            if state.get("path_draw_active"):
+                self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            if self.path_draw_mode:
+                self.stop_path_draw_mode()
+            if self.pill_anchor_move_mode:
+                self.stop_pill_anchor_move_mode()
+            if self.hover_shape:
+                self._refresh_hover_rule_ghost()
+            elif not self.hover_rule_ghost:
+                self._trigger_preview_timer.stop()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def start_path_draw_mode(
+        self,
+        *,
+        on_path_changed: Callable[[List[Dict[str, float]]], None],
+        on_pill_anchor_changed: Optional[Callable[[Dict[str, float]], None]] = None,
+        initial_path: Optional[List[Dict[str, float]]] = None,
+    ) -> None:
+        """Enable drawing a frame-normalized motion path on the live camera image."""
+        self.path_draw_mode = True
+        self._path_draw_callback = on_path_changed
+        self._path_draw_pill_callback = on_pill_anchor_changed
+        self._path_draw_points = [
+            {"x": float(p["x"]), "y": float(p["y"])} for p in (initial_path or [])
+        ]
+        self._path_draw_active = False
+        self._path_draw_pill_drag = False
+        self.drag_meta = None
+        self.view_pan_drag = None
+        parent = self.parent()
+        while parent is not None:
+            reset_drag = getattr(parent, "_reset_child_drag", None)
+            if callable(reset_drag):
+                reset_drag()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def stop_path_draw_mode(self) -> None:
+        """Disable camera path drawing."""
+        self.path_draw_mode = False
+        self._path_draw_active = False
+        self._path_draw_pill_drag = False
+        self._path_draw_callback = None
+        self._path_draw_pill_callback = None
+        if not self.trigger_preview and not self.pill_anchor_move_mode:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def start_pill_anchor_move_mode(
+        self,
+        *,
+        on_pill_anchor_changed: Callable[[Dict[str, float]], None],
+    ) -> None:
+        """Enable dragging the counter pill on the live camera overlay."""
+        self.pill_anchor_move_mode = True
+        self._pill_move_pill_callback = on_pill_anchor_changed
+        self._path_draw_pill_drag = False
+        self.drag_meta = None
+        self.view_pan_drag = None
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.update()
+
+    def stop_pill_anchor_move_mode(self) -> None:
+        """Disable counter pill repositioning on the camera overlay."""
+        self.pill_anchor_move_mode = False
+        self._pill_move_pill_callback = None
+        self._path_draw_pill_drag = False
+        if not self.path_draw_mode and not self.trigger_preview:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        elif self.path_draw_mode:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def _append_path_draw_point(self, nx: float, ny: float) -> None:
+        if self._path_draw_points:
+            lx = self._path_draw_points[-1]["x"]
+            ly = self._path_draw_points[-1]["y"]
+            if math.hypot(nx - lx, ny - ly) < self._path_draw_min_dist:
+                return
+        self._path_draw_points.append({"x": nx, "y": ny})
+
+    def _emit_path_draw_changed(self) -> None:
+        if self._path_draw_callback:
+            path = [{"x": p["x"], "y": p["y"]} for p in self._path_draw_points]
+            self._path_draw_callback(path)
+
+    def _hit_test_preview_pill(self, pos: QPointF) -> bool:
+        tp = self.trigger_preview
+        if not tp:
+            return False
+        if (
+            not self.pill_anchor_move_mode
+            and normalize_counter_mode(tp.get("show_counter")) == "off"
+        ):
+            return False
+        if not self.last_draw_rect or self.frame_dims[0] <= 0:
+            return False
+        sid = str(tp.get("shape_id") or "")
+        target = next((s for s in self.shapes if s.get("id") == sid), None)
+        if not target:
+            return False
+        x_off, y_off, view_w, view_h = self.last_draw_rect
+        anchor_bbox = parse_counter_pill_anchor(tp.get("counter_pill_anchor"))
+        pill = self._shape_counter_anchor(
+            target, x_off, y_off, view_w, view_h, anchor_bbox=anchor_bbox
+        )
+        if not pill:
+            return False
+        pos = self._unmap_view_point(pos)
+        return math.hypot(pos.x() - pill[0], pos.y() - (pill[1] - 14)) <= 18.0
+
+    def _set_preview_pill_from_widget(self, pos: QPointF) -> None:
+        tp = self.trigger_preview
+        if not tp:
+            return
+        sid = str(tp.get("shape_id") or "")
+        target = next((s for s in self.shapes if s.get("id") == sid), None)
+        if not target or not self.last_draw_rect:
+            return
+        pos = self._unmap_view_point(pos)
+        x_off, y_off, view_w, view_h = self.last_draw_rect
+        nx = clamp01((pos.x() - x_off) / max(1.0, view_w))
+        ny = clamp01((pos.y() - y_off + 14.0) / max(1.0, view_h))
+        anchor = counter_pill_bbox_from_frame(target, nx, ny)
+        tp["counter_pill_anchor"] = anchor
+        callback = self._pill_move_pill_callback or self._path_draw_pill_callback
+        if callback:
+            callback(dict(anchor))
+        self.update()
+
+    def set_event_rules_cache(
+        self,
+        rules: Optional[List[Dict[str, object]]],
+        *,
+        cache_ts: Optional[float] = None,
+    ) -> None:
+        """Update cached event rules used for hover ghost previews."""
+        self._event_rules_cache = list(rules or [])
+        self._event_rules_cache_ts = float(cache_ts if cache_ts is not None else time.time())
+        if self.hover_shape and not self.trigger_preview:
+            self._refresh_hover_rule_ghost()
+
+    def _refresh_hover_rule_ghost(self) -> None:
+        if self.trigger_preview:
+            self.hover_rule_ghost = None
+            return
+        sid = str(self.hover_shape or "").strip()
+        if not sid:
+            self.hover_rule_ghost = None
+            if not self.trigger_preview:
+                self._trigger_preview_timer.stop()
+            return
+        ghost_shape = next(
+            (s for s in self.shapes if str(s.get("id") or "") == sid),
+            None,
+        )
+        entries: List[Dict[str, object]] = []
+        for idx, rule in enumerate(rules_for_shape(self._event_rules_cache, sid)):
+            if not rule.get("enabled", True):
+                continue
+            entry = rule_to_hover_ghost_entry(rule, color_index=idx, shape=ghost_shape)
+            if entry:
+                entries.append(entry)
+        self.hover_rule_ghost = entries or None
+        if self.hover_rule_ghost:
+            if not self._trigger_preview_timer.isActive():
+                self._trigger_preview_timer.start(50)
+        elif not self.trigger_preview:
+            self._trigger_preview_timer.stop()
+        self.update()
+
+    def _update_hover_shape(self, shape_id: Optional[str]) -> None:
+        sid = str(shape_id or "").strip() or None
+        if sid == self.hover_shape:
+            return
+        self.hover_shape = sid
+        self._refresh_hover_rule_ghost()
+        self.hover_shape_changed.emit(sid)
+        self.update()
+
+    def _tick_trigger_preview(self) -> None:
+        if self.trigger_preview:
+            dwell = float(self.trigger_preview.get("dwell_min") or 0.0)
+            cooldown = float(self.trigger_preview.get("cooldown_sec") or DEFAULT_RULE_COOLDOWN_SEC)
+            phase_inc, _ = preview_animation_params(dwell, cooldown)
+            phase = float(self.trigger_preview.get("phase", 0.0)) + phase_inc
+            self.trigger_preview["phase"] = phase % 1.0
+            self.update()
+            return
+        if self.hover_rule_ghost:
+            phase_inc, _ = preview_animation_params(0.0, 3.0)
+            self._hover_ghost_phase = (self._hover_ghost_phase + phase_inc) % 1.0
+            self.update()
+            return
+        self._trigger_preview_timer.stop()
+
+    def refresh_shape_counter_config(self, rules: Optional[List[Dict[str, object]]] = None) -> None:
+        """Load per-rule counter pill settings from event rules."""
+        shapes_map = {
+            str(s.get("id") or ""): dict(s)
+            for s in (self.shapes or [])
+            if isinstance(s, dict) and str(s.get("id") or "").strip()
+        }
+        configs = counter_pill_configs_from_rules(list(rules or []), shapes=shapes_map)
+        self.counter_pill_configs = configs
+        active_rule_ids = [str(cfg.get("rule_id") or "") for cfg in configs]
+        self.rule_trigger_counts = prune_trigger_counts(self.rule_trigger_counts, active_rule_ids)
+        self._rule_counter_last_emit = {
+            rid: ts
+            for rid, ts in self._rule_counter_last_emit.items()
+            if rid in set(active_rule_ids)
+        }
+        self.rule_counter_pulses = {
+            rid: ts
+            for rid, ts in self.rule_counter_pulses.items()
+            if rid in set(active_rule_ids)
+        }
+        self.update()
+
+    def _counter_cooldown_for_rule(self, rule_id: str) -> float:
+        rid = str(rule_id or "").strip()
+        for cfg in self.counter_pill_configs:
+            if str(cfg.get("rule_id") or "") == rid:
+                try:
+                    return max(0.0, float(cfg.get("cooldown_sec", DEFAULT_RULE_COOLDOWN_SEC) or DEFAULT_RULE_COOLDOWN_SEC))
+                except Exception:
+                    break
+        return 3.0
+
+    def notify_shape_rule_triggered(
+        self,
+        shape_id: str,
+        rule_id: Optional[str] = None,
+    ) -> bool:
+        """Increment matching rule counter pill(s).
+
+        Returns ``True`` when at least one counter actually advanced (i.e. it was
+        not suppressed by per-rule cooldown).  The desktop trigger pipeline relies
+        on this return value to keep screenshot side-effects coupled to (and
+        de-duplicated with) the counter.
+        """
+        sid = str(shape_id or "").strip()
+        if not sid:
+            return False
+        rid = str(rule_id or "").strip()
+        if rid:
+            if not any(str(cfg.get("rule_id") or "") == rid for cfg in self.counter_pill_configs):
+                return False
+            now = time.time()
+            cooldown = self._counter_cooldown_for_rule(rid)
+            last = float(self._rule_counter_last_emit.get(rid, 0.0) or 0.0)
+            if cooldown > 0 and (now - last) < cooldown:
+                return False
+            self._rule_counter_last_emit[rid] = now
+            self.rule_trigger_counts[rid] = int(self.rule_trigger_counts.get(rid, 0)) + 1
+            self.rule_counter_pulses[rid] = now
+            self.update()
+            return True
+        # Without a rule id, increment each matching rule independently (debounced per rule).
+        now = time.time()
+        changed = False
+        for cfg in self.counter_pill_configs:
+            if str(cfg.get("shape_id") or "") != sid:
+                continue
+            cfg_rid = str(cfg.get("rule_id") or "")
+            if not cfg_rid:
+                continue
+            cooldown = self._counter_cooldown_for_rule(cfg_rid)
+            last = float(self._rule_counter_last_emit.get(cfg_rid, 0.0) or 0.0)
+            if cooldown > 0 and (now - last) < cooldown:
+                continue
+            self._rule_counter_last_emit[cfg_rid] = now
+            self.rule_trigger_counts[cfg_rid] = int(self.rule_trigger_counts.get(cfg_rid, 0)) + 1
+            self.rule_counter_pulses[cfg_rid] = now
+            changed = True
+        if changed:
+            self.update()
+        return changed
+
+    def _shape_counter_anchor(
+        self,
+        sh: Shape,
+        x_offset: float,
+        y_offset: float,
+        view_w: float,
+        view_h: float,
+        *,
+        sid: Optional[str] = None,
+        anchor_bbox: Optional[Dict[str, float]] = None,
+    ) -> Optional[Tuple[float, float]]:
+        if anchor_bbox is None and sid:
+            for cfg in self.counter_pill_configs:
+                if str(cfg.get("shape_id") or "") == str(sid):
+                    anchor_bbox = cfg.get("anchor")
+                    break
+        fx, fy = counter_pill_frame_coords(sh, parse_counter_pill_anchor(anchor_bbox))
+        return x_offset + fx * view_w, y_offset + fy * view_h
+
+    def _counter_pill_configs_for_shape(self, sid: str) -> List[Dict[str, object]]:
+        return [
+            cfg for cfg in self.counter_pill_configs
+            if str(cfg.get("shape_id") or "") == str(sid)
+        ]
+
+    def _count_objects_in_shape(self, sh: Shape) -> int:
+        """Count tracked object centroids currently inside a zone shape."""
+        kind = str(sh.get("kind") or "").lower()
+        if kind != "zone" or self.frame_dims[0] <= 0:
+            return 0
+        pts = sh.get("pts") or []
+        if len(pts) < 3:
+            return 0
+        src_w, src_h = self.frame_dims
+        count = 0
+        for obj in (self.tracked_objects or {}).values():
+            box = obj.get("box")
+            if not box or len(box) < 4:
+                continue
+            bx, by, bw, bh = box[:4]
+            cx = clamp01((float(bx) + float(bw) / 2.0) / src_w)
+            cy = clamp01((float(by) + float(bh) / 2.0) / src_h)
+            if point_in_polygon({"x": cx, "y": cy}, pts):
+                count += 1
+        return count
+
+    def _paint_shape_counter_pill(
+        self,
+        painter: QPainter,
+        sh: Shape,
+        sid: str,
+        x_offset: float,
+        y_offset: float,
+        view_w: float,
+        view_h: float,
+        now: float,
+    ) -> None:
+        configs = self._counter_pill_configs_for_shape(sid)
+        if not configs:
+            return
+        stale_pulses = [
+            rid for rid, ts in self.rule_counter_pulses.items()
+            if (now - float(ts)) > 2.5
+        ]
+        for rid in stale_pulses:
+            self.rule_counter_pulses.pop(rid, None)
+        items = build_counter_pill_render_items(
+            configs,
+            self.rule_trigger_counts,
+            shape=sh,
+            now=now,
+            pulse_ts_by_rule=self.rule_counter_pulses,
+        )
+        for item in items:
+            anchor = self._shape_counter_anchor(
+                sh,
+                x_offset,
+                y_offset,
+                view_w,
+                view_h,
+                anchor_bbox=item.get("anchor"),
+            )
+            if not anchor:
+                continue
+            _draw_counter_pill(
+                painter,
+                anchor[0],
+                anchor[1] - 14,
+                int(item.get("count") or 0),
+                highlight=bool(item.get("highlight")),
+                label=str(item.get("label") or ""),
+                bg_color=str(item.get("bg_color") or ""),
+                text_color=str(item.get("text_color") or ""),
+            )
 
     def _coerce_shape(self, shape: Shape) -> Shape:
         """Ensure shape dict has expected keys and clamped coordinates."""
@@ -792,6 +1269,7 @@ class CameraOpenGLWidget(QWidget):
         self.shapes.append(nz)
         self._emit_shapes()
         self.update()
+        self.shape_added.emit(nz['id'])
 
     def _add_line(self, p1: Pt, p2: Pt):
         idx = len([s for s in self.shapes if s.get('kind') == 'line'])
@@ -808,6 +1286,7 @@ class CameraOpenGLWidget(QWidget):
         self.shapes.append(nl)
         self._emit_shapes()
         self.update()
+        self.shape_added.emit(nl['id'])
 
     def _add_tag(self, anchor: Pt):
         idx = len([s for s in self.shapes if s.get('kind') == 'tag'])
@@ -825,6 +1304,7 @@ class CameraOpenGLWidget(QWidget):
         self.shapes.append(nt)
         self._emit_shapes()
         self.update()
+        self.shape_added.emit(nt['id'])
 
     def update_detections(self, detections):
         """Backward-compatible alias: treat as backend detections."""
@@ -909,6 +1389,289 @@ class CameraOpenGLWidget(QWidget):
         # Trigger update to redraw FPS if no new frames are coming
         self.update()
 
+    # --- Motion box pipeline helpers (client-side frame differencing) ---
+    _MOTION_PERSIST_REQUIRED = 3
+    _MOTION_PERSIST_WINDOW = 5
+    _MOTION_MIN_FILL_RATIO = 0.20
+    _MOTION_MIN_ASPECT = 0.06
+    _MOTION_MAX_FRAME_COVERAGE = 0.80
+    _MOTION_MAX_DIM_RATIO = 0.92
+    _MOTION_ILLUM_CHANGED_PCT = 0.35
+    _MOTION_ILLUM_UNIFORM_RATIO = 0.85
+    _MOTION_ILLUM_MIN_MEDIAN = 4
+
+    @staticmethod
+    def _motion_box_iou(
+        a: Tuple[int, int, int, int],
+        b: Tuple[int, int, int, int],
+    ) -> float:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        x1 = max(ax, bx)
+        y1 = max(ay, by)
+        x2 = min(ax + aw, bx + bw)
+        y2 = min(ay + ah, by + bh)
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        if inter <= 0:
+            return 0.0
+        union = aw * ah + bw * bh - inter
+        return float(inter) / float(union) if union > 0 else 0.0
+
+    def _motion_params_from_settings(
+        self,
+        sensitivity: int,
+        merge_size: int,
+        motion_scale: float,
+        frame_w: int,
+        frame_h: int,
+    ) -> Tuple[int, int, int, int]:
+        """Map user controls to decoupled internal parameters."""
+        sens = max(1, min(100, int(sensitivity)))
+        merge_sz = max(0, min(100, int(merge_size)))
+
+        # Sensitivity → pixel-difference threshold only.
+        thresh_val = int(max(5, 80 - (sens * 0.75)))
+
+        # Minimum contour area is independent of sensitivity (legacy sens=50 equivalent).
+        base_min_area = 1050
+        min_area = int(base_min_area * (motion_scale * motion_scale))
+        if frame_w > 0 and frame_h > 0:
+            frame_scaled_area = frame_w * frame_h * (motion_scale * motion_scale)
+            min_area = max(min_area, int(frame_scaled_area * 0.00004))
+
+        # Merge size → morphological dilation kernel only.
+        dilate_k = 3 + int(merge_sz * 0.3)
+        open_k = 3
+        return thresh_val, min_area, open_k, dilate_k
+
+    def _motion_is_global_illumination(
+        self,
+        prev_gray: np.ndarray,
+        gray: np.ndarray,
+        frame_delta: np.ndarray,
+        thresh_val: int,
+    ) -> bool:
+        """Detect whole-frame brightness shifts (IR cut, floodlight, cloud glare)."""
+        try:
+            motion_mask = frame_delta > thresh_val
+            total = motion_mask.size
+            if total <= 0:
+                return False
+            changed_count = int(np.count_nonzero(motion_mask))
+            changed_pct = changed_count / float(total)
+            if changed_pct < self._MOTION_ILLUM_CHANGED_PCT:
+                return False
+
+            signed_diff = gray.astype(np.int16) - prev_gray.astype(np.int16)
+            changed_signed = signed_diff[motion_mask]
+            if changed_signed.size == 0:
+                return False
+
+            median_delta = float(np.median(changed_signed))
+            if abs(median_delta) < self._MOTION_ILLUM_MIN_MEDIAN:
+                return False
+
+            pos_ratio = float(np.mean(changed_signed > 0))
+            uniform = (
+                pos_ratio >= self._MOTION_ILLUM_UNIFORM_RATIO
+                or pos_ratio <= (1.0 - self._MOTION_ILLUM_UNIFORM_RATIO)
+            )
+            return uniform
+        except Exception:
+            return False
+
+    def _motion_contour_to_box(
+        self,
+        contour: np.ndarray,
+        min_area: int,
+        motion_scale: float,
+        small_w: int,
+        small_h: int,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            return None
+
+        sx, sy, sw, sh = cv2.boundingRect(contour)
+        rect_area = sw * sh
+        if rect_area <= 0:
+            return None
+
+        fill_ratio = area / float(rect_area)
+        if fill_ratio < self._MOTION_MIN_FILL_RATIO:
+            return None
+
+        long_side = max(sw, sh)
+        if long_side <= 0:
+            return None
+        aspect = min(sw, sh) / float(long_side)
+        if aspect < self._MOTION_MIN_ASPECT:
+            return None
+
+        frame_area = small_w * small_h
+        if frame_area > 0 and rect_area > self._MOTION_MAX_FRAME_COVERAGE * frame_area:
+            return None
+        if small_w > 0 and sw > self._MOTION_MAX_DIM_RATIO * small_w:
+            return None
+        if small_h > 0 and sh > self._MOTION_MAX_DIM_RATIO * small_h:
+            return None
+
+        x = int(sx / motion_scale)
+        y = int(sy / motion_scale)
+        w_box = int(sw / motion_scale)
+        h_box = int(sh / motion_scale)
+        return (x, y, w_box, h_box)
+
+    def _motion_update_persistence(
+        self,
+        raw_boxes: List[Tuple[int, int, int, int]],
+    ) -> List[Tuple[int, int, int, int]]:
+        """Require 3 of the last 5 analyzed frames before a box is confirmed."""
+        candidates = self._motion_persist_candidates
+        matched_cids: set = set()
+
+        for box in raw_boxes:
+            bcx = box[0] + box[2] / 2.0
+            bcy = box[1] + box[3] / 2.0
+            best_cid: Optional[int] = None
+            best_score = 0.0
+
+            for cid, cand in candidates.items():
+                if cid in matched_cids:
+                    continue
+                cb = cand["box"]
+                ccx = cb[0] + cb[2] / 2.0
+                ccy = cb[1] + cb[3] / 2.0
+                dist = float(np.hypot(bcx - ccx, bcy - ccy))
+                max_dist = max(60.0, min(cb[2], cb[3]) * 0.75)
+                iou = self._motion_box_iou(box, cb)
+                if iou <= 0.15 and dist >= max_dist:
+                    continue
+                score = iou + (1.0 / (1.0 + dist / 50.0))
+                if score > best_score:
+                    best_score = score
+                    best_cid = cid
+
+            if best_cid is not None:
+                matched_cids.add(best_cid)
+                cand = candidates[best_cid]
+                cand["box"] = box
+                cand["history"].append(True)
+                cand["missing"] = 0
+            else:
+                self._motion_persist_next_id += 1
+                candidates[self._motion_persist_next_id] = {
+                    "box": box,
+                    "history": deque([True], maxlen=self._MOTION_PERSIST_WINDOW),
+                    "missing": 0,
+                }
+
+        to_remove: List[int] = []
+        for cid, cand in candidates.items():
+            if cid in matched_cids:
+                continue
+            cand["history"].append(False)
+            cand["missing"] = int(cand.get("missing", 0)) + 1
+            hist = cand["history"]
+            if cand["missing"] > self._MOTION_PERSIST_WINDOW:
+                to_remove.append(cid)
+            elif len(hist) >= self._MOTION_PERSIST_WINDOW and sum(hist) == 0:
+                to_remove.append(cid)
+        for cid in to_remove:
+            candidates.pop(cid, None)
+
+        confirmed: List[Tuple[int, int, int, int]] = []
+        for cand in candidates.values():
+            if sum(cand["history"]) >= self._MOTION_PERSIST_REQUIRED:
+                confirmed.append(tuple(cand["box"]))
+        return confirmed
+
+    def _motion_track_confirmed(
+        self,
+        confirmed_boxes: List[Tuple[int, int, int, int]],
+    ) -> None:
+        """Smooth centroid tracking for confirmed (display-eligible) boxes."""
+        current_centroids: List[Tuple[float, float]] = []
+        for x, y, w_box, h_box in confirmed_boxes:
+            current_centroids.append((x + w_box / 2.0, y + h_box / 2.0))
+
+        new_tracked: Dict[int, dict] = {}
+        used_centroids: set = set()
+
+        for tid, tobj in self.tracked_objects.items():
+            last_cx, last_cy = tobj["history"][-1]
+            best_dist = 100.0
+            best_idx = -1
+
+            for idx, (cx, cy) in enumerate(current_centroids):
+                if idx in used_centroids:
+                    continue
+                dist = float(np.hypot(cx - last_cx, cy - last_cy))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+
+            if best_idx != -1:
+                cx, cy = current_centroids[best_idx]
+                box = confirmed_boxes[best_idx]
+                history = tobj["history"]
+                history.append((cx, cy))
+                hist_cap = motion_trail_history_limit(self.motion_settings)
+                while len(history) > hist_cap:
+                    history.pop(0)
+                speed = 0.7 * tobj.get("speed", 0) + 0.3 * best_dist
+                new_tracked[tid] = {
+                    "box": box,
+                    "history": history,
+                    "speed": speed,
+                    "missing": 0,
+                }
+                used_centroids.add(best_idx)
+            elif tobj["missing"] < 5:
+                tobj["missing"] += 1
+                new_tracked[tid] = tobj
+
+        for idx, (cx, cy) in enumerate(current_centroids):
+            if idx not in used_centroids:
+                self.tracker_next_id += 1
+                new_tracked[self.tracker_next_id] = {
+                    "box": confirmed_boxes[idx],
+                    "history": [(cx, cy)],
+                    "speed": 0,
+                    "missing": 0,
+                }
+
+        self.tracked_objects = new_tracked
+
+    def _motion_centroid_history_norm(
+        self,
+        box: Tuple[int, int, int, int],
+    ) -> List[Dict[str, float]]:
+        """Return normalized centroid history for the tracked object nearest to *box*."""
+        if self.frame_dims[0] <= 0 or self.frame_dims[1] <= 0:
+            return []
+        src_w, src_h = self.frame_dims
+        bx, by, bw, bh = box[:4]
+        bcx = float(bx) + float(bw) / 2.0
+        bcy = float(by) + float(bh) / 2.0
+        best_hist: List[Tuple[float, float]] = []
+        best_dist = 999999.0
+        for tobj in (self.tracked_objects or {}).values():
+            hist = tobj.get("history") or []
+            if not hist:
+                continue
+            last_cx, last_cy = hist[-1]
+            dist = float(np.hypot(float(last_cx) - bcx, float(last_cy) - bcy))
+            if dist < best_dist:
+                best_dist = dist
+                best_hist = list(hist)
+        if best_dist > max(80.0, min(float(bw), float(bh)) * 1.5):
+            return []
+        out: List[Dict[str, float]] = []
+        for cx, cy in best_hist:
+            out.append({"x": clamp01(float(cx) / src_w), "y": clamp01(float(cy) / src_h)})
+        return out
+
     @Slot(np.ndarray)
     def update_frame(self, frame):
         """Receive a numpy array (OpenCV frame), convert, and render."""
@@ -981,109 +1744,52 @@ class CameraOpenGLWidget(QWidget):
                 if self.prev_gray is None or self.prev_gray.shape != gray.shape:
                     self.prev_gray = gray
                 else:
-                    sens = self.motion_settings.get('sensitivity', 50)
-                    # Map 1-100 to Threshold 80-5 (Higher sens = lower threshold)
-                    thresh_val = int(max(5, 80 - (sens * 0.75)))
-                    # Map 1-100 to Min Area 2000-100 (Higher sens = smaller objects)
-                    # Scale area threshold by scale^2
-                    base_min_area = max(100, 2000 - (sens * 19))
-                    min_area = int(base_min_area * (motion_scale * motion_scale))
-                    
-                    merge_sz = self.motion_settings.get('merge_size', 0)
+                    sens = self.motion_settings.get('sensitivity', DEFAULT_MOTION_SENSITIVITY)
+                    merge_sz = self.motion_settings.get('merge_size', DEFAULT_MOTION_MERGE_SIZE)
+                    fw, fh = self.frame_dims
+                    thresh_val, min_area, open_k, dilate_k = self._motion_params_from_settings(
+                        sens, merge_sz, motion_scale, fw, fh,
+                    )
 
                     frame_delta = cv2.absdiff(self.prev_gray, gray)
+                    self._motion_global_illumination = self._motion_is_global_illumination(
+                        self.prev_gray, gray, frame_delta, thresh_val,
+                    )
+
                     thresh = cv2.threshold(frame_delta, thresh_val, 255, cv2.THRESH_BINARY)[1]
-                    
-                    # Dynamic dilation based on merge_size
-                    # Base (0 setting) = 3x3 kernel
-                    extra_k = int(merge_sz * 0.3) 
-                    k_dim = 3 + extra_k
-                    kernel = np.ones((k_dim, k_dim), np.uint8)
-                    
-                    thresh = cv2.dilate(thresh, kernel, iterations=2)
-                    contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    
-                    current_centroids = []
-                    current_boxes = []
-                    
+
+                    open_kernel = np.ones((open_k, open_k), np.uint8)
+                    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_kernel)
+
+                    dilate_kernel = np.ones((dilate_k, dilate_k), np.uint8)
+                    thresh = cv2.dilate(thresh, dilate_kernel, iterations=2)
+
+                    contours, _ = cv2.findContours(
+                        thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                    )
+
+                    small_h, small_w = gray.shape[:2]
+                    raw_boxes: List[Tuple[int, int, int, int]] = []
                     for c in contours:
-                        if cv2.contourArea(c) < min_area:
-                            continue
-                        
-                        # Get rect in small coordinates
-                        sx, sy, sw, sh = cv2.boundingRect(c)
-                        
-                        # Scale back to original coordinates
-                        x = int(sx / motion_scale)
-                        y = int(sy / motion_scale)
-                        w_box = int(sw / motion_scale)
-                        h_box = int(sh / motion_scale)
-                        
-                        box = (x, y, w_box, h_box)
-                        current_boxes.append(box)
-                        
-                        cx = x + w_box / 2
-                        cy = y + h_box / 2
-                        current_centroids.append((cx, cy))
-                    
-                    # Track objects
-                    new_tracked = {}
-                    used_centroids = set()
-                    
-                    # Match existing
-                    for tid, tobj in self.tracked_objects.items():
-                        last_cx, last_cy = tobj['history'][-1]
-                        best_dist = 100.0 # Max match distance
-                        best_idx = -1
-                        
-                        for idx, (cx, cy) in enumerate(current_centroids):
-                            if idx in used_centroids: continue
-                            dist = np.hypot(cx - last_cx, cy - last_cy)
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_idx = idx
-                        
-                        if best_idx != -1:
-                            # Update existing
-                            cx, cy = current_centroids[best_idx]
-                            box = current_boxes[best_idx]
-                            history = tobj['history']
-                            history.append((cx, cy))
-                            if len(history) > 30: history.pop(0)
-                            
-                            speed = best_dist # px per frame
-                            # Smooth speed
-                            speed = 0.7 * tobj.get('speed', 0) + 0.3 * speed
-                            
-                            new_tracked[tid] = {
-                                'box': box,
-                                'history': history,
-                                'speed': speed,
-                                'missing': 0
-                            }
-                            used_centroids.add(best_idx)
-                        else:
-                            # Keep lost objects briefly
-                            if tobj['missing'] < 5:
-                                tobj['missing'] += 1
-                                new_tracked[tid] = tobj
-                    
-                    # Add new
-                    for idx, (cx, cy) in enumerate(current_centroids):
-                        if idx not in used_centroids:
-                            self.tracker_next_id += 1
-                            new_tracked[self.tracker_next_id] = {
-                                'box': current_boxes[idx],
-                                'history': [(cx, cy)],
-                                'speed': 0,
-                                'missing': 0
-                            }
-                    
-                    self.tracked_objects = new_tracked
-                    self.motion_boxes = current_boxes # For fallback/debug
+                        box = self._motion_contour_to_box(
+                            c, min_area, motion_scale, small_w, small_h,
+                        )
+                        if box is not None:
+                            raw_boxes.append(box)
+
+                    self.raw_motion_boxes = raw_boxes
+
+                    if self._motion_global_illumination:
+                        # Suppress overlay/triggers; raw boxes remain for recording.
+                        self.motion_boxes = []
+                        self.tracked_objects = {}
+                    else:
+                        confirmed_boxes = self._motion_update_persistence(raw_boxes)
+                        self._motion_track_confirmed(confirmed_boxes)
+                        self.motion_boxes = list(confirmed_boxes)
+                        self._process_motion_shapes(confirmed_boxes)
+
                     self.prev_gray = gray
-                    # Check for zone/line/tag interactions
-                    self._process_motion_shapes(current_boxes)
             
             self.frame_count += 1
             self.update() # Trigger paintEvent
@@ -1113,6 +1819,7 @@ class CameraOpenGLWidget(QWidget):
                             'shape_id': sh['id'], 'shape_type': 'zone',
                             'shape_name': sh.get('label') or sh.get('id', ''),
                             'interaction_type': 'entered_zone', 'point': pt,
+                            'centroid_history': self._motion_centroid_history_norm((bx, by, bw, bh)),
                         })
                         self.motion_hit_pulses.append({'ts': now, 'box': (bx, by, bw, bh)})
                         break
@@ -1567,9 +2274,9 @@ class CameraOpenGLWidget(QWidget):
                 
                 base_color = self.motion_settings['color']
                 thickness = self.motion_settings['thickness']
-                style = self.motion_settings['style']
-                anim = self.motion_settings.get('animation', 'None')
-                show_trails = self.motion_settings.get('trails', False)
+                style = normalize_motion_style(self.motion_settings.get('style', 'Box'))
+                anim = normalize_motion_animation(self.motion_settings.get('animation', 'None'))
+                show_trails = bool(self.motion_settings.get('trails', False))
                 color_speed = self.motion_settings.get('color_speed', False)
 
                 # Animation Logic
@@ -1613,51 +2320,20 @@ class CameraOpenGLWidget(QWidget):
                     
                     cx, cy = draw_x + draw_w/2, draw_y + draw_h/2
 
-                    # --- Color Logic ---
-                    final_color = QColor(base_color)
-                    
-                    if color_speed:
-                        # Map speed (0-50) to Color (Green -> Red)
-                        # Hue: 120 (Green) -> 0 (Red)
-                        sp = min(obj.get('speed', 0), 20.0) # Cap at 20 px/frame
-                        hue = 120 - (sp / 20.0 * 120)
-                        final_color.setHslF(hue / 360.0, 1.0, 0.5)
-                    
-                    if anim == 'Rainbow':
-                        # Rotate hue over time
-                        hue = (t * 50) % 360
-                        final_color.setHslF(hue / 360.0, 1.0, 0.5)
-
-                    # --- Animation Transforms ---
-                    alpha_mult = 1.0
-                    size_mult = 1.0
-                    
-                    if anim == 'Pulse':
-                        val = (np.sin(t * 5) + 1) / 2
-                        alpha_mult = 0.4 + 0.6 * val
-                        size_mult = 1.0 + 0.05 * val
-                    elif anim == 'Flash':
-                        val = int(t * 8) % 2
-                        alpha_mult = 1.0 if val else 0.2
-                    elif anim == 'Glitch':
-                        # Random offset and size jitter
-                        if random.random() > 0.7:
-                            draw_x += random.randint(-5, 5)
-                            draw_y += random.randint(-5, 5)
-                            draw_w += random.randint(-5, 5)
-                            draw_h += random.randint(-5, 5)
-                            # Occasional color glitch
-                            if random.random() > 0.5:
-                                final_color = QColor(0, 255, 255) if random.random() > 0.5 else QColor(255, 0, 255)
-
-                    final_color.setAlphaF(min(1.0, final_color.alphaF() * alpha_mult))
-
-                    # Apply Size Multiplier
-                    if size_mult != 1.0:
-                        draw_w *= size_mult
-                        draw_h *= size_mult
-                        draw_x = cx - draw_w/2
-                        draw_y = cy - draw_h/2
+                    # --- Color Logic (speed / base handled in apply_motion_animation) ---
+                    state = apply_motion_animation(
+                        anim,
+                        t,
+                        QColor(base_color),
+                        draw_x,
+                        draw_y,
+                        draw_w,
+                        draw_h,
+                        cx,
+                        cy,
+                        obj,
+                        color_speed=color_speed,
+                    )
 
                     # Subtle interaction glow when motion intersects shapes
                     if hit_strength > 0:
@@ -1667,77 +2343,44 @@ class CameraOpenGLWidget(QWidget):
                         glow_pen.setWidth(max(3, thickness + 1))
                         painter.setPen(glow_pen)
                         painter.setBrush(Qt.BrushStyle.NoBrush)
-                        painter.drawRect(QRectF(draw_x, draw_y, draw_w, draw_h))
-                        painter.fillRect(QRectF(draw_x, draw_y, draw_w, draw_h), QColor(0, 255, 200, int(40 * hit_strength)))
-                        # Brief ripple
+                        painter.drawRect(QRectF(state.draw_x, state.draw_y, state.draw_w, state.draw_h))
+                        painter.fillRect(
+                            QRectF(state.draw_x, state.draw_y, state.draw_w, state.draw_h),
+                            QColor(0, 255, 200, int(40 * hit_strength)),
+                        )
                         ripple_pen = QPen(QColor(0, 255, 180, int(120 * hit_strength)))
                         ripple_pen.setWidth(max(2, thickness))
                         painter.setPen(ripple_pen)
                         grow = 6 + 12 * hit_strength
-                        painter.drawRect(QRectF(draw_x - grow/2, draw_y - grow/2, draw_w + grow, draw_h + grow))
+                        painter.drawRect(QRectF(
+                            state.draw_x - grow / 2, state.draw_y - grow / 2,
+                            state.draw_w + grow, state.draw_h + grow,
+                        ))
 
                     # --- Draw Trails ---
                     if show_trails and len(obj.get('history', [])) > 1:
-                        path_pen = QPen(final_color)
-                        path_pen.setWidth(max(1, thickness // 2))
-                        path_pen.setStyle(Qt.PenStyle.DotLine)
-                        painter.setPen(path_pen)
-                        
                         hist_points = []
                         for (hx, hy) in obj['history']:
                             px = x_offset + hx * scale_x
                             py = y_offset + hy * scale_y
                             hist_points.append(QPointF(px, py))
-                        
-                        painter.drawPolyline(hist_points)
+                        draw_motion_trail(
+                            painter,
+                            hist_points,
+                            self.motion_settings,
+                            obj,
+                            QColor(base_color),
+                        )
 
-                    # --- Draw Box/Shape ---
-                    if style == 'Fill':
-                        painter.setPen(Qt.PenStyle.NoPen)
-                        fill_color = QColor(final_color)
-                        fill_color.setAlpha(min(fill_color.alpha(), 100))
-                        painter.setBrush(fill_color)
-                    else:
-                        pen = QPen(final_color)
-                        pen.setWidth(thickness)
-                        painter.setPen(pen)
-                        painter.setBrush(Qt.BrushStyle.NoBrush)
-                    
-                    if style == 'Box':
-                        painter.drawRect(QRectF(draw_x, draw_y, draw_w, draw_h))
-                    elif style == 'Fill':
-                        painter.drawRect(QRectF(draw_x, draw_y, draw_w, draw_h))
-                    elif style == 'Circle':
-                        painter.drawEllipse(QRectF(draw_x, draw_y, draw_w, draw_h))
-                    elif style == 'Underline':
-                        painter.drawLine(int(draw_x), int(draw_y + draw_h), int(draw_x + draw_w), int(draw_y + draw_h))
-                    elif style == 'Crosshair':
-                        len_c = min(draw_w, draw_h) / 2
-                        # Horizontal
-                        painter.drawLine(int(cx - len_c), int(cy), int(cx + len_c), int(cy))
-                        # Vertical
-                        painter.drawLine(int(cx), int(cy - len_c), int(cx), int(cy + len_c))
-                    elif style == 'Bracket':
-                        # ... existing bracket logic ...
-                        painter.drawLine(int(draw_x), int(draw_y), int(draw_x), int(draw_y + draw_h))
-                        painter.drawLine(int(draw_x), int(draw_y), int(draw_x + 5), int(draw_y))
-                        painter.drawLine(int(draw_x), int(draw_y + draw_h), int(draw_x + 5), int(draw_y + draw_h))
-                        painter.drawLine(int(draw_x + draw_w), int(draw_y), int(draw_x + draw_w), int(draw_y + draw_h))
-                        painter.drawLine(int(draw_x + draw_w), int(draw_y), int(draw_x + draw_w - 5), int(draw_y))
-                        painter.drawLine(int(draw_x + draw_w), int(draw_y + draw_h), int(draw_x + draw_w - 5), int(draw_y + draw_h))
-                    elif style == 'Corners':
-                        # ... existing corners logic ...
-                        len_x = min(draw_w / 3, 20)
-                        len_y = min(draw_h / 3, 20)
-                        x, y, w, h = int(draw_x), int(draw_y), int(draw_w), int(draw_h)
-                        painter.drawLine(x, y, int(x + len_x), y)
-                        painter.drawLine(x, y, x, int(y + len_y))
-                        painter.drawLine(x + w, y, int(x + w - len_x), y)
-                        painter.drawLine(x + w, y, x + w, int(y + len_y))
-                        painter.drawLine(x, y + h, int(x + len_x), y + h)
-                        painter.drawLine(x, y + h, x, int(y + h - len_y))
-                        painter.drawLine(x + w, y + h, int(x + w - len_x), y + h)
-                        painter.drawLine(x + w, y + h, x + w, int(y + h - len_y))
+                    draw_motion_box_style(
+                        painter,
+                        style,
+                        state,
+                        thickness,
+                        t,
+                        obj,
+                        anim=anim,
+                    )
 
             # Draw user-defined zones, lines, and tags (normalized coordinates)
             # Hide shapes when playback_hide_shapes is True (controlled by overlay filter toggle).
@@ -2101,6 +2744,138 @@ class CameraOpenGLWidget(QWidget):
                             painter.setPen(QColor(sh.get('text_color', '#F0F0F0')))
                             painter.drawText(QPointF(cx + 10, cy - 10), sh.get('label') or 'Tag')
 
+                    if self.trigger_preview and str(self.trigger_preview.get("shape_id") or "") != sid:
+                        self._paint_shape_counter_pill(
+                            painter,
+                            sh,
+                            sid,
+                            x_offset,
+                            y_offset,
+                            view_w,
+                            view_h,
+                            now,
+                        )
+                    elif not self.trigger_preview:
+                        self._paint_shape_counter_pill(
+                            painter,
+                            sh,
+                            sid,
+                            x_offset,
+                            y_offset,
+                            view_w,
+                            view_h,
+                            now,
+                        )
+
+                # Event-rule trigger preview animation (ShapeTriggerDialog open)
+                tp = self.trigger_preview
+                if tp and self.frame_dims[0] > 0:
+                    sid_tp = str(tp.get("shape_id") or "")
+                    target = next((s for s in self.shapes if s.get("id") == sid_tp), None)
+                    if target:
+                        draw_rect = (float(x_offset), float(y_offset), view_w, view_h)
+                        motion_path = tp.get("motion_path")
+                        if isinstance(motion_path, list) and len(motion_path) >= 2:
+                            draw_motion_path(
+                                painter,
+                                motion_path,
+                                phase=float(tp.get("phase", 0.0)),
+                                draw_rect=draw_rect,
+                                color_bucket=str(tp.get("color_bucket") or ""),
+                                classes=list(tp.get("classes") or []),
+                                require_detection=bool(tp.get("require_detection", True)),
+                                dwell_min=float(tp.get("dwell_min") or 0.0),
+                                cooldown_sec=float(tp.get("cooldown_sec") or DEFAULT_RULE_COOLDOWN_SEC),
+                            )
+                        show_counter = normalize_counter_mode(tp.get("show_counter"))
+                        if show_counter != "off":
+                            anchor_bbox = parse_counter_pill_anchor(tp.get("counter_pill_anchor"))
+                            pill_anchor = self._shape_counter_anchor(
+                                target,
+                                x_offset,
+                                y_offset,
+                                view_w,
+                                view_h,
+                                anchor_bbox=anchor_bbox,
+                            )
+                            if pill_anchor:
+                                counter_value = int(tp.get("counter_value") or 1)
+                                highlight = show_counter == "on_trigger"
+                                pill_label = str(tp.get("counter_pill_label") or "")
+                                if not pill_label:
+                                    pill_label = resolve_counter_pill_label(
+                                        {"label": "", "rule_name": ""},
+                                        target,
+                                    )
+                                _draw_counter_pill(
+                                    painter,
+                                    pill_anchor[0],
+                                    pill_anchor[1] - 14,
+                                    counter_value,
+                                    highlight=highlight,
+                                    label=pill_label,
+                                    bg_color=str(tp.get("counter_pill_color") or ""),
+                                    text_color=str(tp.get("counter_pill_text_color") or ""),
+                                )
+                        extra_pills = tp.get("extra_pill_items")
+                        if isinstance(extra_pills, list):
+                            for item in extra_pills:
+                                if not isinstance(item, dict):
+                                    continue
+                                anchor_bbox = parse_counter_pill_anchor(item.get("anchor"))
+                                pill_anchor = self._shape_counter_anchor(
+                                    target,
+                                    x_offset,
+                                    y_offset,
+                                    view_w,
+                                    view_h,
+                                    anchor_bbox=anchor_bbox,
+                                )
+                                if not pill_anchor:
+                                    continue
+                                _draw_counter_pill(
+                                    painter,
+                                    pill_anchor[0],
+                                    pill_anchor[1] - 14,
+                                    int(item.get("count") or 0),
+                                    highlight=bool(item.get("highlight")),
+                                    label=str(item.get("label") or ""),
+                                    bg_color=str(item.get("bg_color") or ""),
+                                    text_color=str(item.get("text_color") or ""),
+                                )
+                        if self.path_draw_mode:
+                            hint_font = painter.font()
+                            hint_font.setPointSize(10)
+                            painter.setFont(hint_font)
+                            painter.setPen(QColor(148, 163, 184, 220))
+                            painter.drawText(
+                                int(x_offset) + 8,
+                                int(y_offset + view_h) - 8,
+                                "Drag on video to draw path · drag pill to reposition · right-click to cancel",
+                            )
+
+                # Hover ghost preview for configured event rules (dialog closed)
+                if (
+                    not tp
+                    and self.hover_rule_ghost
+                    and self.frame_dims[0] > 0
+                    and self.hover_shape
+                ):
+                    ghost_shape = next(
+                        (s for s in self.shapes if s.get("id") == self.hover_shape),
+                        None,
+                    )
+                    if ghost_shape:
+                        draw_rect = (float(x_offset), float(y_offset), view_w, view_h)
+                        for entry in self.hover_rule_ghost:
+                            draw_rule_ghost_overlay(
+                                painter,
+                                entry,
+                                phase=self._hover_ghost_phase,
+                                draw_rect=draw_rect,
+                                shape=ghost_shape,
+                            )
+
                 # Ghost preview while drawing
                 if self.draw_mode in ('zone', 'line', 'tag') and (self.draw_temp or self.cursor_norm):
                     ghost_pen = QPen(QColor(255, 255, 255, 180))
@@ -2456,7 +3231,13 @@ class CameraOpenGLWidget(QWidget):
             event.ignore()
             return
         # Right-click while drawing: cancel and pass through so dragging still works
-        if event.button() == Qt.MouseButton.RightButton and self.draw_mode != 'idle':
+        if event.button() == Qt.MouseButton.RightButton and (
+            self.draw_mode != 'idle' or self.path_draw_mode or self.pill_anchor_move_mode
+        ):
+            if self.path_draw_mode:
+                self.stop_path_draw_mode()
+            if self.pill_anchor_move_mode:
+                self.stop_pill_anchor_move_mode()
             self.cancel_draw_mode()
             return super().mousePressEvent(event)
         if event.button() != Qt.MouseButton.LeftButton:
@@ -2464,7 +3245,32 @@ class CameraOpenGLWidget(QWidget):
         norm = self._widget_to_norm(event.position())
         if norm:
             self.cursor_norm = norm
-        else:
+        elif not self.path_draw_mode and not self.pill_anchor_move_mode:
+            return super().mousePressEvent(event)
+        if self.pill_anchor_move_mode:
+            if self._hit_test_preview_pill(event.position()):
+                self._path_draw_pill_drag = True
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                event.accept()
+                return
+            event.accept()
+            return
+        # Path draw mode (event rule dialog) — full frame, not limited to shape bounds
+        if self.path_draw_mode and norm:
+            if self._hit_test_preview_pill(event.position()):
+                self._path_draw_pill_drag = True
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                event.accept()
+                return
+            self.drag_meta = None
+            self.view_pan_drag = None
+            self._path_draw_active = True
+            self._path_draw_points = [{"x": norm["x"], "y": norm["y"]}]
+            self._emit_path_draw_changed()
+            self.update()
+            event.accept()
+            return
+        if not norm:
             return super().mousePressEvent(event)
         # Drawing modes
         if self.draw_mode == 'zone':
@@ -2599,6 +3405,8 @@ class CameraOpenGLWidget(QWidget):
             return False
         if self.draw_mode != 'idle':
             return False
+        if self.path_draw_mode:
+            return False
         pos = event.position()
         norm = self._widget_to_norm(pos)
         if not norm:
@@ -2631,7 +3439,40 @@ class CameraOpenGLWidget(QWidget):
         norm = self._widget_to_norm(event.position())
         if norm:
             self.cursor_norm = norm
-        else:
+
+        if self.path_draw_mode:
+            pos = event.position()
+            if self._path_draw_pill_drag:
+                self._set_preview_pill_from_widget(pos)
+                event.accept()
+                return
+            if self._path_draw_active and norm:
+                self._append_path_draw_point(norm["x"], norm["y"])
+                self._emit_path_draw_changed()
+                self.update()
+                event.accept()
+                return
+            if self._hit_test_preview_pill(pos):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+            else:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            event.accept()
+            return
+
+        if self.pill_anchor_move_mode:
+            pos = event.position()
+            if self._path_draw_pill_drag:
+                self._set_preview_pill_from_widget(pos)
+                event.accept()
+                return
+            if self._hit_test_preview_pill(pos):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+            else:
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+            event.accept()
+            return
+
+        if not norm:
             return super().mouseMoveEvent(event)
 
         # If we're in drawing mode, handle locally (don't bubble to allow precise cursor/ghost)
@@ -2650,6 +3491,8 @@ class CameraOpenGLWidget(QWidget):
             return
 
         if not self.drag_meta:
+            if self.draw_mode == 'idle' and not self.view_pan_drag:
+                self._update_hover_shape(self._hit_test_shape(event.position()))
             self.update()
             return super().mouseMoveEvent(event)
         meta = self.drag_meta
@@ -2702,6 +3545,25 @@ class CameraOpenGLWidget(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self.path_draw_mode or self.pill_anchor_move_mode:
+            if self._path_draw_pill_drag:
+                self._path_draw_pill_drag = False
+                if self.path_draw_mode:
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+                else:
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                event.accept()
+                return
+        if self.path_draw_mode:
+            if self._path_draw_active:
+                self._path_draw_active = False
+                norm = self._widget_to_norm(event.position())
+                if norm:
+                    self._append_path_draw_point(norm["x"], norm["y"])
+                self._emit_path_draw_changed()
+                self.update()
+                event.accept()
+                return
         if self.view_pan_drag:
             self.view_pan_drag = None
             return
@@ -2717,7 +3579,7 @@ class CameraOpenGLWidget(QWidget):
         if self._in_parent_resize_zone(event):
             event.ignore()
             return
-        if self.draw_mode != 'idle' or self.drag_meta:
+        if self.draw_mode != 'idle' or self.drag_meta or self.path_draw_mode:
             return super().wheelEvent(event)
         delta = event.angleDelta().y()
         if delta == 0:
@@ -2729,6 +3591,7 @@ class CameraOpenGLWidget(QWidget):
 
     def leaveEvent(self, event):
         self.cursor_norm = None
+        self._update_hover_shape(None)
         return super().leaveEvent(event)
 
     def keyPressEvent(self, event):
@@ -2756,79 +3619,323 @@ class MotionSettingsDialog(QDialog):
     def __init__(self, current_settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Motion Box Settings")
-        self.setFixedSize(300, 250)
-        # Ensure the dialog stays on top if the parent is pinned, and tool tool window style
+        self.setMinimumSize(480, 560)
+        self.resize(500, 620)
         self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        
+
         self.settings = current_settings.copy()
-        
-        layout = QFormLayout(self)
-        
-        # Style
-        self.style_combo = QComboBox()
-        self.style_combo.addItems(["Box", "Fill", "Corners", "Circle", "Bracket", "Underline", "Crosshair"])
-        self.style_combo.setCurrentText(self.settings['style'])
-        self.style_combo.currentTextChanged.connect(self.update_style)
-        layout.addRow("Style:", self.style_combo)
-        
-        # Animation
-        self.anim_combo = QComboBox()
-        self.anim_combo.addItems(["None", "Pulse", "Flash", "Glitch", "Rainbow"])
-        self.anim_combo.setCurrentText(self.settings.get('animation', 'None'))
-        self.anim_combo.currentTextChanged.connect(self.update_animation)
-        layout.addRow("Animation:", self.anim_combo)
+        cur_style = normalize_motion_style(self.settings.get('style', 'Box'))
+        cur_anim = normalize_motion_animation(self.settings.get('animation', 'None'))
+        self.settings['style'] = cur_style
+        self.settings['animation'] = cur_anim
 
-        # Options
-        self.trails_check = QCheckBox("Show Trails")
-        self.trails_check.setChecked(self.settings.get('trails', False))
-        self.trails_check.toggled.connect(lambda x: self.update_bool('trails', x))
-        layout.addRow("", self.trails_check)
+        self.setStyleSheet(
+            "QDialog { background: #0f172a; }"
+            "QLabel { color: #e2e8f0; }"
+            "QGroupBox { color: #cbd5e1; font-weight: bold; margin-top: 10px; padding-top: 8px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+        )
 
-        self.speed_color_check = QCheckBox("Color by Speed")
-        self.speed_color_check.setChecked(self.settings.get('color_speed', False))
-        self.speed_color_check.toggled.connect(lambda x: self.update_bool('color_speed', x))
-        layout.addRow("", self.speed_color_check)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
 
-        # Sensitivity
-        self.sens_slider = QSlider(Qt.Orientation.Horizontal)
-        self.sens_slider.setRange(1, 100)
-        self.sens_slider.setValue(self.settings.get('sensitivity', 50))
-        self.sens_slider.valueChanged.connect(self.update_sensitivity)
-        layout.addRow("Sensitivity:", self.sens_slider)
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
 
-        # Merge / Size
-        self.size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.size_slider.setRange(0, 100)
-        self.size_slider.setValue(self.settings.get('merge_size', 0))
-        self.size_slider.valueChanged.connect(self.update_merge_size)
-        layout.addRow("Box Size/Merge:", self.size_slider)
+        # ---- Tab 1: Box appearance ----
+        look_tab = QWidget()
+        look_layout = QVBoxLayout(look_tab)
+        look_layout.setContentsMargins(10, 12, 10, 10)
+        look_layout.setSpacing(14)
 
-        # Color
+        style_hdr = QLabel("Bounding box style")
+        style_hdr.setStyleSheet("font-weight: bold; font-size: 11px; color: #94a3b8;")
+        look_layout.addWidget(style_hdr)
+        self.style_picker = motion_style_picker(cur_style, self, compact=True)
+        self.style_picker.valueChanged.connect(self.update_style)
+        look_layout.addWidget(self.style_picker)
+        self.style_selected_lbl = QLabel(f"Selected: {cur_style}")
+        self.style_selected_lbl.setStyleSheet("color: #f87171; font-size: 10px; padding-left: 2px;")
+        self.style_selected_lbl.setWordWrap(True)
+        look_layout.addWidget(self.style_selected_lbl)
+
+        anim_hdr = QLabel("Animation")
+        anim_hdr.setStyleSheet("font-weight: bold; font-size: 11px; color: #94a3b8; margin-top: 4px;")
+        look_layout.addWidget(anim_hdr)
+        self.anim_picker = motion_animation_picker(cur_anim, self, compact=True)
+        self.anim_picker.valueChanged.connect(self.update_animation)
+        look_layout.addWidget(self.anim_picker)
+        self.anim_selected_lbl = QLabel(f"Selected: {cur_anim}")
+        self.anim_selected_lbl.setStyleSheet("color: #f87171; font-size: 10px; padding-left: 2px;")
+        look_layout.addWidget(self.anim_selected_lbl)
+
+        look_form = QFormLayout()
+        look_form.setVerticalSpacing(12)
+        look_form.setHorizontalSpacing(14)
+        look_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        look_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
         self.color_btn = QPushButton()
+        self.color_btn.setMinimumHeight(26)
         self._refresh_color_button()
         self.color_btn.clicked.connect(self.pick_color)
-        layout.addRow("Color:", self.color_btn)
-        
-        # Thickness
+        look_form.addRow("Box color:", self.color_btn)
+
         self.thickness_spin = QSpinBox()
         self.thickness_spin.setRange(1, 10)
         self.thickness_spin.setValue(self.settings['thickness'])
         self.thickness_spin.valueChanged.connect(self.update_thickness)
-        layout.addRow("Thickness:", self.thickness_spin)
-        
-        # Close button
+        look_form.addRow("Line thickness:", self.thickness_spin)
+
+        self.speed_color_check = QCheckBox("Color box by speed")
+        self.speed_color_check.setChecked(self.settings.get('color_speed', False))
+        self.speed_color_check.toggled.connect(lambda x: self.update_bool('color_speed', x))
+        look_form.addRow("", self.speed_color_check)
+
+        look_layout.addLayout(look_form)
+        look_layout.addStretch(1)
+        tabs.addTab(look_tab, "Box Style")
+
+        # ---- Tab 2: Trails ----
+        trails_tab = QWidget()
+        trails_outer = QVBoxLayout(trails_tab)
+        trails_outer.setContentsMargins(10, 12, 10, 10)
+        trails_outer.setSpacing(8)
+
+        trail_form = QFormLayout()
+        trail_form.setVerticalSpacing(14)
+        trail_form.setHorizontalSpacing(16)
+        trail_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        trail_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self.trails_check = QCheckBox("Enable motion trails")
+        self.trails_check.setChecked(bool(self.settings.get('trails', False)))
+        self.trails_check.toggled.connect(self._on_trails_toggled)
+        trail_form.addRow("", self.trails_check)
+
+        len_row = QWidget()
+        len_h = QHBoxLayout(len_row)
+        len_h.setContentsMargins(0, 0, 0, 0)
+        len_h.setSpacing(10)
+        self.trail_len_slider = QSlider(Qt.Orientation.Horizontal)
+        self.trail_len_slider.setRange(5, 60)
+        self.trail_len_slider.setValue(int(self.settings.get('trail_length', 20)))
+        self.trail_len_slider.valueChanged.connect(self._on_trail_length)
+        self.trail_len_value = QLabel()
+        self.trail_len_value.setMinimumWidth(52)
+        self.trail_len_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        len_h.addWidget(self.trail_len_slider, 1)
+        len_h.addWidget(self.trail_len_value)
+        trail_form.addRow("Trail length:", len_row)
+        self._update_trail_len_label(self.trail_len_slider.value())
+
+        self.trail_width_spin = QSpinBox()
+        self.trail_width_spin.setRange(1, 8)
+        self.trail_width_spin.setValue(int(self.settings.get('trail_width', 2)))
+        self.trail_width_spin.setMinimumWidth(64)
+        self.trail_width_spin.valueChanged.connect(lambda v: self._set_trail('trail_width', v))
+        trail_form.addRow("Trail width:", self.trail_width_spin)
+
+        self.trail_style_combo = QComboBox()
+        self.trail_style_combo.setMinimumWidth(140)
+        self.trail_style_combo.addItems(TRAIL_STYLES)
+        cur_ts = str(self.settings.get('trail_style', 'Solid'))
+        if cur_ts in TRAIL_STYLES:
+            self.trail_style_combo.setCurrentText(cur_ts)
+        self.trail_style_combo.currentTextChanged.connect(
+            lambda t: self._set_trail('trail_style', t)
+        )
+        trail_form.addRow("Line style:", self.trail_style_combo)
+
+        self.trail_color_mode = QComboBox()
+        self.trail_color_mode.setMinimumWidth(140)
+        self.trail_color_mode.addItems(TRAIL_COLOR_MODES)
+        cur_mode = str(self.settings.get('trail_color_mode', 'Match Box'))
+        if cur_mode in TRAIL_COLOR_MODES:
+            self.trail_color_mode.setCurrentText(cur_mode)
+        self.trail_color_mode.currentTextChanged.connect(self._on_trail_color_mode)
+        trail_form.addRow("Trail color:", self.trail_color_mode)
+
+        self.trail_color_btn = QPushButton()
+        self.trail_color_btn.setMinimumHeight(26)
+        self._refresh_trail_color_button()
+        self.trail_color_btn.clicked.connect(self.pick_trail_color)
+        trail_form.addRow("Custom color:", self.trail_color_btn)
+
+        opacity_row = QWidget()
+        opacity_h = QHBoxLayout(opacity_row)
+        opacity_h.setContentsMargins(0, 0, 0, 0)
+        opacity_h.setSpacing(10)
+        self.trail_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.trail_opacity_slider.setRange(20, 255)
+        self.trail_opacity_slider.setValue(int(self.settings.get('trail_opacity', 180)))
+        self.trail_opacity_slider.valueChanged.connect(self._on_trail_opacity)
+        self.trail_opacity_value = QLabel()
+        self.trail_opacity_value.setMinimumWidth(52)
+        self.trail_opacity_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        opacity_h.addWidget(self.trail_opacity_slider, 1)
+        opacity_h.addWidget(self.trail_opacity_value)
+        trail_form.addRow("Opacity:", opacity_row)
+        self._update_trail_opacity_label(self.trail_opacity_slider.value())
+
+        self.trail_fade_check = QCheckBox("Fade older segments along the path")
+        self.trail_fade_check.setChecked(bool(self.settings.get('trail_fade', True)))
+        self.trail_fade_check.toggled.connect(lambda x: self.update_bool('trail_fade', x))
+        trail_form.addRow("", self.trail_fade_check)
+
+        trails_outer.addLayout(trail_form)
+        trails_outer.addStretch(1)
+        tabs.addTab(trails_tab, "Trails")
+
+        self._sync_trail_controls_enabled(bool(self.settings.get('trails', False)))
+
+        # ---- Tab 3: Detection tuning ----
+        detect_tab = QWidget()
+        detect_form = QFormLayout(detect_tab)
+        detect_form.setContentsMargins(10, 16, 10, 10)
+        detect_form.setVerticalSpacing(16)
+        detect_form.setHorizontalSpacing(16)
+        detect_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.sens_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sens_slider.setRange(1, 100)
+        self.sens_slider.setValue(self.settings.get('sensitivity', DEFAULT_MOTION_SENSITIVITY))
+        self.sens_slider.valueChanged.connect(self.update_sensitivity)
+        self.sens_value = QLabel(str(self.settings.get('sensitivity', DEFAULT_MOTION_SENSITIVITY)))
+        self.sens_value.setMinimumWidth(36)
+        self.sens_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        sens_row = QWidget()
+        sens_h = QHBoxLayout(sens_row)
+        sens_h.setContentsMargins(0, 0, 0, 0)
+        sens_h.setSpacing(10)
+        sens_h.addWidget(self.sens_slider, 1)
+        sens_h.addWidget(self.sens_value)
+        self.sens_slider.valueChanged.connect(lambda v: self.sens_value.setText(str(v)))
+        detect_form.addRow("Sensitivity:", sens_row)
+
+        self.size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.size_slider.setRange(0, 100)
+        self.size_slider.setValue(self.settings.get('merge_size', DEFAULT_MOTION_MERGE_SIZE))
+        self.size_slider.valueChanged.connect(self.update_merge_size)
+        self.merge_value = QLabel(str(self.settings.get('merge_size', DEFAULT_MOTION_MERGE_SIZE)))
+        self.merge_value.setMinimumWidth(36)
+        self.merge_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        merge_row = QWidget()
+        merge_h = QHBoxLayout(merge_row)
+        merge_h.setContentsMargins(0, 0, 0, 0)
+        merge_h.setSpacing(10)
+        merge_h.addWidget(self.size_slider, 1)
+        merge_h.addWidget(self.merge_value)
+        self.size_slider.valueChanged.connect(lambda v: self.merge_value.setText(str(v)))
+        detect_form.addRow("Merge size:", merge_row)
+
+        merge_hint = QLabel(
+            "Sensitivity controls motion pixel threshold.\n"
+            "Merge size joins nearby motion blobs before boxing."
+        )
+        merge_hint.setWordWrap(True)
+        merge_hint.setStyleSheet("color: #64748b; font-size: 10px; padding-top: 8px;")
+        detect_form.addRow("", merge_hint)
+
+        tabs.addTab(detect_tab, "Detection")
+
+        root.addWidget(tabs, 1)
+
         close_btn = QPushButton("Close")
+        close_btn.setMinimumHeight(32)
         close_btn.clicked.connect(self.close)
-        layout.addRow(close_btn)
-        
+        root.addWidget(close_btn)
+
     def update_style(self, text):
-        self.settings['style'] = text
+        self.settings['style'] = normalize_motion_style(text)
+        try:
+            self.style_selected_lbl.setText(f"Selected: {self.settings['style']}")
+        except Exception:
+            pass
         self.settings_changed.emit(self.settings)
 
     def update_animation(self, text):
-        self.settings['animation'] = text
+        self.settings['animation'] = normalize_motion_animation(text)
+        try:
+            self.anim_selected_lbl.setText(f"Selected: {self.settings['animation']}")
+        except Exception:
+            pass
         self.settings_changed.emit(self.settings)
         
+    def _on_trails_toggled(self, on: bool):
+        self.update_bool('trails', on)
+        self._sync_trail_controls_enabled(on)
+
+    def _sync_trail_controls_enabled(self, on: bool):
+        for w in (
+            self.trail_len_slider, self.trail_width_spin, self.trail_style_combo,
+            self.trail_color_mode, self.trail_color_btn, self.trail_opacity_slider,
+            self.trail_fade_check,
+        ):
+            try:
+                w.setEnabled(bool(on))
+            except Exception:
+                pass
+        self._sync_trail_color_btn()
+
+    def _set_trail(self, key: str, val):
+        self.settings[key] = val
+        self.settings_changed.emit(self.settings)
+
+    def _on_trail_length(self, val: int):
+        self._update_trail_len_label(val)
+        self._set_trail('trail_length', int(val))
+
+    def _update_trail_len_label(self, val: int):
+        self.trail_len_value.setText(f"{val} pts")
+
+    def _on_trail_opacity(self, val: int):
+        self._update_trail_opacity_label(val)
+        self._set_trail('trail_opacity', int(val))
+
+    def _update_trail_opacity_label(self, val: int):
+        pct = int(round(val / 255.0 * 100))
+        self.trail_opacity_value.setText(f"{pct}%")
+
+    def _on_trail_color_mode(self, mode: str):
+        self._set_trail('trail_color_mode', str(mode))
+        self._sync_trail_color_btn()
+
+    def _sync_trail_color_btn(self):
+        custom = (
+            bool(self.settings.get('trails'))
+            and str(self.settings.get('trail_color_mode')) == 'Custom'
+        )
+        self.trail_color_btn.setEnabled(custom)
+
+    def _refresh_trail_color_button(self) -> None:
+        try:
+            c = self.settings.get("trail_color")
+            if not isinstance(c, QColor) or not c.isValid():
+                c = QColor(255, 200, 0)
+                self.settings["trail_color"] = c
+            self.trail_color_btn.setText(c.name().upper())
+            self.trail_color_btn.setStyleSheet(
+                f"background-color: {c.name()}; border: 1px solid #666; min-height: 18px;"
+            )
+        except Exception:
+            pass
+
+    def pick_trail_color(self):
+        try:
+            from PySide6.QtWidgets import QColorDialog
+            base = self.settings.get("trail_color")
+            if not isinstance(base, QColor) or not base.isValid():
+                base = QColor(255, 200, 0)
+            c = QColorDialog.getColor(base, self, "Trail Color")
+            if c.isValid():
+                self.settings["trail_color"] = c
+                self._refresh_trail_color_button()
+                self.settings_changed.emit(dict(self.settings))
+        except Exception:
+            pass
+
     def update_bool(self, key, val):
         self.settings[key] = val
         self.settings_changed.emit(self.settings)
@@ -3471,18 +4578,49 @@ class TrackedObjectSettingsDialog(QDialog):
 
 class MotionWatchDialog(QDialog):
     """
-    Lightweight motion watch configuration dialog.
-    Allows user control over delay, crop, resolution, overlays, save path, and shape filters.
+    Capture settings dialog shared by Event Rules screenshots and legacy Motion Watch.
+
+    ``settings_only=True`` hides legacy session controls (watch duration, shape filters,
+    cooldown) and is used from the Event Rule editor. Legacy/advanced mode keeps those
+    fields for the desktop Motion Watch migration path.
     """
-    def __init__(self, current_settings: Dict[str, object], parent=None):
+    def __init__(
+        self,
+        current_settings: Dict[str, object],
+        parent=None,
+        *,
+        settings_only: bool = False,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Motion Watch")
-        self.setFixedSize(420, 780)
+        self._settings_only = bool(settings_only)
+        self.setWindowTitle("Capture Settings" if self._settings_only else "Capture Settings (Advanced)")
+        self.setFixedSize(420, 700 if self._settings_only else 780)
         self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
         self.settings = current_settings.copy()
         duration_val = int(self.settings.get("duration_sec", 30))
 
-        form = QFormLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        if self._settings_only:
+            info = QLabel(
+                "Used by Event Rule screenshots and legacy Motion Watch captures. "
+                "Arm or save Event Rules separately — no start/stop here."
+            )
+            info.setWordWrap(True)
+            info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            root.addWidget(info)
+        else:
+            info = QLabel(
+                "Saves capture defaults for this camera. Use Arm Event Rules in the "
+                "camera menu to activate capturing."
+            )
+            info.setWordWrap(True)
+            info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            root.addWidget(info)
+
+        form = QFormLayout()
 
         self.duration_spin = QSpinBox()
         self.duration_spin.setRange(1, 36000)
@@ -3510,7 +4648,8 @@ class MotionWatchDialog(QDialog):
         dur_row = QHBoxLayout()
         dur_row.addWidget(self.duration_spin)
         dur_row.addWidget(self.duration_unit)
-        form.addRow("Watch duration", dur_row)
+        self._duration_row_label = QLabel("Watch duration")
+        form.addRow(self._duration_row_label, dur_row)
 
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(0, 5000)
@@ -3567,7 +4706,8 @@ class MotionWatchDialog(QDialog):
         filter_row = QHBoxLayout()
         for w in (self.zone_check, self.line_check, self.tag_check):
             filter_row.addWidget(w)
-        form.addRow("Trigger on", filter_row)
+        self._trigger_on_label = QLabel("Trigger on")
+        form.addRow(self._trigger_on_label, filter_row)
 
         self.cooldown_spin = QSpinBox()
         self.cooldown_spin.setRange(0, 60000)
@@ -3575,9 +4715,10 @@ class MotionWatchDialog(QDialog):
         self.cooldown_spin.setSingleStep(50)
         cooldown_ms = self.settings.get("cooldown_ms")
         if cooldown_ms is None:
-            cooldown_ms = int(float(self.settings.get("cooldown_sec", 3) or 3) * 1000)
+            cooldown_ms = cooldown_ms_from_sec(float(self.settings.get("cooldown_sec", DEFAULT_RULE_COOLDOWN_SEC) or DEFAULT_RULE_COOLDOWN_SEC))
         self.cooldown_spin.setValue(int(cooldown_ms))
-        form.addRow("Cooldown between shots", self.cooldown_spin)
+        self._cooldown_label = QLabel("Cooldown between shots")
+        form.addRow(self._cooldown_label, self.cooldown_spin)
 
         # Clip Recording group
         clip_group = QGroupBox("Clip Recording")
@@ -3671,13 +4812,26 @@ class MotionWatchDialog(QDialog):
         form.addRow(label_group)
 
         btn_row = QHBoxLayout()
-        self.start_btn = QPushButton("Start")
+        self.save_btn = QPushButton("Save")
         self.cancel_btn = QPushButton("Cancel")
-        self.start_btn.clicked.connect(self.accept)
+        self.save_btn.clicked.connect(self.accept)
         self.cancel_btn.clicked.connect(self.reject)
-        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.save_btn)
         btn_row.addWidget(self.cancel_btn)
         form.addRow(btn_row)
+
+        root.addLayout(form)
+
+        if self._settings_only:
+            self._duration_row_label.hide()
+            self.duration_spin.hide()
+            self.duration_unit.hide()
+            self._trigger_on_label.hide()
+            self.zone_check.hide()
+            self.line_check.hide()
+            self.tag_check.hide()
+            self._cooldown_label.hide()
+            self.cooldown_spin.hide()
 
     def _pick_dir(self):
         target = QFileDialog.getExistingDirectory(self, "Select save directory", self.save_dir_edit.text() or ".")
@@ -3691,14 +4845,34 @@ class MotionWatchDialog(QDialog):
             self.clip_save_dir_edit.setText(target)
 
     def get_settings(self) -> Dict[str, object]:
-        unit = self.duration_unit.currentText()
-        duration_sec = int(self.duration_spin.value())
-        if unit == "Minutes":
-            duration_sec *= 60
-        elif unit == "Hours":
-            duration_sec *= 3600
-        elif unit == "Infinite":
-            duration_sec = -1
+        if self._settings_only:
+            unit = str(self.settings.get("duration_unit") or "Seconds")
+            duration_sec = int(self.settings.get("duration_sec", 30))
+            allow_zone = bool(self.settings.get("allow_zone", True))
+            allow_line = bool(self.settings.get("allow_line", True))
+            allow_tag = bool(self.settings.get("allow_tag", True))
+            cooldown_ms = int(
+                self.settings.get("cooldown_ms")
+                if self.settings.get("cooldown_ms") is not None
+                else cooldown_ms_from_sec(
+                    float(self.settings.get("cooldown_sec", DEFAULT_RULE_COOLDOWN_SEC) or DEFAULT_RULE_COOLDOWN_SEC)
+                )
+            )
+            cooldown_sec = max(0, int(round(cooldown_ms / 1000.0)))
+        else:
+            unit = self.duration_unit.currentText()
+            duration_sec = int(self.duration_spin.value())
+            if unit == "Minutes":
+                duration_sec *= 60
+            elif unit == "Hours":
+                duration_sec *= 3600
+            elif unit == "Infinite":
+                duration_sec = -1
+            allow_zone = bool(self.zone_check.isChecked())
+            allow_line = bool(self.line_check.isChecked())
+            allow_tag = bool(self.tag_check.isChecked())
+            cooldown_ms = int(self.cooldown_spin.value())
+            cooldown_sec = max(0, int(round(cooldown_ms / 1000.0)))
         return {
             "duration_sec": duration_sec,
             "duration_unit": unit,
@@ -3709,11 +4883,11 @@ class MotionWatchDialog(QDialog):
             "resize_w": int(self.resize_w_spin.value()),
             "include_overlays": bool(self.overlay_check.isChecked()),
             "save_dir": self.save_dir_edit.text().strip() or "captures/motion_watch",
-            "allow_zone": bool(self.zone_check.isChecked()),
-            "allow_line": bool(self.line_check.isChecked()),
-            "allow_tag": bool(self.tag_check.isChecked()),
-            "cooldown_ms": int(self.cooldown_spin.value()),
-            "cooldown_sec": max(0, int(round(int(self.cooldown_spin.value()) / 1000.0))),
+            "allow_zone": allow_zone,
+            "allow_line": allow_line,
+            "allow_tag": allow_tag,
+            "cooldown_ms": cooldown_ms,
+            "cooldown_sec": cooldown_sec,
             "clip_enabled": bool(self.clip_enabled_check.isChecked()),
             "clip_duration_sec": int(self.clip_duration_spin.value()),
             "clip_pre_roll_sec": int(self.clip_pre_roll_spin.value()),
@@ -5350,6 +6524,8 @@ class CameraWidget(BaseDesktopWidget):
     Also connects to Socket.IO for AI detections.
     """
     detections_signal = Signal(list)
+    automation_alert_signal = Signal(dict)
+    new_capture_signal = Signal(dict)
     ptz_result_signal = Signal(dict)
     _playback_data_ready = Signal(list, bool, list)  # segments, use_mediamtx, extra_dirs
     _playback_events_ready = Signal(list)
@@ -5489,6 +6665,10 @@ class CameraWidget(BaseDesktopWidget):
         self._detector_last_error: Optional[str] = None
         # Motion watch state
         self.motion_watch_active = False
+        self._server_event_rules_enabled = False
+        self._cached_event_rules: List[Dict[str, object]] = []
+        self._event_rules_cache_ts: float = 0.0
+        self._EVENT_RULES_CACHE_TTL: float = 30.0
         self.motion_watch_settings = {
             "duration_sec": 30,
             "duration_unit": "Seconds",
@@ -5502,8 +6682,8 @@ class CameraWidget(BaseDesktopWidget):
             "allow_zone": True,
             "allow_line": True,
             "allow_tag": True,
-            "cooldown_ms": 3000,
-            "cooldown_sec": 3,
+            "cooldown_ms": DEFAULT_RULE_COOLDOWN_MS,
+            "cooldown_sec": DEFAULT_RULE_COOLDOWN_SEC,
             "clip_enabled": False,
             "clip_duration_sec": 10,
             "clip_pre_roll_sec": 5,
@@ -5537,7 +6717,9 @@ class CameraWidget(BaseDesktopWidget):
         self.gl_widget = CameraOpenGLWidget(parent=self, camera_id=camera_id)
         self.gl_widget.shapes_changed.connect(self._on_shapes_changed)
         self.gl_widget.shape_triggered.connect(self._on_shape_triggered)
-        self.gl_widget.shape_double_clicked.connect(self.edit_shape)
+        self.gl_widget.shape_double_clicked.connect(self.on_shape_double_clicked)
+        self.gl_widget.shape_added.connect(self.on_shape_added)
+        self.gl_widget.hover_shape_changed.connect(self._on_hover_shape_changed)
         self.register_drag_handle(self.gl_widget, self.gl_widget.can_start_window_drag)
         self.set_content(self.gl_widget)
         # Load per-camera tracked-object overrides (name/color/hide)
@@ -5549,9 +6731,11 @@ class CameraWidget(BaseDesktopWidget):
             pass
         self.shapes_by_camera[self.camera_id] = self.shapes_by_camera.get(self.camera_id, [])
         self.gl_widget.set_shapes(self.shapes_by_camera[self.camera_id])
+        QTimer.singleShot(800, self._refresh_shape_counter_config)
         # Overlay projections: allow multiple independent overlay windows per camera / per shape selection.
         # Keyed by shape id (single selection) or by a stable group key (multi-selection).
         self.overlay_windows: Dict[str, CameraOverlayWindow] = {}
+        self._shape_trigger_dialogs: Dict[str, ShapeTriggerDialog] = {}
         self.ptz_overlay: Optional[PTZOverlayWidget] = None
         self.ptz_controller_window: Optional[PTZControllerWindow] = None
         self.ptz_overlay_settings: Dict[str, object] = load_ptz_overlay_settings(self.camera_id)
@@ -5673,6 +6857,8 @@ class CameraWidget(BaseDesktopWidget):
         
         # Connect signals
         self.detections_signal.connect(self.gl_widget.update_backend_detections)
+        self.automation_alert_signal.connect(self._on_automation_alert)
+        self.new_capture_signal.connect(self._on_new_capture)
         self.ptz_result_signal.connect(self._on_ptz_result)
 
         # Apply styles
@@ -6648,6 +7834,48 @@ class CameraWidget(BaseDesktopWidget):
                         return
                     except Exception:
                         return
+
+            @w0.sio.on('automation_alert', namespace='/realtime')
+            def on_automation_alert(data):
+                w = self_ref()
+                if w is None:
+                    return
+                try:
+                    if not bool(getattr(w, "running", True)):
+                        return
+                except Exception:
+                    return
+                if not isinstance(data, dict):
+                    return
+                if str(data.get("camera_id") or "") not in ("", str(w.camera_id)):
+                    return
+                try:
+                    w.automation_alert_signal.emit(data)
+                except RuntimeError:
+                    return
+                except Exception:
+                    return
+
+            @w0.sio.on('new_capture', namespace='/realtime')
+            def on_new_capture(data):
+                w = self_ref()
+                if w is None:
+                    return
+                try:
+                    if not bool(getattr(w, "running", True)):
+                        return
+                except Exception:
+                    return
+                if not isinstance(data, dict):
+                    return
+                if str(data.get("camera_id") or "") not in ("", str(w.camera_id)):
+                    return
+                try:
+                    w.new_capture_signal.emit(data)
+                except RuntimeError:
+                    return
+                except Exception:
+                    return
             
             # Connect
             # Use default backend port
@@ -7391,16 +8619,29 @@ class CameraWidget(BaseDesktopWidget):
         self._clear_auto_debug()
         self._apply_overlay_settings()
 
+    def get_motion_boxes_visible(self) -> bool:
+        """Whether desktop motion-box overlay is drawn on the live feed."""
+        return bool(self.motion_boxes_enabled)
+
+    def set_motion_boxes_visible(self, enabled: bool) -> None:
+        """Show or hide desktop motion-box overlay without keyboard/menu confirmation."""
+        enabled = bool(enabled)
+        if bool(self.motion_boxes_enabled) == enabled:
+            return
+        self.motion_boxes_enabled = enabled
+        self._apply_overlay_settings()
+
     def toggle_motion(self):
-        self.motion_boxes_enabled = not self.motion_boxes_enabled
-        self.gl_widget.set_overlay_settings(self.debug_overlay_enabled, self.motion_boxes_enabled)
+        self.set_motion_boxes_visible(not self.motion_boxes_enabled)
         # Briefly surface a confirmation in the debug overlay so the
         # user has visible proof of the toggle action.  Takes direct
         # ownership of the overlay (bypasses user_opt_out) for the
         # 1.5s confirmation window, then restores the prior state.
         try:
             state = "ON" if self.motion_boxes_enabled else "OFF"
-            self._debug_chord_lines = [f"Motion boxes: {state}"]
+            self._debug_chord_lines = [
+                f"Motion boxes: {state} (overlay preview)",
+            ]
             self._chord_take_overlay()
             self._chord_push_lines(self._debug_chord_lines)
             # Only schedule the auto-clear when no chord modifier is
@@ -7470,13 +8711,100 @@ class CameraWidget(BaseDesktopWidget):
         self.detection_settings_dialog.raise_()
         self.detection_settings_dialog.activateWindow()
 
-    def open_motion_watch_dialog(self):
-        dlg = MotionWatchDialog(self.motion_watch_settings, self)
+    def open_event_rules_dialog(self):
+        """Open staged Event Rules editor for this camera."""
+        shapes = list(getattr(self.gl_widget, "shapes", []) or [])
+        api_base = getattr(self, "API_BASE", "http://localhost:5000/api")
+        dlg = EventRulesEditorDialog(
+            camera_id=self.camera_id,
+            api_base=api_base,
+            shapes=shapes,
+            parent=self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.should_arm():
+            self.arm_event_rules()
+        self._refresh_shape_counter_config(force=True)
+
+    def open_motion_watch_settings_dialog(self, *, settings_only: bool = False):
+        """Capture settings (clips, disk management, labeling).
+
+        ``settings_only=True`` opens config-only mode for Event Rules (no legacy
+        session controls or Start semantics).
+        """
+        dlg = MotionWatchDialog(self.motion_watch_settings, self, settings_only=settings_only)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.motion_watch_settings.update(dlg.get_settings())
             self._persist_motion_watch_settings()
             self._sync_storage_settings()
-            self.start_motion_watch()
+
+    def open_motion_watch_dialog(self):
+        """Compatibility entry point — opens Event Rules editor."""
+        self.open_event_rules_dialog()
+
+    def _refresh_shape_counter_config(self, *, force: bool = False) -> None:
+        """Load event rules from API (cached) for counter pills and hover ghosts."""
+        api_base = getattr(self, "API_BASE", "http://localhost:5000/api")
+        now = time.time()
+        ttl = float(getattr(self, "_EVENT_RULES_CACHE_TTL", 30.0))
+        if (
+            not force
+            and getattr(self, "_cached_event_rules", None)
+            and (now - float(getattr(self, "_event_rules_cache_ts", 0.0))) < ttl
+        ):
+            rules = self._cached_event_rules
+        else:
+            rules = list_rules(api_base, self.camera_id)
+            self._cached_event_rules = rules
+            self._event_rules_cache_ts = now
+        self.gl_widget.refresh_shape_counter_config(rules)
+        self.gl_widget.set_event_rules_cache(rules, cache_ts=self._event_rules_cache_ts)
+
+    def _on_hover_shape_changed(self, shape_id) -> None:
+        if not shape_id:
+            return
+        ttl = float(getattr(self, "_EVENT_RULES_CACHE_TTL", 30.0))
+        if (time.time() - float(getattr(self, "_event_rules_cache_ts", 0.0))) >= ttl:
+            self._refresh_shape_counter_config(force=True)
+        else:
+            self.gl_widget.set_event_rules_cache(
+                getattr(self, "_cached_event_rules", []),
+                cache_ts=self._event_rules_cache_ts,
+            )
+
+    def _server_event_rules_active(self) -> bool:
+        return bool(self.motion_watch_active and getattr(self, "_server_event_rules_enabled", False))
+
+    def _enable_server_event_rules(self) -> None:
+        api_base = getattr(self, "API_BASE", "http://localhost:5000/api")
+        try:
+            migrate_motion_watch_settings(api_base, self.camera_id, self.motion_watch_settings or {})
+            shapes = list(getattr(self.gl_widget, "shapes", []) or [])
+            sync_camera_shapes(api_base, self.camera_id, shapes)
+            ensure_backend_detection_for_rules(api_base, self.camera_id, verification_enabled=True)
+            set_rules_enabled(api_base, self.camera_id, True)
+            self._server_event_rules_enabled = True
+            self._refresh_shape_counter_config()
+        except Exception as e:
+            print(f"Event rules enable error for {self.camera_id}: {e}")
+            self._server_event_rules_enabled = False
+
+    def _disable_server_event_rules(self) -> None:
+        if not getattr(self, "_server_event_rules_enabled", False):
+            return
+        api_base = getattr(self, "API_BASE", "http://localhost:5000/api")
+        try:
+            set_rules_enabled(api_base, self.camera_id, False)
+        except Exception:
+            pass
+        self._server_event_rules_enabled = False
+        self._refresh_shape_counter_config(force=True)
+
+    def arm_event_rules(self, remaining_sec: int | None = None):
+        """Enable server rules and arm legacy desktop capture session."""
+        self.start_motion_watch(remaining_sec=remaining_sec, sync_server_rules=True)
+
+    def disarm_event_rules(self, reason: str = "stopped"):
+        self.stop_motion_watch(reason, disable_server_rules=True)
 
     def _overlay_key(self, ids: List[str]) -> str:
         clean = [str(x) for x in (ids or []) if x]
@@ -7998,11 +9326,46 @@ class CameraWidget(BaseDesktopWidget):
         except Exception:
             _go()
 
+    def on_shape_double_clicked(self, shape_id: str):
+        """Double-click on shape: choose Shape Settings or Event Rule / Trigger."""
+        from PySide6.QtGui import QCursor
+
+        self.show_shape_action_menu(shape_id, QCursor.pos())
+
+    def on_shape_added(self, shape_id: str):
+        """After drawing a new shape, offer quick access to settings or triggers."""
+        from PySide6.QtGui import QCursor
+
+        self.show_shape_action_menu(shape_id, QCursor.pos())
+
+    def show_shape_action_menu(self, shape_id: str, global_pos=None):
+        from PySide6.QtGui import QAction, QCursor
+        from PySide6.QtWidgets import QMenu
+
+        target = next((s for s in self.gl_widget.shapes if s.get('id') == shape_id), None)
+        if not target:
+            return
+
+        menu = QMenu(self)
+        label = str(target.get('label') or shape_id)
+        menu.setTitle(label)
+
+        settings_action = QAction("Shape Settings…", self)
+        settings_action.triggered.connect(lambda: self.edit_shape(shape_id))
+        menu.addAction(settings_action)
+
+        trigger_action = QAction("Event Rule / Trigger…", self)
+        trigger_action.triggered.connect(lambda: self.open_shape_trigger_dialog(shape_id))
+        menu.addAction(trigger_action)
+
+        pos = global_pos if global_pos is not None else QCursor.pos()
+        menu.exec(pos)
+
     def edit_shape(self, shape_id: str):
         target = next((s for s in self.gl_widget.shapes if s['id'] == shape_id), None)
         if not target:
             return
-            
+
         dialog = ShapeSettingsDialog(target, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             new_shape = dialog.get_shape()
@@ -8010,6 +9373,231 @@ class CameraWidget(BaseDesktopWidget):
             self.gl_widget.shapes = [new_shape if s['id'] == shape_id else s for s in self.gl_widget.shapes]
             self.gl_widget._emit_shapes()
             self.gl_widget.update()
+
+    def _on_automation_alert(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("type") or "") not in ("rule_triggered", ""):
+            return
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        rule = payload.get("rule") if isinstance(payload.get("rule"), dict) else {}
+        shape_id = str(details.get("shape_id") or "").strip()
+        rule_id = str(rule.get("id") or "").strip()
+        capture = payload.get("capture") if isinstance(payload.get("capture"), dict) else None
+        capture_error = (
+            payload.get("capture_error") if isinstance(payload.get("capture_error"), dict) else None
+        )
+        # Route the server alert through the same coupler used by the local
+        # fallback so the counter increment and screenshot stay de-duplicated.
+        self.rule_side_effects.handle_server_alert(
+            rule_id=rule_id,
+            shape_id=shape_id,
+            capture=capture,
+            capture_error=capture_error,
+            rule_name=str(rule.get("name") or ""),
+        )
+
+    def _capture_thumb_b64_from_payload(self, payload: dict) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+        inline = str(payload.get("thumb_b64") or payload.get("image_b64") or "").strip()
+        if inline:
+            return inline
+        candidates: List[str] = []
+        for key in ("thumb_uri", "file_uri", "file_path", "thumb_path"):
+            raw = str(payload.get(key) or "").strip()
+            if raw:
+                candidates.append(raw)
+        seen: set[str] = set()
+        for raw in candidates:
+            path_str = raw[7:] if raw.startswith("file://") else raw
+            if path_str in seen:
+                continue
+            seen.add(path_str)
+            path = Path(path_str)
+            if path.exists() and path.is_file():
+                try:
+                    return base64.b64encode(path.read_bytes()).decode("utf-8")
+                except Exception:
+                    continue
+        return None
+
+    def _notify_terminal_event_rule_capture(self, payload: dict, *, source: str = "new_capture") -> None:
+        """Show Event Rule snapshot in terminal; dedupe new_capture vs automation_alert."""
+        if not isinstance(payload, dict):
+            return
+        dedupe_key = str(
+            payload.get("event_id")
+            or payload.get("file_path")
+            or payload.get("file_uri")
+            or payload.get("thumb_uri")
+            or ""
+        ).strip()
+        if not dedupe_key:
+            return
+        now = time.time()
+        last_key, last_ts = getattr(self, "_last_terminal_capture", ("", 0.0))
+        if dedupe_key == last_key and (now - float(last_ts)) < 3.0:
+            return
+        self._last_terminal_capture = (dedupe_key, now)
+        try:
+            from core.capture_events import build_motion_watch_terminal_payload
+            from desktop.widgets.terminal import TerminalWidget
+
+            thumb_b64 = self._capture_thumb_b64_from_payload(payload)
+            result = {
+                "file_path": str(payload.get("file_path") or ""),
+                "shape_name": payload.get("shape_name"),
+                "trigger_type": payload.get("trigger_type"),
+                "camera_name": payload.get("camera_name"),
+            }
+            terminal_kwargs = build_motion_watch_terminal_payload(
+                result=result,
+                camera_id=str(self.camera_id),
+                camera_label=self._camera_label(),
+                thumb_b64=thumb_b64,
+            )
+            remaining = self._remaining_watch_seconds() if self.motion_watch_active else None
+            TerminalWidget.broadcast_motion_watch(
+                str(self.camera_id),
+                terminal_kwargs["text"],
+                image_b64=terminal_kwargs.get("image_b64"),
+                link=terminal_kwargs.get("link"),
+                link_label=terminal_kwargs.get("link_label"),
+                remaining_seconds=remaining,
+                camera_label=terminal_kwargs.get("camera_label"),
+                suppress_log=False,
+            )
+        except Exception as e:
+            if bool(getattr(self, "debug_overlay_enabled", False)):
+                print(f"Event rule terminal capture ({source}) error for {self.camera_id}: {e}")
+
+    def _notify_terminal_capture_failure(
+        self,
+        error: dict,
+        *,
+        rule_name: str = "",
+        source: str = "automation_alert",
+    ) -> None:
+        """Show snapshot failure in terminal with a readable reason."""
+        if not isinstance(error, dict):
+            return
+        dedupe_key = f"capture_error:{error.get('reason')}:{error.get('rule_id')}:{self.camera_id}"
+        now = time.time()
+        last_key, last_ts = getattr(self, "_last_terminal_capture_error", ("", 0.0))
+        if dedupe_key == last_key and (now - float(last_ts)) < 3.0:
+            return
+        self._last_terminal_capture_error = (dedupe_key, now)
+        try:
+            from core.capture_events import build_terminal_capture_failure_payload
+            from desktop.widgets.terminal import TerminalWidget
+
+            terminal_kwargs = build_terminal_capture_failure_payload(
+                error=error,
+                camera_id=str(self.camera_id),
+                camera_label=self._camera_label(),
+                rule_name=rule_name or None,
+            )
+            TerminalWidget.broadcast_motion_watch(
+                str(self.camera_id),
+                terminal_kwargs["text"],
+                kind=str(terminal_kwargs.get("kind") or "warning"),
+                camera_label=terminal_kwargs.get("camera_label"),
+                suppress_log=False,
+            )
+        except Exception as e:
+            if bool(getattr(self, "debug_overlay_enabled", False)):
+                print(f"Event rule terminal capture failure ({source}) error for {self.camera_id}: {e}")
+
+    def _on_new_capture(self, payload: dict) -> None:
+        """Show server-side Event Rule snapshots in the terminal (Motion Watch channel)."""
+        if not isinstance(payload, dict):
+            return
+        camera_id = str(payload.get("camera_id") or "").strip()
+        if camera_id and camera_id != str(self.camera_id):
+            return
+        self._notify_terminal_event_rule_capture(payload, source="new_capture")
+
+    def open_shape_trigger_dialog(self, shape_id: str, existing_rule: Optional[dict] = None):
+        """Open compact shape-bound trigger editor (non-modal; draw path on live camera)."""
+        target = next((s for s in self.gl_widget.shapes if s.get('id') == shape_id), None)
+        if not target:
+            return
+        api_base = getattr(self, "API_BASE", "http://localhost:5000/api")
+        dialog_key = shape_trigger_dialog_key(shape_id, existing_rule)
+
+        existing_dlg = self._shape_trigger_dialogs.get(dialog_key)
+        if existing_dlg is not None:
+            try:
+                if existing_dlg.isVisible():
+                    existing_dlg.raise_()
+                    existing_dlg.activateWindow()
+                    return
+            except RuntimeError:
+                self._shape_trigger_dialogs.pop(dialog_key, None)
+
+        def _on_preview_changed(state: Optional[dict]) -> None:
+            self.gl_widget.set_trigger_preview(state)
+
+        def _on_shape_updated(shape: dict) -> None:
+            sid = shape.get("id")
+            self.gl_widget.shapes = [
+                shape if s.get("id") == sid else s for s in self.gl_widget.shapes
+            ]
+            self.gl_widget._emit_shapes()
+            self.gl_widget.update()
+
+        dlg_holder: Dict[str, object] = {}
+
+        def _on_path_draw_control(action: str, path: list) -> None:
+            dialog = dlg_holder.get("dialog")
+            if action == "start":
+                self.gl_widget.start_path_draw_mode(
+                    on_path_changed=lambda p: dialog.set_motion_path_from_camera(p) if dialog else None,
+                    on_pill_anchor_changed=lambda a: dialog.set_pill_anchor_from_camera(a) if dialog else None,
+                    initial_path=path,
+                )
+            elif action in ("stop", "clear"):
+                self.gl_widget.stop_path_draw_mode()
+                if action == "clear" and dialog:
+                    dialog.set_motion_path_from_camera([])
+
+        def _on_pill_move_control(action: str) -> None:
+            dialog = dlg_holder.get("dialog")
+            if action == "start":
+                self.gl_widget.start_pill_anchor_move_mode(
+                    on_pill_anchor_changed=lambda a: dialog.set_pill_anchor_from_camera(a) if dialog else None,
+                )
+            elif action == "stop":
+                self.gl_widget.stop_pill_anchor_move_mode()
+
+        dlg = ShapeTriggerDialog(
+            camera_id=self.camera_id,
+            shape=target,
+            api_base=api_base,
+            existing_rule=existing_rule,
+            on_preview_changed=_on_preview_changed,
+            on_shape_updated=_on_shape_updated,
+            on_path_draw_control=_on_path_draw_control,
+            on_pill_move_control=_on_pill_move_control,
+            parent=self,
+        )
+        dlg_holder["dialog"] = dlg
+        self._shape_trigger_dialogs[dialog_key] = dlg
+
+        def _on_finished(_result: int) -> None:
+            self.gl_widget.stop_path_draw_mode()
+            self.gl_widget.stop_pill_anchor_move_mode()
+            self.gl_widget.set_trigger_preview(None)
+            if _result == QDialog.DialogCode.Accepted and dlg.should_arm():
+                self.arm_event_rules()
+            self._refresh_shape_counter_config(force=True)
+            if self._shape_trigger_dialogs.get(dialog_key) is dlg:
+                self._shape_trigger_dialogs.pop(dialog_key, None)
+
+        dlg.finished.connect(_on_finished)
+        dlg.show()
+        dlg.raise_()
 
     def toggle_aspect_ratio(self, checked):
         self.aspect_ratio_locked = checked
@@ -8094,6 +9682,7 @@ class CameraWidget(BaseDesktopWidget):
             # Shallow copies to avoid mutating live state
             shapes = [dict(s) for s in (gl.shapes or [])]
             motion_boxes = list(gl.motion_boxes or [])
+            raw_motion_boxes = list(getattr(gl, "raw_motion_boxes", None) or [])
             tracked_objects = []
             for obj in (gl.tracked_objects or {}).values():
                 tracked_objects.append({
@@ -8109,6 +9698,8 @@ class CameraWidget(BaseDesktopWidget):
                 'selected_shapes': list(gl.selected_shapes or []),
                 'show_shape_labels': bool(gl.show_shape_labels),
                 'motion_boxes': motion_boxes,
+                'raw_motion_boxes': raw_motion_boxes,
+                'motion_global_illumination': bool(getattr(gl, "_motion_global_illumination", False)),
                 'tracked_objects': tracked_objects,
                 'motion_hit_pulses': list(gl.motion_hit_pulses or []),
                 'zone_pulses': dict(gl.zone_pulses or {}),
@@ -8122,21 +9713,216 @@ class CameraWidget(BaseDesktopWidget):
             return None
 
     def _on_shapes_changed(self, shapes: List[Shape]):
-        """Persist latest shapes and keep OpenGL widget in sync."""
+        """Persist latest shapes locally and sync to server for TrackSceneEngine."""
         self.shapes_by_camera[self.camera_id] = shapes
-        # Shapes already applied inside widget; nothing else yet but reserved for persistence hooks.
+        api_base = getattr(self, "API_BASE", "http://localhost:5000/api")
+        try:
+            sync_camera_shapes(api_base, self.camera_id, list(shapes or []))
+        except Exception:
+            pass
+
+    def _shape_uses_local_motion_counter(self, shape_id: str) -> bool:
+        """True when a counter pill on this shape uses Motion mode (desktop motion can count)."""
+        sid = str(shape_id or "").strip()
+        if not sid:
+            return False
+        if not bool(getattr(self.gl_widget, "show_motion", False)):
+            return False
+        for cfg in self.gl_widget.counter_pill_configs:
+            if str(cfg.get("shape_id") or "") == sid and cfg.get("require_detection") is False:
+                return True
+        return False
+
+    def _shape_dict_for_id(self, shape_id: str) -> Optional[Dict[str, object]]:
+        sid = str(shape_id or "").strip()
+        if not sid:
+            return None
+        for sh in self.gl_widget.shapes or []:
+            if str(sh.get("id") or "") == sid:
+                return dict(sh)
+        return None
+
+    def _local_counter_rule_matches_event(
+        self,
+        cfg: Dict[str, object],
+        ev: dict,
+    ) -> bool:
+        cond = cfg.get("conditions") if isinstance(cfg.get("conditions"), dict) else {}
+        if not cond and isinstance(cfg.get("motion_path"), list):
+            cond = {
+                "motion_path": cfg.get("motion_path"),
+                "motion_path_space": cfg.get("motion_path_space"),
+                "path_direction_gate": cfg.get("path_direction_gate"),
+                "any_interaction": cfg.get("any_interaction"),
+            }
+        shape = self._shape_dict_for_id(str(cfg.get("shape_id") or ev.get("shape_id") or ""))
+        return local_motion_matches_counter_rule(
+            point=ev.get("point") if isinstance(ev.get("point"), dict) else {},
+            centroid_history=ev.get("centroid_history") if isinstance(ev.get("centroid_history"), list) else [],
+            conditions=cond,
+            shape=shape,
+            trigger=str(cfg.get("trigger") or ""),
+        )
+
+    def _rule_by_id(self, rule_id: str) -> Optional[Dict[str, object]]:
+        """Resolve a cached event rule (with its actions) by id."""
+        rid = str(rule_id or "").strip()
+        if not rid:
+            return None
+        for rule in (getattr(self, "_cached_event_rules", None) or []):
+            if isinstance(rule, dict) and str(rule.get("id") or "") == rid:
+                return rule
+        return None
+
+    @property
+    def rule_side_effects(self) -> RuleTriggerSideEffects:
+        """Shared coupler so every counter increment also drives screenshots.
+
+        Built lazily because ``CameraWidget.__init__`` is large and the wired
+        callbacks are bound methods that must already exist on the instance.
+        """
+        dispatcher = getattr(self, "_rule_side_effects_obj", None)
+        if dispatcher is None:
+            dispatcher = RuleTriggerSideEffects(
+                increment_counter=self.gl_widget.notify_shape_rule_triggered,
+                dispatch_local_screenshot=self._dispatch_local_rule_screenshot,
+                notify_terminal_capture=(
+                    lambda capture, rule_id: self._notify_terminal_event_rule_capture(
+                        capture, source="automation_alert"
+                    )
+                ),
+                notify_terminal_failure=(
+                    lambda error, rule_name="": self._notify_terminal_capture_failure(
+                        error, rule_name=rule_name, source="automation_alert"
+                    )
+                ),
+                rule_lookup=self._rule_by_id,
+            )
+            self._rule_side_effects_obj = dispatcher
+        return dispatcher
+
+    def _handle_rule_trigger_side_effects(
+        self,
+        rule_id: str,
+        shape_id: str,
+        event_ctx: Optional[dict] = None,
+    ) -> None:
+        """Single entry the local counter path uses to couple counter + screenshot."""
+        try:
+            self.rule_side_effects.handle_local_trigger(rule_id, shape_id, event_ctx)
+        except Exception as e:
+            if bool(getattr(self, "debug_overlay_enabled", False)):
+                print(f"Rule trigger side-effects error for {self.camera_id}: {e}")
+
+    def _dispatch_local_rule_screenshot(
+        self,
+        rule_id: str,
+        shape_id: str,
+        event_ctx: Optional[dict] = None,
+    ) -> bool:
+        """Capture and show a screenshot for a locally-counted rule trigger.
+
+        Returns ``True`` when a capture was dispatched.  Returns ``False`` (so the
+        caller can surface a terminal warning) when no frame is available.
+        """
+        if not self.motion_watch_active:
+            return False
+        trigger_jpg = getattr(self.gl_widget, "_mw_trigger_jpg", None)
+        jpg = trigger_jpg
+        if jpg is None:
+            try:
+                jpg = self._pick_snapshot_jpg(time.monotonic(), 0)
+            except Exception:
+                jpg = None
+        frame_available = bool(jpg)
+        if not frame_available:
+            try:
+                img = getattr(self.gl_widget, "image", None)
+                frame_available = bool(img is not None and not img.isNull())
+            except Exception:
+                frame_available = False
+        if not frame_available:
+            return False
+
+        motion_box = None
+        try:
+            pulses = (
+                getattr(self.gl_widget, "detection_hit_pulses", None)
+                or getattr(self.gl_widget, "motion_hit_pulses", None)
+            )
+            if pulses:
+                motion_box = pulses[-1].get("box")
+        except Exception:
+            motion_box = None
+
+        overlay_snapshot = None
+        if bool(self.motion_watch_settings.get("include_overlays", True)):
+            try:
+                overlay_snapshot = self.get_overlay_snapshot()
+            except Exception:
+                overlay_snapshot = None
+
+        snap_ev = dict(event_ctx) if isinstance(event_ctx, dict) else {}
+        snap_ev.setdefault("shape_id", shape_id)
+        snap_ev.setdefault("rule_id", rule_id)
+        snap_ev.setdefault("interaction_type", "event_rule")
+
+        try:
+            self._capture_motion_watch_shot_async(
+                motion_box=motion_box,
+                trigger_events=[snap_ev],
+                trigger_source="event_rule_local",
+                remaining_seconds=self._remaining_watch_seconds(),
+                pre_encoded_jpg=jpg,
+                trigger_mono=time.monotonic(),
+                overlay_snapshot=overlay_snapshot,
+            )
+            return True
+        except Exception as e:
+            if bool(getattr(self, "debug_overlay_enabled", False)):
+                print(f"Local rule screenshot dispatch error for {self.camera_id}: {e}")
+            return False
 
     def _on_shape_triggered(self, payload: dict):
         """Receive motion-shape interactions from GL widget."""
         events = (payload or {}).get('events') or []
         src = (payload or {}).get("source") or None
+        # Zone/line counters follow server rule triggers (automation_alert) for Detection-mode
+        # rules when armed. Motion-mode rules and tags may also increment from local motion.
+        counter_events = list(events)
+        if self.motion_watch_active and self._server_event_rules_active():
+            counter_events = [
+                ev for ev in counter_events
+                if isinstance(ev, dict) and (
+                    str(ev.get("shape_type") or "") == "tag"
+                    or self._shape_uses_local_motion_counter(str(ev.get("shape_id") or ""))
+                )
+            ]
+        if counter_events:
+            for ev in counter_events:
+                sid = str(ev.get("shape_id") or "").strip()
+                if not sid:
+                    continue
+                for cfg in self.gl_widget.counter_pill_configs:
+                    if str(cfg.get("shape_id") or "") != sid:
+                        continue
+                    rid = str(cfg.get("rule_id") or "")
+                    if rid and self._local_counter_rule_matches_event(cfg, ev):
+                        self._handle_rule_trigger_side_effects(rid, sid, ev)
         if self.motion_watch_active and events:
             allowed = {
                 'zone': bool(self.motion_watch_settings.get("allow_zone", True)),
                 'line': bool(self.motion_watch_settings.get("allow_line", True)),
                 'tag': bool(self.motion_watch_settings.get("allow_tag", True)),
             }
-            if any(allowed.get(ev.get("shape_type"), False) for ev in events):
+            snapshot_events = filter_desktop_capture_events(
+                events,
+                motion_watch_active=self.motion_watch_active,
+                server_event_rules_active=self._server_event_rules_active(),
+            )
+            if snapshot_events and any(
+                allowed.get(ev.get("shape_type"), False) for ev in snapshot_events
+            ):
                 now = time.time()
                 cooldown = self._motion_watch_cooldown_seconds()
                 if now - self.motion_watch_last_trigger >= cooldown:
@@ -8168,7 +9954,7 @@ class CameraWidget(BaseDesktopWidget):
 
                     capture_kwargs = {
                         "motion_box": motion_box,
-                        "trigger_events": events,
+                        "trigger_events": snapshot_events,
                         "trigger_source": src,
                         "remaining_seconds": self._remaining_watch_seconds(),
                         "trigger_mono": trigger_mono,
@@ -8176,6 +9962,8 @@ class CameraWidget(BaseDesktopWidget):
                     }
 
                     def do_capture():
+                        if not self.motion_watch_active:
+                            return
                         jpg = None
                         if total_offset_ms <= 0 and trigger_jpg:
                             jpg = trigger_jpg
@@ -8193,15 +9981,16 @@ class CameraWidget(BaseDesktopWidget):
                     else:
                         QTimer.singleShot(0, do_capture)
 
-                    # Trigger clip recording if enabled (independent of screenshot cooldown)
-                    if self.motion_watch_settings.get("clip_enabled"):
-                        try:
-                            self._start_clip_recording(
-                                trigger_events=events,
-                                trigger_source=src,
-                            )
-                        except Exception:
-                            pass
+            # Clip recording is not duplicated server-side; honor all allowed shape types.
+            if any(allowed.get(ev.get("shape_type"), False) for ev in events):
+                if self.motion_watch_settings.get("clip_enabled"):
+                    try:
+                        self._start_clip_recording(
+                            trigger_events=events,
+                            trigger_source=src,
+                        )
+                    except Exception:
+                        pass
         try:
             print(f"[{self.camera_id}] shape interaction: {payload}")
         except Exception:
@@ -8273,11 +10062,11 @@ class CameraWidget(BaseDesktopWidget):
                         # Migrate legacy second-based cooldown to milliseconds.
                         if "cooldown_ms" not in saved and "cooldown_sec" in saved:
                             try:
-                                self.motion_watch_settings["cooldown_ms"] = int(
-                                    float(saved.get("cooldown_sec", 3) or 3) * 1000
+                                self.motion_watch_settings["cooldown_ms"] = cooldown_ms_from_sec(
+                                    float(saved.get("cooldown_sec", DEFAULT_RULE_COOLDOWN_SEC) or DEFAULT_RULE_COOLDOWN_SEC)
                                 )
                             except Exception:
-                                self.motion_watch_settings["cooldown_ms"] = 3000
+                                self.motion_watch_settings["cooldown_ms"] = DEFAULT_RULE_COOLDOWN_MS
         except Exception as e:
             print(f"Motion watch settings load error for {self.camera_id}: {e}")
 
@@ -8759,13 +10548,17 @@ class CameraWidget(BaseDesktopWidget):
         except Exception as e:
             print(f"Motion watch terminal spawn error: {e}")
 
-    def start_motion_watch(self, remaining_sec: int | None = None):
+    def start_motion_watch(self, remaining_sec: int | None = None, *, sync_server_rules: bool = True):
         """Arm motion watch for the configured duration.
 
         Args:
             remaining_sec: When set, arm for this many seconds instead of reading
                 duration_sec from settings (used when restoring layout snapshots).
+            sync_server_rules: When True (default), migrate settings and enable server
+                Event Rules so track-based triggers are evaluated server-side.
         """
+        if sync_server_rules:
+            self._enable_server_event_rules()
         if remaining_sec is not None:
             duration = int(remaining_sec)
         else:
@@ -8789,14 +10582,16 @@ class CameraWidget(BaseDesktopWidget):
             self.motion_watch_timer.start(1000)
         self._ensure_motion_watch_stream_recovery()
         self._post_motion_watch_to_terminal(
-            "Motion watch armed",
+            "Event Rules armed",
             countdown=duration if duration >= 0 else None,
             remaining_seconds=duration if duration >= 0 else None,
         )
 
-    def stop_motion_watch(self, reason: str = "stopped"):
+    def stop_motion_watch(self, reason: str = "stopped", *, disable_server_rules: bool = True):
         if not self.motion_watch_active:
             return
+        if disable_server_rules:
+            self._disable_server_event_rules()
         self.motion_watch_active = False
         self.motion_watch_timer.stop()
         self._stop_motion_watch_stream_recovery()
@@ -8805,7 +10600,7 @@ class CameraWidget(BaseDesktopWidget):
                 self._motion_watch_snapshot_ring.clear()
         except Exception:
             pass
-        self._post_motion_watch_to_terminal(f"Motion watch {reason}", stopped=True)
+        self._post_motion_watch_to_terminal(f"Event Rules {reason}", stopped=True)
 
     def _remaining_watch_seconds(self) -> Optional[int]:
         if not self.motion_watch_active:
@@ -8904,7 +10699,7 @@ class CameraWidget(BaseDesktopWidget):
         settings = self.motion_watch_settings or {}
         ms = settings.get("cooldown_ms")
         if ms is None:
-            ms = int(float(settings.get("cooldown_sec", 3) or 3) * 1000)
+            ms = cooldown_ms_from_sec(float(settings.get("cooldown_sec", DEFAULT_RULE_COOLDOWN_SEC) or DEFAULT_RULE_COOLDOWN_SEC))
         try:
             return max(0.0, float(ms) / 1000.0)
         except Exception:
@@ -8986,6 +10781,8 @@ class CameraWidget(BaseDesktopWidget):
         When pre_encoded_jpg is supplied (trigger-aligned frame from the snapshot ring or
         trigger-time encode), the UI thread avoids copying the live GL framebuffer.
         """
+        if not self.motion_watch_active:
+            return
         capture_request = {
             "motion_box": motion_box,
             "trigger_events": trigger_events,
@@ -9756,6 +11553,24 @@ class CameraWidget(BaseDesktopWidget):
         if app and hasattr(app, 'toggle_patrol'):
             app.toggle_patrol()
 
+    def _request_save_camera_profile(self):
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app and hasattr(app, 'prompt_save_camera_profile_for_widget'):
+            app.prompt_save_camera_profile_for_widget(self)
+
+    def _request_apply_camera_profile(self):
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app and hasattr(app, 'prompt_apply_camera_profile_for_widget'):
+            app.prompt_apply_camera_profile_for_widget(self)
+
+    def _request_copy_settings_from(self):
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app and hasattr(app, 'prompt_copy_settings_from_camera'):
+            app.prompt_copy_settings_from_camera(self)
+
     def _patrol_toggle_camera(self, camera_id: str, include: bool):
         """Add or remove a camera from the persisted patrol order."""
         from PySide6.QtWidgets import QApplication
@@ -9911,8 +11726,8 @@ class CameraWidget(BaseDesktopWidget):
     # Modifiers:
     #   M (motion):    arrows=size,  1-7=style,  C=color,  N=animation,  Z/X=thickness
     #   D (detection): arrows=tune,  1-7=style,  C=color,  N=animation,  Z/X=thickness
-    _MOTION_STYLES = ['Box', 'Fill', 'Corners', 'Circle', 'Bracket', 'Underline', 'Crosshair']
-    _MOTION_ANIMATIONS = ['None', 'Pulse', 'Flash', 'Glitch', 'Rainbow']
+    _MOTION_STYLES = MOTION_STYLE_QUICK_PICK
+    _MOTION_ANIMATIONS = all_motion_animations()
     _DETECTION_ANIMATIONS = ['None', 'Pulse', 'Flash', 'Glitch', 'Rainbow', 'Glow']
     # (label, QColor) pairs.  Kept short enough to memorize; visually
     # distinct so cycling through them on a busy frame is obvious.
@@ -9976,8 +11791,8 @@ class CameraWidget(BaseDesktopWidget):
             "MOTION quick-adjust  (release M to keep)\n"
             "  Left/Right  =  Sensitivity\n"
             "  Up/Down     =  Merge size\n"
-            "  1..7        =  Style (Box, Fill, Corners, Circle,\n"
-            "                       Bracket, Underline, Crosshair)\n"
+            "  1..7        =  Quick style (Box, Corners, HUD,\n"
+            "                       Reticle, Neon, Eyes, Threat)\n"
             "  C           =  Cycle color\n"
             "  N           =  Cycle animation\n"
             "  Z / X       =  Thickness  -/+"
@@ -10492,7 +12307,7 @@ class CameraWidget(BaseDesktopWidget):
         motion overlay so the change is visible immediately."""
         try:
             settings = dict(self.gl_widget.motion_settings or {})
-            settings['style'] = str(style)
+            settings['style'] = normalize_motion_style(str(style))
             self.gl_widget.motion_settings = settings
             if not bool(self.motion_boxes_enabled):
                 try:
@@ -10949,6 +12764,11 @@ class CameraWidget(BaseDesktopWidget):
             motion_action = QAction("Show Motion Boxes\tM", self)
             motion_action.setCheckable(True)
             motion_action.setChecked(self.motion_boxes_enabled)
+            motion_action.setToolTip(
+                "Visualization only: draws desktop frame-diff motion boxes on the live feed. "
+                "Does not enable detection. Motion-mode Event Rules use backend MOG2 motion "
+                "tracks server-side; turn this on to preview what motion looks like locally."
+            )
             motion_action.triggered.connect(self.toggle_motion)
             motion_menu.addAction(motion_action)
 
@@ -10956,14 +12776,35 @@ class CameraWidget(BaseDesktopWidget):
             motion_settings_action.triggered.connect(self.open_motion_settings)
             motion_menu.addAction(motion_settings_action)
 
-            motion_watch_action = QAction("📸 Motion Watch...", self)
-            motion_watch_action.triggered.connect(self.open_motion_watch_dialog)
-            motion_menu.addAction(motion_watch_action)
+            event_rules_action = QAction("📋 Event Rules...", self)
+            event_rules_action.triggered.connect(self.open_event_rules_dialog)
+            motion_menu.addAction(event_rules_action)
+
+            capture_settings_action = QAction("⚙️ Capture Settings (Advanced)...", self)
+            capture_settings_action.triggered.connect(self.open_motion_watch_settings_dialog)
+            motion_menu.addAction(capture_settings_action)
+
+            motion_menu.addSeparator()
+
+            profile_menu = motion_menu.addMenu("Camera Profile")
+            save_profile_action = QAction("Save Camera Profile…", self)
+            save_profile_action.triggered.connect(self._request_save_camera_profile)
+            profile_menu.addAction(save_profile_action)
+            apply_profile_action = QAction("Apply Camera Profile…", self)
+            apply_profile_action.triggered.connect(self._request_apply_camera_profile)
+            profile_menu.addAction(apply_profile_action)
+            copy_profile_action = QAction("Copy Settings From…", self)
+            copy_profile_action.triggered.connect(self._request_copy_settings_from)
+            profile_menu.addAction(copy_profile_action)
 
             if self.motion_watch_active:
-                stop_watch_action = QAction("⏹ Stop Motion Watch", self)
-                stop_watch_action.triggered.connect(lambda: self.stop_motion_watch("stopped"))
+                stop_watch_action = QAction("⏹ Stop Event Rules", self)
+                stop_watch_action.triggered.connect(lambda: self.disarm_event_rules("stopped"))
                 motion_menu.addAction(stop_watch_action)
+            else:
+                arm_action = QAction("▶ Arm Event Rules", self)
+                arm_action.triggered.connect(lambda: self.arm_event_rules())
+                motion_menu.addAction(arm_action)
 
             # ── Audio ──
             audio_menu = menu.addMenu("🎵 Audio")
@@ -10995,6 +12836,10 @@ class CameraWidget(BaseDesktopWidget):
                 edit_action = QAction("✏️ Edit Shape", self)
                 edit_action.triggered.connect(lambda: self.edit_shape(sel_id))
                 shapes_menu.addAction(edit_action)
+
+                trigger_action = QAction("⚡ Event Rule / Trigger…", self)
+                trigger_action.triggered.connect(lambda: self.open_shape_trigger_dialog(sel_id))
+                shapes_menu.addAction(trigger_action)
 
                 def _projection_label():
                     sid = sel_ids[0] if sel_ids else ""

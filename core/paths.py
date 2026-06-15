@@ -93,6 +93,22 @@ def get_motion_watch_zone_dir(zone_name: str) -> Path:
     return d
 
 
+def get_event_rules_scripts_dir() -> Path:
+    """
+    Default directory for Event Rule script actions (absolute).
+
+    Allows override via KNOXNET_EVENT_RULES_SCRIPT_DIR.
+    """
+    env = (os.environ.get("KNOXNET_EVENT_RULES_SCRIPT_DIR") or "").strip()
+    if env:
+        try:
+            p = Path(env).expanduser()
+            return p.resolve() if p.is_absolute() else (get_project_root() / p).resolve()
+        except Exception:
+            pass
+    return (get_project_root() / "scripts" / "event_rules").resolve()
+
+
 def get_recordings_dir() -> Path:
     """
     Return the continuous-recording storage directory (absolute).

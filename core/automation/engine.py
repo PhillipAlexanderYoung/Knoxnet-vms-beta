@@ -27,6 +27,9 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+# Anti-spam floor when a track-event rule omits cooldown (cooldown_sec <= 0).
+_TRACK_EVENT_DEFAULT_COOLDOWN_SEC = 2.0
+
 
 @dataclass
 class AutomationEvent:
@@ -126,27 +129,43 @@ class AutomationEngine:
     def _get_shape_by_id(self, camera_id: str, shape_id: str) -> Optional[Dict[str, Any]]:
         if not shape_id:
             return None
+
+        def _scan(rec: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            if not rec or not isinstance(rec, dict):
+                return None
+            for z in rec.get("zones", []) or []:
+                if isinstance(z, dict) and str(z.get("id")) == str(shape_id):
+                    out = dict(z)
+                    out.setdefault("kind", "zone")
+                    if "pts" not in out and out.get("points"):
+                        out["pts"] = list(out.get("points") or [])
+                    return out
+            for l in rec.get("lines", []) or []:
+                if isinstance(l, dict) and str(l.get("id")) == str(shape_id):
+                    out = dict(l)
+                    out.setdefault("kind", "line")
+                    return out
+            for t in rec.get("tags", []) or []:
+                if isinstance(t, dict) and str(t.get("id")) == str(shape_id):
+                    out = dict(t)
+                    out.setdefault("kind", "tag")
+                    return out
+            return None
+
         try:
             if self.db_manager and hasattr(self.db_manager, "get_camera_shapes"):
-                rec = self.db_manager.get_camera_shapes(camera_id)
-                if rec and isinstance(rec, dict):
-                    for z in rec.get("zones", []) or []:
-                        if isinstance(z, dict) and str(z.get("id")) == str(shape_id):
-                            out = dict(z)
-                            out.setdefault("kind", "zone")
-                            return out
-                    for l in rec.get("lines", []) or []:
-                        if isinstance(l, dict) and str(l.get("id")) == str(shape_id):
-                            out = dict(l)
-                            out.setdefault("kind", "line")
-                            return out
-                    for t in rec.get("tags", []) or []:
-                        if isinstance(t, dict) and str(t.get("id")) == str(shape_id):
-                            out = dict(t)
-                            out.setdefault("kind", "tag")
-                            return out
+                found = _scan(self.db_manager.get_camera_shapes(camera_id))
+                if found is not None:
+                    return found
         except Exception:
-            return None
+            pass
+        try:
+            if self.stream_server is not None and hasattr(self.stream_server, "get_camera_shapes"):
+                found = _scan(self.stream_server.get_camera_shapes(camera_id))
+                if found is not None:
+                    return found
+        except Exception:
+            pass
         return None
 
     def _worker(self) -> None:
@@ -179,35 +198,82 @@ class AutomationEngine:
                 if not rule_id:
                     continue
 
-                # Cooldown
-                cooldown = 0.0
                 conditions = rule.get("conditions") if isinstance(rule.get("conditions"), dict) else {}
                 try:
                     cooldown = float(conditions.get("cooldown_sec", conditions.get("cooldown", 0)) or 0)
                 except Exception:
                     cooldown = 0.0
-                if self.state.is_in_cooldown(rule_id=rule_id, camera_id=evt.camera_id, cooldown_sec=cooldown):
+
+                track_id = None
+                if evt.kind == "track_event":
+                    try:
+                        track_id = int((evt.payload or {}).get("track_id"))
+                    except Exception:
+                        track_id = None
+                    per_track = conditions.get("cooldown_per_track", True)
+                    effective_cooldown = (
+                        float(cooldown) if cooldown > 0 else _TRACK_EVENT_DEFAULT_COOLDOWN_SEC
+                    )
+                    if per_track is not False and track_id is not None:
+                        if self.state.is_in_track_cooldown(
+                            rule_id=rule_id,
+                            camera_id=evt.camera_id,
+                            track_id=track_id,
+                            cooldown_sec=effective_cooldown,
+                        ):
+                            continue
+                    elif self.state.is_in_cooldown(
+                        rule_id=rule_id, camera_id=evt.camera_id, cooldown_sec=effective_cooldown
+                    ):
+                        continue
+                elif self.state.is_in_cooldown(rule_id=rule_id, camera_id=evt.camera_id, cooldown_sec=cooldown):
                     continue
 
-                # Optional shape constraint
+                # Optional shape constraint (legacy frame rules only)
                 shape = None
-                shape_id = rule.get("shape_id")
-                if shape_id:
-                    shape = self._get_shape_by_id(evt.camera_id, str(shape_id))
-                    if shape is None:
-                        # shape not found -> treat as non-match (avoids silent false triggers)
-                        continue
+                if evt.kind != "track_event":
+                    shape_id = rule.get("shape_id")
+                    if shape_id:
+                        shape = self._get_shape_by_id(evt.camera_id, str(shape_id))
+                        if shape is None:
+                            # shape not found -> treat as non-match (avoids silent false triggers)
+                            continue
+                else:
+                    shape_id = rule.get("shape_id") or conditions.get("shape_id")
+                    if shape_id:
+                        shape = self._get_shape_by_id(evt.camera_id, str(shape_id))
 
                 ok, details = matches_rule(rule=rule, ctx=ctx, shape=shape)
                 if not ok:
+                    reason = str(details.get("reason") or "no_match")
+                    logger.debug(
+                        "Rule skipped camera=%s rule=%s kind=%s reason=%s details=%s",
+                        evt.camera_id,
+                        rule_id,
+                        evt.kind,
+                        reason,
+                        details,
+                    )
                     continue
 
-                # Best-effort dedupe
-                signature = f"{evt.kind}:{rule_id}:{details.get('filtered_object_count',0)}:{shape_id or ''}"
-                if self.state.is_duplicate(rule_id=rule_id, camera_id=evt.camera_id, signature=signature, window_sec=2.0):
+                # Best-effort dedupe (longer window for semantic track events)
+                signature = (
+                    f"{evt.kind}:{rule_id}:{details.get('track_id', details.get('filtered_object_count', 0))}:"
+                    f"{shape_id or ''}:{details.get('event_type', '')}"
+                )
+                if evt.kind == "track_event":
+                    dedupe_window = float(cooldown) if cooldown > 0 else _TRACK_EVENT_DEFAULT_COOLDOWN_SEC
+                else:
+                    dedupe_window = 2.0
+                if self.state.is_duplicate(
+                    rule_id=rule_id,
+                    camera_id=evt.camera_id,
+                    signature=signature,
+                    window_sec=dedupe_window,
+                ):
                     continue
 
-                self.state.mark_triggered(rule_id=rule_id, camera_id=evt.camera_id)
+                self.state.mark_triggered(rule_id=rule_id, camera_id=evt.camera_id, track_id=track_id)
 
                 self._on_rule_triggered(rule, details, evt, ctx)
             except Exception:
@@ -344,6 +410,52 @@ class AutomationEngine:
         except Exception as e:
             logger.debug("Failed to persist automation bundle: %s", e)
 
+        # Run actions before realtime UI emission so snapshot results can ride along.
+        capture_result: Optional[Dict[str, Any]] = None
+        capture_error: Optional[Dict[str, Any]] = None
+        snapshot_action_requested = any(
+            isinstance(a, dict) and str(a.get("type") or "").strip().lower() == "snapshot"
+            for a in (rule.get("actions") if isinstance(rule.get("actions"), list) else [])
+        )
+        actions = rule.get("actions") if isinstance(rule.get("actions"), list) else []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_type = str(action.get("type") or "").strip().lower()
+            if not action_type:
+                continue
+
+            handler = self.action_handlers.get(action_type)
+            if not handler:
+                logger.warning(
+                    "No action handler registered for type=%s rule=%s camera=%s",
+                    action_type,
+                    rule_id,
+                    evt.camera_id,
+                )
+                continue
+
+            if self.dry_run:
+                logger.info("Dry-run: would execute action=%s for rule=%s camera=%s", action_type, rule_id, evt.camera_id)
+                continue
+            try:
+                result = handler(rule=rule, ctx=ctx, details=details, action=action, event=evt)
+                if action_type == "snapshot" and isinstance(result, dict):
+                    if result.get("capture_failed"):
+                        capture_error = result
+                    elif str(result.get("file_path") or "").strip():
+                        capture_result = result
+            except Exception as e:
+                logger.warning("Action handler failed type=%s rule=%s: %s", action_type, rule_id, e)
+                if action_type == "snapshot":
+                    capture_error = {
+                        "capture_failed": True,
+                        "reason": "handler_exception",
+                        "detail": str(e),
+                        "camera_id": str(evt.camera_id),
+                        "rule_id": rule_id,
+                    }
+
         # Optional realtime emission for UI/desktop (observability will formalize this later)
         try:
             if self.socketio is not None:
@@ -363,32 +475,38 @@ class AutomationEngine:
                     "details": details,
                     "bundle_id": bundle_id,
                 }
+                if capture_result is not None:
+                    try:
+                        from core.capture_events import build_new_capture_payload
+
+                        payload["capture"] = build_new_capture_payload(
+                            capture_result,
+                            camera_id=str(evt.camera_id),
+                        )
+                    except Exception:
+                        payload["capture"] = dict(capture_result)
+                elif capture_error is not None:
+                    payload["capture_error"] = dict(capture_error)
+                elif snapshot_action_requested:
+                    payload["capture_error"] = {
+                        "capture_failed": True,
+                        "reason": "snapshot_not_executed",
+                        "camera_id": str(evt.camera_id),
+                        "rule_id": rule_id,
+                    }
                 try:
                     self.socketio.emit("automation_alert", payload, room=f"camera:{evt.camera_id}")
                 except Exception:
                     self.socketio.emit("automation_alert", payload)
+                try:
+                    self.socketio.emit(
+                        "automation_alert",
+                        payload,
+                        namespace="/realtime",
+                        room=f"camera:{evt.camera_id}",
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
-
-        # Run actions
-        actions = rule.get("actions") if isinstance(rule.get("actions"), list) else []
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-            action_type = str(action.get("type") or "").strip().lower()
-            if not action_type:
-                continue
-
-            handler = self.action_handlers.get(action_type)
-            if not handler:
-                continue
-
-            if self.dry_run:
-                logger.info("Dry-run: would execute action=%s for rule=%s camera=%s", action_type, rule_id, evt.camera_id)
-                continue
-            try:
-                handler(rule=rule, ctx=ctx, details=details, action=action, event=evt)
-            except Exception as e:
-                logger.warning("Action handler failed type=%s rule=%s: %s", action_type, rule_id, e)
-
 
