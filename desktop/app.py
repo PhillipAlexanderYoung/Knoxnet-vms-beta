@@ -4884,15 +4884,16 @@ class KnoxnetDesktopApp(QApplication):
                 )
                 rewritten = rewrite_rules_for_camera(event_rules, cam_id, id_map)
                 replace_camera_rules(api_base, cam_id, rewritten, delete_existing=True)
-                try:
-                    if hasattr(widget, "_refresh_shape_counter_config"):
-                        widget._refresh_shape_counter_config(force=True)
-                except Exception:
-                    pass
 
             backend_detection = settings.get("backend_detection")
             if isinstance(backend_detection, dict) and backend_detection:
                 apply_backend_detection_config(api_base, cam_id, backend_detection)
+
+            try:
+                if hasattr(widget, "_refresh_shape_counter_config"):
+                    widget._refresh_shape_counter_config(force=True)
+            except Exception:
+                pass
         except Exception as e:
             logger.warning("Failed to restore camera server state for %s: %s", cam_id, e)
 
@@ -6520,6 +6521,8 @@ class KnoxnetDesktopApp(QApplication):
                 try:
                     if entry.type == "camera":
                         self._restore_motion_watch_from_layout(w, entry.view or {})
+                        if hasattr(w, "_refresh_shape_counter_config"):
+                            w._refresh_shape_counter_config(force=True)
                 except Exception:
                     pass
                 created_widgets.append(w)

@@ -643,6 +643,8 @@ def local_motion_matches_counter_rule(
         motion_path,
         shape,
         space=conditions.get("motion_path_space"),
+        shape_ref=conditions.get("motion_path_shape_ref"),
+        attach_to_shape=True,
     )
     if not frame_path:
         return False
@@ -839,11 +841,55 @@ def _shape_relative_path_to_frame(
     return out
 
 
+def _parse_motion_path_shape_ref(value: Any) -> Optional[Dict[str, float]]:
+    if not isinstance(value, dict):
+        return None
+    try:
+        min_x = float(value.get("min_x"))
+        min_y = float(value.get("min_y"))
+        max_x = float(value.get("max_x"))
+        max_y = float(value.get("max_y"))
+    except (TypeError, ValueError):
+        return None
+    if max_x <= min_x or max_y <= min_y:
+        return None
+    return {"min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y}
+
+
+def _transform_frame_path_with_shape_ref(
+    path: Sequence[Any],
+    shape_ref: Dict[str, float],
+    shape: Dict[str, Any],
+) -> List[Dict[str, float]]:
+    """Re-map frame path points from a saved shape bbox to the current shape bbox."""
+    min_x_r = float(shape_ref["min_x"])
+    min_y_r = float(shape_ref["min_y"])
+    max_x_r = float(shape_ref["max_x"])
+    max_y_r = float(shape_ref["max_y"])
+    min_x_c, min_y_c, max_x_c, max_y_c = _shape_bounds(shape)
+    span_x_r = max(max_x_r - min_x_r, 1e-6)
+    span_y_r = max(max_y_r - min_y_r, 1e-6)
+    span_x_c = max(max_x_c - min_x_c, 1e-6)
+    span_y_c = max(max_y_c - min_y_c, 1e-6)
+    out: List[Dict[str, float]] = []
+    for p in path or []:
+        if not isinstance(p, dict):
+            continue
+        fx = float(p.get("x", 0))
+        fy = float(p.get("y", 0))
+        rx = (fx - min_x_r) / span_x_r
+        ry = (fy - min_y_r) / span_y_r
+        out.append({"x": min_x_c + rx * span_x_c, "y": min_y_c + ry * span_y_c})
+    return out
+
+
 def _resolve_motion_path_for_frame(
     path: Sequence[Any],
     shape: Optional[Dict[str, Any]],
     *,
     space: Any = None,
+    shape_ref: Any = None,
+    attach_to_shape: bool = False,
 ) -> Optional[List[Dict[str, float]]]:
     parsed: List[Dict[str, float]] = []
     for p in path or []:
@@ -854,6 +900,16 @@ def _resolve_motion_path_for_frame(
     path_space = _normalize_motion_path_space(space)
     if path_space == _MOTION_PATH_SPACE_SHAPE and isinstance(shape, dict):
         return _shape_relative_path_to_frame(parsed, shape)
+    if (
+        attach_to_shape
+        and path_space == _MOTION_PATH_SPACE_FRAME
+        and isinstance(shape, dict)
+    ):
+        ref = _parse_motion_path_shape_ref(shape_ref)
+        if ref:
+            transformed = _transform_frame_path_with_shape_ref(parsed, ref, shape)
+            if len(transformed) >= 2:
+                return transformed
     return parsed
 
 
@@ -1165,6 +1221,8 @@ def matches_track_event(*, rule: Dict[str, Any], ctx: EvalContext, shape: Option
             motion_path,
             shape,
             space=conditions.get("motion_path_space"),
+            shape_ref=conditions.get("motion_path_shape_ref"),
+            attach_to_shape=True,
         )
         if not frame_path:
             return False, {"reason": "invalid_motion_path", "rule_id": rule_id}

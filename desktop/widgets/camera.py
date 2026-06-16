@@ -8783,7 +8783,7 @@ class CameraWidget(BaseDesktopWidget):
             ensure_backend_detection_for_rules(api_base, self.camera_id, verification_enabled=True)
             set_rules_enabled(api_base, self.camera_id, True)
             self._server_event_rules_enabled = True
-            self._refresh_shape_counter_config()
+            self._refresh_shape_counter_config(force=True)
         except Exception as e:
             print(f"Event rules enable error for {self.camera_id}: {e}")
             self._server_event_rules_enabled = False
