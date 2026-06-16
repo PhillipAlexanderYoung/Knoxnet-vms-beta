@@ -46,6 +46,7 @@ from desktop.widgets.event_rules_editor import EventRulesEditorDialog
 from desktop.widgets.shape_trigger_dialog import (
     ShapeTriggerDialog,
     draw_motion_path,
+    draw_path_tolerance_corridor,
     draw_rule_ghost_overlay,
     _draw_counter_pill,
 )
@@ -844,6 +845,15 @@ class CameraOpenGLWidget(QWidget):
             return QPointF(x_offset + nx * view_w, y_offset + ny * view_h)
 
         widget_pts = [_pt(p["x"], p["y"]) for p in self._path_draw_points]
+        tp = self.trigger_preview if isinstance(self.trigger_preview, dict) else {}
+        tol = float(tp.get("path_match_tolerance") or 0.0)
+        if tol > 0 and len(widget_pts) >= 2:
+            draw_path_tolerance_corridor(
+                painter,
+                self._path_draw_points,
+                tol,
+                draw_rect=(float(x_offset), float(y_offset), view_w, view_h),
+            )
         accent = QColor("#24D1FF")
         accent.setAlpha(220)
         line_pen = QPen(accent, 2)
@@ -2917,6 +2927,7 @@ class CameraOpenGLWidget(QWidget):
                                 require_detection=bool(tp.get("require_detection", True)),
                                 dwell_min=float(tp.get("dwell_min") or 0.0),
                                 cooldown_sec=float(tp.get("cooldown_sec") or DEFAULT_RULE_COOLDOWN_SEC),
+                                path_match_tolerance=float(tp.get("path_match_tolerance") or 0.0),
                             )
                         show_counter = normalize_counter_mode(tp.get("show_counter"))
                         if show_counter != "off":
@@ -10147,8 +10158,8 @@ class CameraWidget(BaseDesktopWidget):
         """Receive motion-shape interactions from GL widget."""
         events = (payload or {}).get('events') or []
         src = (payload or {}).get("source") or None
-        # Zone/line detection triggers follow server rules (``new_capture``) when armed.
-        # Motion-mode rules and tags use the local rule-coupled screenshot path.
+        # Zone/line/tag detection triggers follow server rules (``new_capture``) when armed.
+        # Motion-mode rules use the local rule-coupled screenshot path.
         counter_events = filter_desktop_counter_events(
             events,
             motion_watch_active=self.motion_watch_active,

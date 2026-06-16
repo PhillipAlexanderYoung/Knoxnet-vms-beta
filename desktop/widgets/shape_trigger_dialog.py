@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSizePolicy,
     QSpinBox,
     QVBoxLayout,
@@ -34,12 +35,16 @@ from desktop.utils.shape_trigger_helpers import (
     DEFAULT_SCRIPT_RUNNER,
     DEFAULT_TRIGGER_MODE,
     EXPLICIT_SHAPE_TRIGGERS,
+    PATH_TOLERANCE_SLIDER_MAX,
+    PATH_TOLERANCE_SLIDER_MIN,
     SCRIPT_RUNNER_OPTIONS,
     build_event_source_conditions,
     build_rule_actions,
     effective_trigger_from_mode,
     ensure_event_rules_scripts_dir,
     parse_event_source_flags,
+    path_tolerance_from_slider,
+    path_tolerance_slider_value,
     script_action_from_rule,
     trigger_mode_options_for_kind,
 )
@@ -369,6 +374,43 @@ def _draw_shape_base(
         painter.drawLine(QPointF(cpt.x(), cpt.y() - sz), QPointF(cpt.x(), cpt.y() + sz))
 
 
+def draw_path_tolerance_corridor(
+    painter: QPainter,
+    motion_path: List[Dict[str, float]],
+    tolerance: float,
+    *,
+    draw_rect: Tuple[float, float, float, float],
+    preview_fit: Optional[PreviewFit] = None,
+    color: Optional[QColor] = None,
+) -> None:
+    """Draw a semi-transparent corridor showing allowed deviation from the path."""
+    if len(motion_path) < 2:
+        return
+    tol = max(0.01, float(tolerance))
+    x0, y0, rw, rh = draw_rect
+    rect = QRectF(x0, y0, rw, rh)
+
+    def _pt(nx: float, ny: float) -> QPointF:
+        if preview_fit is not None:
+            return _fit_to_qpoint(preview_fit, nx, ny)
+        return _norm_pt(nx, ny, rect)
+
+    half_w = tol * ((rw + rh) / 2.0)
+    accent = color or QColor("#24D1FF")
+    fill = QColor(accent)
+    fill.setAlpha(36)
+    stroke = QColor(accent)
+    stroke.setAlpha(90)
+    pen = QPen(stroke, max(2.0, half_w * 2.0))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(fill)
+    pts = [_pt(float(p["x"]), float(p["y"])) for p in motion_path]
+    for i in range(len(pts) - 1):
+        painter.drawLine(pts[i], pts[i + 1])
+
+
 def draw_motion_path(
     painter: QPainter,
     motion_path: List[Dict[str, float]],
@@ -381,6 +423,7 @@ def draw_motion_path(
     require_detection: bool = True,
     dwell_min: float = 0.0,
     cooldown_sec: float = DEFAULT_RULE_COOLDOWN_SEC,
+    path_match_tolerance: float = 0.0,
 ) -> None:
     """Draw user-recorded motion path with animated dot."""
     if len(motion_path) < 2:
@@ -388,6 +431,16 @@ def draw_motion_path(
 
     x0, y0, rw, rh = draw_rect
     rect = QRectF(x0, y0, rw, rh)
+
+    if path_match_tolerance > 0:
+        draw_path_tolerance_corridor(
+            painter,
+            motion_path,
+            path_match_tolerance,
+            draw_rect=draw_rect,
+            preview_fit=preview_fit,
+            color=color_bucket_to_qcolor(color_bucket),
+        )
 
     def _pt(nx: float, ny: float) -> QPointF:
         if preview_fit is not None:
@@ -829,32 +882,40 @@ class ShapeTriggerDialog(QDialog):
         root.setSpacing(6)
         root.setContentsMargins(8, 8, 8, 8)
 
-        top_row = QHBoxLayout()
-        top_row.setSpacing(8)
+        meta = QLabel(f"<b>{label}</b> <span style='color:#64748b'>{kind}</span>")
+        meta.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(meta)
 
-        path_btns = QHBoxLayout()
-        path_btns.setSpacing(4)
+        path_row = QHBoxLayout()
+        path_row.setSpacing(6)
         self.draw_path_btn = QPushButton("Draw path on camera")
         self.draw_path_btn.setFixedHeight(28)
         self.draw_path_btn.clicked.connect(self._toggle_camera_path_draw)
-        path_btns.addWidget(self.draw_path_btn)
+        path_row.addWidget(self.draw_path_btn)
         self.clear_path_btn = QPushButton("Clear path")
         self.clear_path_btn.setFixedHeight(28)
         self.clear_path_btn.clicked.connect(self._clear_path)
-        path_btns.addWidget(self.clear_path_btn)
-        top_row.addLayout(path_btns)
-
-        controls_col = QVBoxLayout()
-        controls_col.setSpacing(4)
-
-        meta = QLabel(f"<b>{label}</b> <span style='color:#64748b'>{kind}</span>")
-        meta.setTextFormat(Qt.TextFormat.RichText)
-        controls_col.addWidget(meta)
+        path_row.addWidget(self.clear_path_btn)
+        path_tol_label = QLabel("Path deviation")
+        path_tol_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        path_row.addWidget(path_tol_label)
+        self.path_tol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.path_tol_slider.setRange(PATH_TOLERANCE_SLIDER_MIN, PATH_TOLERANCE_SLIDER_MAX)
+        self.path_tol_slider.setValue(path_tolerance_slider_value(DEFAULT_PATH_TOLERANCE))
+        self.path_tol_slider.setFixedHeight(20)
+        self.path_tol_slider.valueChanged.connect(self._on_path_tolerance_changed)
+        path_row.addWidget(self.path_tol_slider, 1)
+        self.path_tol_value_label = QLabel(f"{DEFAULT_PATH_TOLERANCE:.2f}")
+        self.path_tol_value_label.setFixedWidth(36)
+        self.path_tol_value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.path_tol_value_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        path_row.addWidget(self.path_tol_value_label)
+        root.addLayout(path_row)
 
         self.shape_name_edit = QLineEdit(label)
         self.shape_name_edit.setPlaceholderText("Shape name")
         self.shape_name_edit.textChanged.connect(self._on_shape_name_changed)
-        controls_col.addWidget(self.shape_name_edit)
+        root.addWidget(self.shape_name_edit)
 
         trig_row = QHBoxLayout()
         trig_row.addWidget(QLabel("Trigger"))
@@ -863,16 +924,16 @@ class ShapeTriggerDialog(QDialog):
             self.trigger_combo.addItem(tlabel, tval)
         self.trigger_combo.currentIndexChanged.connect(self._on_trigger_mode_changed)
         trig_row.addWidget(self.trigger_combo, 1)
+        root.addLayout(trig_row)
         if not existing_rule:
             auto_idx = self.trigger_combo.findData(DEFAULT_TRIGGER_MODE)
             if auto_idx >= 0:
                 self.trigger_combo.setCurrentIndex(auto_idx)
-        controls_col.addLayout(trig_row)
 
         self.inferred_label = QLabel("")
         self.inferred_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
         self.inferred_label.setWordWrap(True)
-        controls_col.addWidget(self.inferred_label)
+        root.addWidget(self.inferred_label)
 
         rule_row = QHBoxLayout()
         self.rule_combo = QComboBox()
@@ -884,7 +945,7 @@ class ShapeTriggerDialog(QDialog):
         self.name_edit.setPlaceholderText("Rule name")
         self.name_edit.textEdited.connect(lambda _t: setattr(self, "_auto_rule_name", False))
         rule_row.addWidget(self.name_edit, 1)
-        controls_col.addLayout(rule_row)
+        root.addLayout(rule_row)
 
         rule_manage_row = QHBoxLayout()
         self.enabled_check = QCheckBox("Rule enabled")
@@ -896,10 +957,7 @@ class ShapeTriggerDialog(QDialog):
         self.delete_rule_btn.clicked.connect(self._delete_rule)
         rule_manage_row.addWidget(self.delete_rule_btn)
         rule_manage_row.addStretch()
-        controls_col.addLayout(rule_manage_row)
-
-        top_row.addLayout(controls_col, 1)
-        root.addLayout(top_row)
+        root.addLayout(rule_manage_row)
 
         event_source_box = QGroupBox("Event source")
         event_source_layout = QVBoxLayout(event_source_box)
@@ -996,6 +1054,21 @@ class ShapeTriggerDialog(QDialog):
         self._refresh_backend_detection_status()
         self._emit_preview()
 
+    def _path_tolerance(self) -> float:
+        return path_tolerance_from_slider(int(self.path_tol_slider.value()))
+
+    def _set_path_tolerance(self, tolerance: float) -> None:
+        self.path_tol_slider.blockSignals(True)
+        try:
+            self.path_tol_slider.setValue(path_tolerance_slider_value(tolerance))
+            self.path_tol_value_label.setText(f"{self._path_tolerance():.2f}")
+        finally:
+            self.path_tol_slider.blockSignals(False)
+
+    def _on_path_tolerance_changed(self, _value: int) -> None:
+        self.path_tol_value_label.setText(f"{self._path_tolerance():.2f}")
+        self._emit_preview()
+
     def _set_counter_mode(self, mode: str) -> None:
         idx = self.counter_combo.findData(normalize_counter_mode(mode))
         if idx >= 0:
@@ -1040,12 +1113,6 @@ class ShapeTriggerDialog(QDialog):
         self.cooldown_spin.setValue(DEFAULT_RULE_COOLDOWN_MS)
         timing_form.addRow("Cooldown", self.cooldown_spin)
         self.cooldown_spin.valueChanged.connect(self._emit_preview)
-        self.path_tol_spin = QDoubleSpinBox()
-        self.path_tol_spin.setRange(0.02, 0.5)
-        self.path_tol_spin.setSingleStep(0.01)
-        self.path_tol_spin.setValue(DEFAULT_PATH_TOLERANCE)
-        self.path_tol_spin.setToolTip("Normalized distance tolerance for path matching")
-        timing_form.addRow("Path tol.", self.path_tol_spin)
         root.addWidget(timing_box)
 
         counter_box, counter_inner = self._collapsible_group("Counter display")
@@ -1265,10 +1332,11 @@ class ShapeTriggerDialog(QDialog):
             "Sensitivity controls how much pixel change counts as motion. "
             "Merge size joins nearby motion blobs before boxing."
         )
-        self.path_tol_spin.setToolTip(
-            "Normalized distance tolerance for path-match triggers. "
-            "Lower values require motion to follow the drawn path more closely."
+        self.path_tol_slider.setToolTip(
+            "How far tracked motion may deviate from the drawn path (normalized coords). "
+            "Higher values are more forgiving; the corridor on the camera preview widens."
         )
+        self.path_tol_value_label.setToolTip(self.path_tol_slider.toolTip())
         self.counter_combo.setToolTip(
             "Show a cumulative trigger-count pill on the shape overlay. "
             "Drag the pill on the camera image to set its position. "
@@ -1642,6 +1710,7 @@ class ShapeTriggerDialog(QDialog):
             "require_detection": detection_enabled,
             "dwell_min": float(self.dwell_min_spin.value()),
             "cooldown_sec": cooldown_sec_from_ms(int(self.cooldown_spin.value())),
+            "path_match_tolerance": self._path_tolerance(),
             "show_counter": show_counter,
             "counter_value": 1 if show_counter != "off" else 0,
             "counter_pill_anchor": dict(self._counter_pill_anchor),
@@ -1888,7 +1957,7 @@ class ShapeTriggerDialog(QDialog):
         self.cooldown_spin.setValue(
             cooldown_ms_from_sec(float(cond.get("cooldown_sec", DEFAULT_RULE_COOLDOWN_SEC) or DEFAULT_RULE_COOLDOWN_SEC))
         )
-        self.path_tol_spin.setValue(float(cond.get("path_match_tolerance") or DEFAULT_PATH_TOLERANCE))
+        self._set_path_tolerance(float(cond.get("path_match_tolerance") or DEFAULT_PATH_TOLERANCE))
         counter_idx = self.counter_combo.findData(normalize_counter_mode(cond.get("show_counter")))
         if counter_idx >= 0:
             self.counter_combo.setCurrentIndex(counter_idx)
@@ -2024,7 +2093,7 @@ class ShapeTriggerDialog(QDialog):
             conditions["motion_path"] = path
             conditions["motion_path_space"] = MOTION_PATH_SPACE_FRAME
             conditions["motion_path_shape_ref"] = motion_path_shape_ref_from_shape(self.shape)
-            conditions["path_match_tolerance"] = float(self.path_tol_spin.value())
+            conditions["path_match_tolerance"] = self._path_tolerance()
             conditions["derived_trigger"] = semantic_trigger
             direction_gate = compute_path_direction_gate(path, self.shape)
             if direction_gate:

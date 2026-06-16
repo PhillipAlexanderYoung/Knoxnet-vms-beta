@@ -148,14 +148,25 @@ class DesktopCounterSuppressionTests(unittest.TestCase):
         )
         self.assertEqual(filtered, [])
 
-    def test_tag_events_always_kept_for_local_counter_path(self):
+    def test_detection_tag_excluded_when_server_active(self):
         events = [_tag_event(source="backend")]
         filtered = filter_desktop_counter_events(
             events,
             motion_watch_active=True,
             server_event_rules_active=True,
             trigger_source="backend",
-            uses_local_motion_counter=lambda _sid: False,
+            uses_local_motion_counter=lambda _sid: True,
+        )
+        self.assertEqual(filtered, [])
+
+    def test_motion_tag_kept_for_local_counter_path(self):
+        events = [_tag_event()]
+        filtered = filter_desktop_counter_events(
+            events,
+            motion_watch_active=True,
+            server_event_rules_active=True,
+            trigger_source=None,
+            uses_local_motion_counter=lambda sid: sid == "tag_1",
         )
         self.assertEqual(filtered, events)
 

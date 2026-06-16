@@ -242,13 +242,15 @@ def ensure_legacy_rule(api_base: str, camera_id: str, settings: Dict[str, Any]) 
 
 
 # Desktop Motion Watch captures for these shape types are handled server-side
-# via track_event rules (zone_enter, line_cross, dwell_met) when Event Rules
-# are armed. Tags remain desktop-only unless a server rule is added later.
-SERVER_AUTHORITATIVE_SHAPE_TYPES = frozenset({"zone", "line"})
+# via track_event rules (zone_enter, line_cross, dwell_met, near_tag) when
+# Event Rules are armed. Motion-mode rules on the same shape may still count
+# locally from motion-box events.
+SERVER_AUTHORITATIVE_SHAPE_TYPES = frozenset({"zone", "line", "tag"})
 
 # Legacy Motion Watch snapshot path is suppressed for these shape types when
-# armed Event Rules are active (zone/line via server ``new_capture``; tag via
-# rule-coupled local capture). Mirrors the zone dedupe fix in 849b303.
+# armed Event Rules are active (server ``new_capture`` owns detection triggers;
+# motion-mode / tag rules use the rule-coupled local capture path). Mirrors
+# the zone dedupe fix in 849b303.
 DESKTOP_LEGACY_CAPTURE_SUPPRESSED_TYPES = frozenset({"zone", "line", "tag"})
 
 DESKTOP_DETECTION_TRIGGER_SOURCES = frozenset({"desktop", "backend", "detection"})
@@ -419,9 +421,9 @@ def filter_desktop_counter_events(
     """Return events that should drive local counter increments and coupled screenshots.
 
     When armed server Event Rules own zone/line detection triggers, detection-sourced
-    zone/line events must not also run the local rule-coupled screenshot path (server
-    ``new_capture`` handles those). Motion-mode rules on the same shape may still count
-    locally from motion-box events. Tags always use the local rule-coupled path.
+    zone/line/tag events must not also run the local rule-coupled screenshot path (server
+    ``new_capture`` handles detection-sourced triggers). Motion-mode rules on the same
+    shape may still count locally from motion-box events.
     """
     if not events:
         return []

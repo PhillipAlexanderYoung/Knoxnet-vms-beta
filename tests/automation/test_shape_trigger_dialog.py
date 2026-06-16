@@ -18,6 +18,10 @@ from desktop.utils.shape_trigger_helpers import (
     trigger_mode_options_for_kind,
 )
 from desktop.widgets.shape_trigger_preview import event_source_description, shape_trigger_dialog_key
+from desktop.utils.shape_trigger_helpers import (
+    path_tolerance_from_slider,
+    path_tolerance_slider_value,
+)
 from core.automation.conditions import BACKEND_SORT_NAMESPACE, MOTION_BOX_NAMESPACE
 
 
@@ -216,6 +220,18 @@ class EventSourcePayloadHelperTests(unittest.TestCase):
         )
         self.assertTrue(motion)
         self.assertTrue(detection)
+
+
+class PathToleranceSliderTests(unittest.TestCase):
+    def test_slider_round_trip_default(self):
+        tol = path_tolerance_from_slider(path_tolerance_slider_value(0.20))
+        self.assertAlmostEqual(tol, 0.20, places=2)
+
+    def test_slider_clamps_extremes(self):
+        self.assertEqual(path_tolerance_from_slider(1), 0.02)
+        self.assertEqual(path_tolerance_from_slider(99), 0.5)
+        self.assertEqual(path_tolerance_slider_value(0.01), 2)
+        self.assertEqual(path_tolerance_slider_value(0.99), 50)
 
 
 if __name__ == "__main__":

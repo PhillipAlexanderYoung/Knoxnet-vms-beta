@@ -13,8 +13,8 @@ The desktop ``CameraWidget`` increments rule counters from two places:
   produced server-side; successful captures are shown in the terminal via the
   separate ``new_capture`` socket event (not duplicated here); and
 * the *local* fallback path (``shape_triggered`` from the GL widget), where
-  motion-mode / tag rules are counted on the desktop and the server never runs
-  a ``SnapshotAction``.
+  motion-mode rules are counted on the desktop and the server never runs
+  a ``SnapshotAction`` for those triggers.
 
 The local path historically incremented the counter but never captured a
 screenshot, so users saw pill counters move with no terminal screenshot and no

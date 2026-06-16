@@ -6,11 +6,28 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.automation.actions.script import DEFAULT_SCRIPT_TIMEOUT_SEC, normalize_args, normalize_runner
-from core.automation.conditions import BACKEND_SORT_NAMESPACE, MOTION_BOX_NAMESPACE
+from core.automation.conditions import BACKEND_SORT_NAMESPACE, DEFAULT_PATH_MATCH_TOLERANCE, MOTION_BOX_NAMESPACE
 from core.paths import get_event_rules_scripts_dir
 from desktop.utils.event_rules_api import snapshot_action_from_motion_watch_settings
 
 DEFAULT_TRIGGER_MODE = "auto_path"
+
+PATH_TOLERANCE_SLIDER_MIN = 2   # 0.02 normalized
+PATH_TOLERANCE_SLIDER_MAX = 50  # 0.50 normalized
+DEFAULT_PATH_TOLERANCE = DEFAULT_PATH_MATCH_TOLERANCE
+
+
+def path_tolerance_from_slider(value: int) -> float:
+    """Map slider ticks (2–50) to normalized path-match tolerance."""
+    return max(0.02, min(0.5, float(value) / 100.0))
+
+
+def path_tolerance_slider_value(tolerance: float) -> int:
+    """Map normalized tolerance to slider ticks."""
+    return max(
+        PATH_TOLERANCE_SLIDER_MIN,
+        min(PATH_TOLERANCE_SLIDER_MAX, int(round(float(tolerance) * 100))),
+    )
 
 PATH_TRIGGER_MODES = [
     ("Auto (from path)", "auto_path"),
