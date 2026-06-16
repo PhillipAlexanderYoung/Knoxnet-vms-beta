@@ -184,5 +184,22 @@ class DesktopCounterSuppressionTests(unittest.TestCase):
         )
 
 
+class TerminalCaptureSinglePathTests(unittest.TestCase):
+    def test_motion_watch_capture_worker_defers_terminal_to_new_capture(self):
+        """Legacy/local captures must not post success images directly to terminal."""
+        from pathlib import Path
+
+        src_path = Path(__file__).resolve().parents[2] / "desktop" / "widgets" / "camera.py"
+        src = src_path.read_text(encoding="utf-8")
+        worker_start = src.index("def _capture_motion_watch_shot_async(")
+        worker_end = src.index("\n    def _start_clip_recording(", worker_start)
+        worker_src = src[worker_start:worker_end]
+        self.assertNotIn(
+            "TerminalWidget.broadcast_motion_watch",
+            worker_src,
+            "success screenshots must arrive via new_capture -> _on_new_capture only",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

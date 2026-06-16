@@ -11320,22 +11320,9 @@ class CameraWidget(BaseDesktopWidget):
 
                     threading.Thread(target=_enrich_and_ingest, daemon=True).start()
 
-                    # Notify terminal (thread-safe; uses Qt signals internally).
-                    try:
-                        from desktop.widgets.terminal import TerminalWidget
-
-                        TerminalWidget.broadcast_motion_watch(
-                            camera_id,
-                            f"Captured {fname}",
-                            image_b64=thumb_b64 or None,
-                            link=file_url or None,
-                            link_label="Open full image" if file_url else None,
-                            remaining_seconds=remaining_seconds,
-                            camera_label=camera_label,
-                            suppress_log=False,
-                        )
-                    except Exception:
-                        pass
+                    # Success screenshots are shown only via ``new_capture`` after ingest
+                    # (see ``_on_new_capture``). Posting here duplicated server and local
+                    # captures when ingest also emitted ``new_capture``.
                 finally:
                     with self._motion_watch_capture_lock:
                         self._motion_watch_capture_inflight = False
