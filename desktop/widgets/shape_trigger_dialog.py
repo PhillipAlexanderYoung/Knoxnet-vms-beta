@@ -850,7 +850,6 @@ class ShapeTriggerDialog(QDialog):
         self._syncing_name = False
         self._derived_trigger = _default_trigger(str(shape.get("kind") or ""))
         self._derived_direction = ""
-        self._path_tolerance = DEFAULT_PATH_TOLERANCE
         self._motion_path: List[Dict[str, float]] = []
         self._preview_phase = 0.0
         self._path_draw_active = False
