@@ -68,6 +68,7 @@ from desktop.widgets.shape_trigger_preview import (
     default_counter_pill_anchor,
     DEFAULT_COUNTER_MODE,
     event_source_description,
+    ghost_entry_hover_lines,
     ghost_entry_label,
     motion_path_travel_t,
     normalize_counter_combine,
@@ -532,7 +533,7 @@ def draw_rule_ghost_overlay(
     )
     accent.setAlpha(102)
 
-    label = ghost_entry_label(entry)
+    hover_lines = ghost_entry_hover_lines(entry)
     motion_path = resolve_motion_path_for_frame(
         entry.get("motion_path"),
         shape,
@@ -547,8 +548,6 @@ def draw_rule_ghost_overlay(
 
     mx: Optional[float] = None
     my: Optional[float] = None
-    label_y_offset = float(idx) * 16.0
-
     if isinstance(motion_path, list) and len(motion_path) >= 2:
         pts = [_pt(float(p["x"]), float(p["y"])) for p in motion_path if isinstance(p, dict)]
         if len(pts) >= 2:
@@ -576,14 +575,24 @@ def draw_rule_ghost_overlay(
         anchor = _shape_anchor_widget(shape, preview_fit=preview_fit, rect=rect)
         mx, my = anchor.x(), anchor.y()
 
-    if mx is not None and label:
+    if mx is not None and hover_lines:
         chip_font = painter.font()
-        chip_font.setPointSize(8)
+        chip_font.setPointSize(7)
         painter.setFont(chip_font)
-        metrics = painter.fontMetrics()
-        tw = min(metrics.horizontalAdvance(label) + 10, 180)
-        th = metrics.height() + 4
-        chip_rect = QRectF(mx + 8, my - th - 4 - label_y_offset, tw, th)
+        pad_x, pad_y = 5, 3
+        max_text_w = 130.0
+        text = "\n".join(hover_lines)
+        flags = (
+            Qt.AlignmentFlag.AlignLeft
+            | Qt.AlignmentFlag.AlignTop
+            | Qt.TextFlag.TextWordWrap
+        )
+        measure_rect = QRectF(0, 0, max_text_w, 400)
+        bound = painter.boundingRect(measure_rect, flags, text)
+        tw = bound.width() + pad_x * 2
+        th = bound.height() + pad_y * 2
+        stack_offset = float(idx) * (th + 6)
+        chip_rect = QRectF(mx + 8, my - th - 4 - stack_offset, tw, th)
         chip_bg = QColor(accent)
         chip_bg.setAlpha(70)
         painter.setBrush(chip_bg)
@@ -592,11 +601,7 @@ def draw_rule_ghost_overlay(
         text_col = QColor("#E2E8F0")
         text_col.setAlpha(180)
         painter.setPen(text_col)
-        painter.drawText(
-            chip_rect.adjusted(5, 2, -5, -2),
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            label,
-        )
+        painter.drawText(chip_rect.adjusted(pad_x, pad_y, -pad_x, -pad_y), flags, text)
 
 
 def draw_trigger_animation(

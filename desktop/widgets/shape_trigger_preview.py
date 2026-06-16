@@ -775,7 +775,64 @@ def rule_to_hover_ghost_entry(
         "cooldown_sec": float(cond.get("cooldown_sec", DEFAULT_RULE_COOLDOWN_SEC) or DEFAULT_RULE_COOLDOWN_SEC),
         "ghost_color_index": int(color_index),
         "has_snapshot": has_snapshot,
+        "path_match_tolerance": float(cond.get("path_match_tolerance") or 0.0),
     }
+
+
+def ghost_entry_hover_lines(entry: Dict[str, Any]) -> List[str]:
+    """Multi-line hover tooltip for a configured event rule ghost."""
+    lines: List[str] = []
+    name = str(entry.get("name") or "").strip()
+    if name:
+        lines.append(name[:28] + ("…" if len(name) > 28 else ""))
+
+    trigger = str(entry.get("trigger") or "").strip()
+    if trigger:
+        trig_label = GHOST_TRIGGER_LABELS.get(trigger, trigger.replace("_", " ").title())
+        lines.append(f"Trigger: {trig_label}")
+
+    direction = str(entry.get("direction") or "").strip()
+    if direction:
+        lines.append(f"Direction: {direction.replace('_', ' ')}")
+
+    motion_path = entry.get("motion_path")
+    if isinstance(motion_path, list) and len(motion_path) >= 2:
+        lines.append(f"Path: {len(motion_path)} pts")
+    elif trigger == "path_match":
+        lines.append("Path: not set")
+
+    tolerance = float(entry.get("path_match_tolerance") or 0.0)
+    if tolerance > 0 and (
+        trigger == "path_match"
+        or (isinstance(motion_path, list) and len(motion_path) >= 2)
+    ):
+        lines.append(f"Tolerance: {tolerance:.2f}")
+
+    classes = entry.get("classes") or []
+    if isinstance(classes, list) and classes:
+        cls = ", ".join(str(c) for c in classes[:3])
+        if len(classes) > 3:
+            cls += "…"
+        lines.append(f"Class: {cls}")
+
+    color = str(entry.get("color_bucket") or "").strip()
+    if color:
+        lines.append(f"Color: {color}")
+
+    dwell = float(entry.get("dwell_min") or 0.0)
+    if dwell > 0:
+        lines.append(f"Dwell: {dwell:.1f}s")
+
+    cooldown = float(entry.get("cooldown_sec") or 0.0)
+    if cooldown > 0:
+        lines.append(f"Cooldown: {cooldown:.0f}s")
+
+    if entry.get("has_snapshot") is False:
+        lines.append("No snapshot")
+    elif entry.get("require_detection") is False:
+        lines.append("Motion only")
+
+    return lines or ["Rule"]
 
 
 def ghost_entry_label(entry: Dict[str, Any]) -> str:

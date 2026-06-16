@@ -20,6 +20,7 @@ from desktop.widgets.shape_trigger_preview import (
     default_counter_pill_anchor,
     fit_shape_preview,
     frame_path_to_shape_relative,
+    ghost_entry_hover_lines,
     ghost_entry_label,
     motion_path_travel_t,
     motion_path_shape_ref_from_shape,
@@ -357,6 +358,35 @@ class ShapeTriggerPreviewTests(unittest.TestCase):
     def test_ghost_entry_label_marks_missing_snapshot(self):
         entry = {"name": "Lane rule", "has_snapshot": False}
         self.assertIn("no snap", ghost_entry_label(entry))
+
+    def test_ghost_entry_hover_lines_multiline(self):
+        entry = {
+            "name": "Front gate rule",
+            "trigger": "line_cross",
+            "direction": "left_to_right",
+            "classes": ["car", "truck"],
+            "color_bucket": "blue",
+            "motion_path": [{"x": 0.1, "y": 0.5}, {"x": 0.9, "y": 0.5}],
+            "path_match_tolerance": 0.12,
+            "dwell_min": 2.0,
+            "cooldown_sec": 5.0,
+        }
+        lines = ghost_entry_hover_lines(entry)
+        self.assertGreater(len(lines), 1)
+        joined = "\n".join(lines)
+        self.assertIn("Front gate rule", joined)
+        self.assertIn("Trigger:", joined)
+        self.assertIn("Cross", joined)
+        self.assertIn("Direction:", joined)
+        self.assertIn("Path:", joined)
+        self.assertIn("Tolerance:", joined)
+        self.assertIn("Class:", joined)
+        self.assertIn("Color:", joined)
+        self.assertIn("Dwell:", joined)
+        self.assertIn("Cooldown:", joined)
+
+    def test_ghost_entry_hover_lines_fallback(self):
+        self.assertEqual(ghost_entry_hover_lines({}), ["Rule"])
 
     def test_counter_combine_modes(self):
         self.assertEqual(COUNTER_COMBINE_MODES, ("none", "sum", "max", "min"))
