@@ -689,6 +689,30 @@ def rules_for_shape(rules: List[Dict[str, Any]], shape_id: str) -> List[Dict[str
     return [r for r in rules if isinstance(r, dict) and str(r.get("shape_id") or "") == sid]
 
 
+def build_armed_rule_ghost_entries(
+    rules: List[Dict[str, Any]],
+    shapes: Sequence[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Build per-shape rule ghost overlays for armed motion-watch display."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for shape in shapes or []:
+        if not isinstance(shape, dict):
+            continue
+        sid = str(shape.get("id") or "").strip()
+        if not sid:
+            continue
+        entries: List[Dict[str, Any]] = []
+        for idx, rule in enumerate(rules_for_shape(rules, sid)):
+            if not rule.get("enabled", True):
+                continue
+            entry = rule_to_hover_ghost_entry(rule, color_index=idx, shape=shape)
+            if entry:
+                entries.append(entry)
+        if entries:
+            out[sid] = entries
+    return out
+
+
 def upsert_event_rule_in_cache(
     rules: List[Dict[str, Any]],
     saved_rule: Dict[str, Any],

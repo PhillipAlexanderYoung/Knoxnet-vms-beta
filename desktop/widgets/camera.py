@@ -60,6 +60,7 @@ from desktop.widgets.shape_trigger_preview import (
     prune_trigger_counts,
     resolve_counter_pill_label,
     rule_to_hover_ghost_entry,
+    build_armed_rule_ghost_entries,
     rules_for_shape,
     shape_trigger_dialog_key,
 )
@@ -541,6 +542,8 @@ class CameraOpenGLWidget(QWidget):
         self._pill_move_pill_callback: Optional[Callable[[Dict[str, float]], None]] = None
         self._path_draw_min_dist: float = 0.012
         self.hover_rule_ghost: Optional[List[Dict[str, object]]] = None
+        self.armed_rule_ghosts: Dict[str, List[Dict[str, object]]] = {}
+        self.armed_overlays_enabled: bool = False
         self._hover_ghost_phase: float = 0.0
         self._event_rules_cache: List[Dict[str, object]] = []
         self._event_rules_cache_ts: float = 0.0
@@ -643,6 +646,8 @@ class CameraOpenGLWidget(QWidget):
         self.line_pulses.clear()
         self.tag_pulses.clear()
         self.motion_hit_pulses.clear()
+        if self.armed_overlays_enabled:
+            self._refresh_armed_rule_ghosts()
         self.update()
 
     def set_selected_shapes(self, ids: List[str]):
@@ -696,8 +701,8 @@ class CameraOpenGLWidget(QWidget):
                 self.stop_pill_anchor_move_mode()
             if self.hover_shape:
                 self._refresh_hover_rule_ghost()
-            elif not self.hover_rule_ghost:
-                self._trigger_preview_timer.stop()
+            else:
+                self._sync_rule_overlay_timer()
             self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
 
@@ -833,6 +838,41 @@ class CameraOpenGLWidget(QWidget):
         self._event_rules_cache_ts = float(cache_ts if cache_ts is not None else time.time())
         if self.hover_shape and not self.trigger_preview:
             self._refresh_hover_rule_ghost()
+        if self.armed_overlays_enabled:
+            self._refresh_armed_rule_ghosts()
+
+    def set_armed_rule_overlays_enabled(self, enabled: bool) -> None:
+        """Show pathway ghost overlays for all armed rules (not only on hover)."""
+        enabled = bool(enabled)
+        if enabled == self.armed_overlays_enabled and (enabled or not self.armed_rule_ghosts):
+            return
+        self.armed_overlays_enabled = enabled
+        if not enabled:
+            self.armed_rule_ghosts = {}
+            self._sync_rule_overlay_timer()
+            self.update()
+            return
+        self._refresh_armed_rule_ghosts()
+
+    def _sync_rule_overlay_timer(self) -> None:
+        if self.trigger_preview or self.hover_rule_ghost or (
+            self.armed_overlays_enabled and self.armed_rule_ghosts
+        ):
+            if not self._trigger_preview_timer.isActive():
+                self._trigger_preview_timer.start(50)
+        elif not self.trigger_preview:
+            self._trigger_preview_timer.stop()
+
+    def _refresh_armed_rule_ghosts(self) -> None:
+        if not self.armed_overlays_enabled:
+            self.armed_rule_ghosts = {}
+            return
+        self.armed_rule_ghosts = build_armed_rule_ghost_entries(
+            self._event_rules_cache,
+            list(self.shapes or []),
+        )
+        self._sync_rule_overlay_timer()
+        self.update()
 
     def _refresh_hover_rule_ghost(self) -> None:
         if self.trigger_preview:
@@ -841,8 +881,7 @@ class CameraOpenGLWidget(QWidget):
         sid = str(self.hover_shape or "").strip()
         if not sid:
             self.hover_rule_ghost = None
-            if not self.trigger_preview:
-                self._trigger_preview_timer.stop()
+            self._sync_rule_overlay_timer()
             return
         ghost_shape = next(
             (s for s in self.shapes if str(s.get("id") or "") == sid),
@@ -856,11 +895,7 @@ class CameraOpenGLWidget(QWidget):
             if entry:
                 entries.append(entry)
         self.hover_rule_ghost = entries or None
-        if self.hover_rule_ghost:
-            if not self._trigger_preview_timer.isActive():
-                self._trigger_preview_timer.start(50)
-        elif not self.trigger_preview:
-            self._trigger_preview_timer.stop()
+        self._sync_rule_overlay_timer()
         self.update()
 
     def _update_hover_shape(self, shape_id: Optional[str]) -> None:
@@ -882,6 +917,11 @@ class CameraOpenGLWidget(QWidget):
             self.update()
             return
         if self.hover_rule_ghost:
+            phase_inc, _ = preview_animation_params(0.0, 3.0)
+            self._hover_ghost_phase = (self._hover_ghost_phase + phase_inc) % 1.0
+            self.update()
+            return
+        if self.armed_overlays_enabled and self.armed_rule_ghosts:
             phase_inc, _ = preview_animation_params(0.0, 3.0)
             self._hover_ghost_phase = (self._hover_ghost_phase + phase_inc) % 1.0
             self.update()
@@ -2852,6 +2892,32 @@ class CameraOpenGLWidget(QWidget):
                                 int(x_offset) + 8,
                                 int(y_offset + view_h) - 8,
                                 "Drag on video to draw path · drag pill to reposition · right-click to cancel",
+                            )
+
+                # Armed rule overlays (motion watch active; visible without hover)
+                if (
+                    not tp
+                    and self.armed_overlays_enabled
+                    and self.armed_rule_ghosts
+                    and self.frame_dims[0] > 0
+                ):
+                    draw_rect = (float(x_offset), float(y_offset), view_w, view_h)
+                    for sid, entries in self.armed_rule_ghosts.items():
+                        if sid == self.hover_shape and self.hover_rule_ghost:
+                            continue
+                        ghost_shape = next(
+                            (s for s in self.shapes if s.get("id") == sid),
+                            None,
+                        )
+                        if not ghost_shape:
+                            continue
+                        for entry in entries:
+                            draw_rule_ghost_overlay(
+                                painter,
+                                entry,
+                                phase=self._hover_ghost_phase,
+                                draw_rect=draw_rect,
+                                shape=ghost_shape,
                             )
 
                 # Hover ghost preview for configured event rules (dialog closed)
@@ -6669,6 +6735,8 @@ class CameraWidget(BaseDesktopWidget):
         self._cached_event_rules: List[Dict[str, object]] = []
         self._event_rules_cache_ts: float = 0.0
         self._EVENT_RULES_CACHE_TTL: float = 30.0
+        self._rules_refresh_retry_count: int = 0
+        self._rules_refresh_retry_scheduled: bool = False
         self.motion_watch_settings = {
             "duration_sec": 30,
             "duration_unit": "Seconds",
@@ -8741,8 +8809,45 @@ class CameraWidget(BaseDesktopWidget):
         """Compatibility entry point — opens Event Rules editor."""
         self.open_event_rules_dialog()
 
+    def _sync_armed_rule_overlays(self) -> None:
+        """Show pathway overlays for all armed rules when motion watch is active."""
+        self.gl_widget.set_armed_rule_overlays_enabled(bool(self.motion_watch_active))
+
+    def _apply_cached_event_rules(self, rules: List[Dict[str, object]]) -> None:
+        """Apply event rules to counter pills and armed overlays without an API round-trip."""
+        rules = [dict(r) for r in (rules or []) if isinstance(r, dict)]
+        if not rules:
+            return
+        self._cached_event_rules = rules
+        self._event_rules_cache_ts = time.time()
+        self.gl_widget.refresh_shape_counter_config(rules)
+        self.gl_widget.set_event_rules_cache(rules, cache_ts=self._event_rules_cache_ts)
+        self._sync_armed_rule_overlays()
+
+    def _schedule_rules_refresh_retry(self) -> None:
+        """Retry rule sync when the API was unavailable during layout restore."""
+        if self._rules_refresh_retry_scheduled:
+            return
+        if self._rules_refresh_retry_count >= 5:
+            return
+        self._rules_refresh_retry_scheduled = True
+        delay_ms = 1500 + (self._rules_refresh_retry_count * 1000)
+        QTimer.singleShot(delay_ms, self._retry_shape_counter_config)
+
+    def _retry_shape_counter_config(self) -> None:
+        self._rules_refresh_retry_scheduled = False
+        self._rules_refresh_retry_count += 1
+        self._refresh_shape_counter_config(force=True)
+        if self.motion_watch_active and not getattr(self, "_server_event_rules_enabled", False):
+            try:
+                self._enable_server_event_rules()
+            except Exception:
+                pass
+        if self.motion_watch_active:
+            self._sync_armed_rule_overlays()
+
     def _refresh_shape_counter_config(self, *, force: bool = False) -> None:
-        """Load event rules from API (cached) for counter pills and hover ghosts."""
+        """Load event rules from API (cached) for counter pills and armed overlays."""
         api_base = getattr(self, "API_BASE", "http://localhost:5000/api")
         now = time.time()
         ttl = float(getattr(self, "_EVENT_RULES_CACHE_TTL", 30.0))
@@ -8753,11 +8858,22 @@ class CameraWidget(BaseDesktopWidget):
         ):
             rules = self._cached_event_rules
         else:
-            rules = list_rules(api_base, self.camera_id)
-            self._cached_event_rules = rules
-            self._event_rules_cache_ts = now
+            fetched = list_rules(api_base, self.camera_id)
+            if fetched:
+                rules = fetched
+                self._cached_event_rules = rules
+                self._event_rules_cache_ts = now
+                self._rules_refresh_retry_count = 0
+            elif getattr(self, "_cached_event_rules", None):
+                rules = self._cached_event_rules
+            elif force:
+                self._schedule_rules_refresh_retry()
+                return
+            else:
+                rules = []
         self.gl_widget.refresh_shape_counter_config(rules)
         self.gl_widget.set_event_rules_cache(rules, cache_ts=self._event_rules_cache_ts)
+        self._sync_armed_rule_overlays()
 
     def _on_hover_shape_changed(self, shape_id) -> None:
         if not shape_id:
@@ -8784,9 +8900,11 @@ class CameraWidget(BaseDesktopWidget):
             set_rules_enabled(api_base, self.camera_id, True)
             self._server_event_rules_enabled = True
             self._refresh_shape_counter_config(force=True)
+            self._sync_armed_rule_overlays()
         except Exception as e:
             print(f"Event rules enable error for {self.camera_id}: {e}")
             self._server_event_rules_enabled = False
+            self._schedule_rules_refresh_retry()
 
     def _disable_server_event_rules(self) -> None:
         if not getattr(self, "_server_event_rules_enabled", False):
@@ -8798,6 +8916,7 @@ class CameraWidget(BaseDesktopWidget):
             pass
         self._server_event_rules_enabled = False
         self._refresh_shape_counter_config(force=True)
+        self._sync_armed_rule_overlays()
 
     def arm_event_rules(self, remaining_sec: int | None = None):
         """Enable server rules and arm legacy desktop capture session."""
@@ -10581,6 +10700,7 @@ class CameraWidget(BaseDesktopWidget):
         if not self.motion_watch_timer.isActive():
             self.motion_watch_timer.start(1000)
         self._ensure_motion_watch_stream_recovery()
+        self._sync_armed_rule_overlays()
         self._post_motion_watch_to_terminal(
             "Event Rules armed",
             countdown=duration if duration >= 0 else None,
@@ -10595,6 +10715,7 @@ class CameraWidget(BaseDesktopWidget):
         self.motion_watch_active = False
         self.motion_watch_timer.stop()
         self._stop_motion_watch_stream_recovery()
+        self._sync_armed_rule_overlays()
         try:
             with self._motion_watch_ring_lock:
                 self._motion_watch_snapshot_ring.clear()

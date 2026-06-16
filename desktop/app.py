@@ -4883,6 +4883,11 @@ class KnoxnetDesktopApp(QApplication):
                     preserve_ids=True,
                 )
                 rewritten = rewrite_rules_for_camera(event_rules, cam_id, id_map)
+                try:
+                    if hasattr(widget, "_apply_cached_event_rules"):
+                        widget._apply_cached_event_rules(rewritten)
+                except Exception:
+                    pass
                 replace_camera_rules(api_base, cam_id, rewritten, delete_existing=True)
 
             backend_detection = settings.get("backend_detection")
@@ -4896,6 +4901,27 @@ class KnoxnetDesktopApp(QApplication):
                 pass
         except Exception as e:
             logger.warning("Failed to restore camera server state for %s: %s", cam_id, e)
+
+    def _deferred_layout_arm_sync(self, widgets: list) -> None:
+        """Retry rule sync and armed overlays after layout load when the API may still be starting."""
+        try:
+            from desktop.widgets.camera import CameraWidget
+        except Exception:
+            return
+        for widget in widgets or []:
+            try:
+                if not isinstance(widget, CameraWidget):
+                    continue
+                if hasattr(widget, "_refresh_shape_counter_config"):
+                    widget._refresh_shape_counter_config(force=True)
+                if getattr(widget, "motion_watch_active", False) and not getattr(
+                    widget, "_server_event_rules_enabled", False
+                ):
+                    widget._enable_server_event_rules()
+                if hasattr(widget, "_sync_armed_rule_overlays"):
+                    widget._sync_armed_rule_overlays()
+            except Exception:
+                continue
 
     def _capture_widget_profile_state(self, widget, *, include: dict) -> dict:
         """Build a full camera profile payload from a live CameraWidget."""
@@ -6539,6 +6565,10 @@ class KnoxnetDesktopApp(QApplication):
             self._current_layout_widgets = list(created_widgets)
         try:
             self._recover_motion_watch_streams()
+        except Exception:
+            pass
+        try:
+            QTimer.singleShot(2500, lambda w=list(created_widgets): self._deferred_layout_arm_sync(w))
         except Exception:
             pass
         self.tray_icon.showMessage("Knoxnet VMS Beta", f"Layout '{layout.name}' restored", QSystemTrayIcon.MessageIcon.Information)

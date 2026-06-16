@@ -34,6 +34,7 @@ from desktop.widgets.shape_trigger_preview import (
     resolve_counter_pill_label,
     resolve_motion_path_for_frame,
     rule_to_hover_ghost_entry,
+    build_armed_rule_ghost_entries,
     rules_for_shape,
     upsert_event_rule_in_cache,
     shape_bounds,
@@ -198,6 +199,60 @@ class ShapeTriggerPreviewTests(unittest.TestCase):
         self.assertEqual(len(matched), 2)
         self.assertEqual(rules_for_shape(rules, ""), [])
         self.assertEqual(rules_for_shape(rules, "missing"), [])
+
+    def test_build_armed_rule_ghost_entries_groups_by_shape(self):
+        shape_a = {
+            "id": "zone_a",
+            "kind": "zone",
+            "pts": [
+                {"x": 0.2, "y": 0.2},
+                {"x": 0.6, "y": 0.2},
+                {"x": 0.4, "y": 0.5},
+            ],
+        }
+        shape_b = {
+            "id": "line_b",
+            "kind": "line",
+            "p1": {"x": 0.1, "y": 0.5},
+            "p2": {"x": 0.9, "y": 0.5},
+        }
+        rules = [
+            {
+                "id": "r1",
+                "shape_id": "zone_a",
+                "name": "Zone path",
+                "trigger": "path_match",
+                "enabled": True,
+                "conditions": {
+                    "motion_path": [{"x": 0.3, "y": 0.35}, {"x": 0.5, "y": 0.35}],
+                    "motion_path_space": MOTION_PATH_SPACE_FRAME,
+                },
+            },
+            {
+                "id": "r2",
+                "shape_id": "line_b",
+                "name": "Line path",
+                "trigger": "path_match",
+                "enabled": True,
+                "conditions": {
+                    "motion_path": [{"x": 0.2, "y": 0.5}, {"x": 0.8, "y": 0.5}],
+                    "motion_path_space": MOTION_PATH_SPACE_FRAME,
+                },
+            },
+            {
+                "id": "r3",
+                "shape_id": "zone_a",
+                "name": "Disabled",
+                "enabled": False,
+                "conditions": {"motion_path": [{"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.2}]},
+            },
+        ]
+        armed = build_armed_rule_ghost_entries(rules, [shape_a, shape_b])
+        self.assertIn("zone_a", armed)
+        self.assertIn("line_b", armed)
+        self.assertEqual(len(armed["zone_a"]), 1)
+        self.assertEqual(len(armed["line_b"]), 1)
+        self.assertEqual(armed["zone_a"][0]["name"], "Zone path")
 
     def test_rule_to_hover_ghost_entry(self):
         rule = {
