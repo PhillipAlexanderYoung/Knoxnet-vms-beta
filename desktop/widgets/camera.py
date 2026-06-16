@@ -74,6 +74,7 @@ from desktop.utils.event_rules_api import (
     cooldown_ms_from_sec,
     ensure_backend_detection_for_rules,
     filter_desktop_capture_events,
+    filter_desktop_counter_events,
     list_rules,
     migrate_motion_watch_settings,
     set_rules_enabled,
@@ -10146,17 +10147,15 @@ class CameraWidget(BaseDesktopWidget):
         """Receive motion-shape interactions from GL widget."""
         events = (payload or {}).get('events') or []
         src = (payload or {}).get("source") or None
-        # Zone/line counters follow server rule triggers (automation_alert) for Detection-mode
-        # rules when armed. Motion-mode rules and tags may also increment from local motion.
-        counter_events = list(events)
-        if self.motion_watch_active and self._server_event_rules_active():
-            counter_events = [
-                ev for ev in counter_events
-                if isinstance(ev, dict) and (
-                    str(ev.get("shape_type") or "") == "tag"
-                    or self._shape_uses_local_motion_counter(str(ev.get("shape_id") or ""))
-                )
-            ]
+        # Zone/line detection triggers follow server rules (``new_capture``) when armed.
+        # Motion-mode rules and tags use the local rule-coupled screenshot path.
+        counter_events = filter_desktop_counter_events(
+            events,
+            motion_watch_active=self.motion_watch_active,
+            server_event_rules_active=self._server_event_rules_active(),
+            trigger_source=src,
+            uses_local_motion_counter=self._shape_uses_local_motion_counter,
+        )
         if counter_events:
             for ev in counter_events:
                 sid = str(ev.get("shape_id") or "").strip()

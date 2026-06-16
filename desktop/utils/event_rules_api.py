@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
@@ -246,6 +246,13 @@ def ensure_legacy_rule(api_base: str, camera_id: str, settings: Dict[str, Any]) 
 # are armed. Tags remain desktop-only unless a server rule is added later.
 SERVER_AUTHORITATIVE_SHAPE_TYPES = frozenset({"zone", "line"})
 
+# Legacy Motion Watch snapshot path is suppressed for these shape types when
+# armed Event Rules are active (zone/line via server ``new_capture``; tag via
+# rule-coupled local capture). Mirrors the zone dedupe fix in 849b303.
+DESKTOP_LEGACY_CAPTURE_SUPPRESSED_TYPES = frozenset({"zone", "line", "tag"})
+
+DESKTOP_DETECTION_TRIGGER_SOURCES = frozenset({"desktop", "backend", "detection"})
+
 
 def shapes_to_api_payload(shapes: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """Convert desktop GL widget shapes into API/stream-server zones payload."""
@@ -391,13 +398,57 @@ def ensure_backend_detection_for_rules(
         return False
 
 
+def is_detection_sourced_shape_event(
+    ev: dict,
+    *,
+    trigger_source: Optional[str] = None,
+) -> bool:
+    """True when a shape-trigger event came from object detection, not motion boxes."""
+    src = str(trigger_source or ev.get("source") or "").strip().lower()
+    return src in DESKTOP_DETECTION_TRIGGER_SOURCES
+
+
+def filter_desktop_counter_events(
+    events: List[Dict[str, Any]],
+    *,
+    motion_watch_active: bool,
+    server_event_rules_active: bool,
+    trigger_source: Optional[str] = None,
+    uses_local_motion_counter: Callable[[str], bool],
+) -> List[Dict[str, Any]]:
+    """Return events that should drive local counter increments and coupled screenshots.
+
+    When armed server Event Rules own zone/line detection triggers, detection-sourced
+    zone/line events must not also run the local rule-coupled screenshot path (server
+    ``new_capture`` handles those). Motion-mode rules on the same shape may still count
+    locally from motion-box events. Tags always use the local rule-coupled path.
+    """
+    if not events:
+        return []
+    if not motion_watch_active or not server_event_rules_active:
+        return list(events)
+    filtered: List[Dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        shape_type = str(ev.get("shape_type") or "")
+        shape_id = str(ev.get("shape_id") or "")
+        if shape_type in SERVER_AUTHORITATIVE_SHAPE_TYPES:
+            if is_detection_sourced_shape_event(ev, trigger_source=trigger_source):
+                continue
+            if not uses_local_motion_counter(shape_id):
+                continue
+        filtered.append(ev)
+    return filtered
+
+
 def filter_desktop_capture_events(
     events: List[Dict[str, Any]],
     *,
     motion_watch_active: bool,
     server_event_rules_active: bool,
 ) -> List[Dict[str, Any]]:
-    """Return shape-trigger events that should still drive desktop snapshot capture."""
+    """Return shape-trigger events that should still drive legacy Motion Watch snapshots."""
     if not events:
         return []
     if not motion_watch_active or not server_event_rules_active:
@@ -405,7 +456,7 @@ def filter_desktop_capture_events(
     return [
         ev
         for ev in events
-        if isinstance(ev, dict) and ev.get("shape_type") not in SERVER_AUTHORITATIVE_SHAPE_TYPES
+        if isinstance(ev, dict) and ev.get("shape_type") not in DESKTOP_LEGACY_CAPTURE_SUPPRESSED_TYPES
     ]
 
 
