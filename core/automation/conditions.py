@@ -1176,8 +1176,14 @@ def matches_track_event(*, rule: Dict[str, Any], ctx: EvalContext, shape: Option
         if not _class_matches(track_obj, classes, min_conf):
             return False, {"reason": "object_filter", "rule_id": rule_id}
 
+    motion_path_cond = conditions.get("motion_path")
+    has_drawn_path = isinstance(motion_path_cond, list) and len(motion_path_cond) >= 2
+    path_gate = conditions.get("path_direction_gate")
     direction = conditions.get("direction")
-    if direction:
+    # Drawn-path rules use path_direction_gate for east/west discrimination (same as zones).
+    # Legacy line rules may have stored positive/negative which conflicts with line_cross
+    # payload direction (left_to_right/right_to_left) — ignore direction when gate is present.
+    if direction and not (has_drawn_path and isinstance(path_gate, dict) and path_gate.get("path_direction")):
         allowed_dirs = direction if isinstance(direction, list) else [direction]
         cur_dir = str(payload.get("direction") or track_obj.get("direction") or "").strip().lower()
         if cur_dir and cur_dir not in [str(d).strip().lower() for d in allowed_dirs if str(d).strip()]:

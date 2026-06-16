@@ -1871,6 +1871,7 @@ class CameraOpenGLWidget(QWidget):
                             'shape_id': sh['id'], 'shape_type': 'line',
                             'shape_name': sh.get('label') or sh.get('id', ''),
                             'interaction_type': 'crossed_line', 'point': pt,
+                            'centroid_history': self._motion_centroid_history_norm((bx, by, bw, bh)),
                         })
                         self.motion_hit_pulses.append({'ts': now, 'box': (bx, by, bw, bh)})
                         break
@@ -1886,6 +1887,7 @@ class CameraOpenGLWidget(QWidget):
                                 'shape_id': sh['id'], 'shape_type': 'tag',
                                 'shape_name': sh.get('label') or sh.get('id', ''),
                                 'interaction_type': 'near_tag', 'point': pt,
+                                'centroid_history': self._motion_centroid_history_norm((bx, by, bw, bh)),
                             })
                             self.motion_hit_pulses.append({'ts': now, 'box': (bx, by, bw, bh)})
                             break
@@ -2012,6 +2014,7 @@ class CameraOpenGLWidget(QWidget):
                                 "shape_name": sh.get("label") or sh.get("id", ""),
                                 "interaction_type": "crossed_line",
                                 "point": pt,
+                                "centroid_history": self._motion_centroid_history_norm((bx, by, bw, bh)),
                                 "source": source,
                                 "det_class": det.get("class"),
                                 "confidence": det.get("confidence"),
@@ -2035,6 +2038,7 @@ class CameraOpenGLWidget(QWidget):
                                     "shape_name": sh.get("label") or sh.get("id", ""),
                                     "interaction_type": "near_tag",
                                     "point": pt,
+                                    "centroid_history": self._motion_centroid_history_norm((bx, by, bw, bh)),
                                     "source": source,
                                     "det_class": det.get("class"),
                                     "confidence": det.get("confidence"),

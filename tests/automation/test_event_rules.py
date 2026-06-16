@@ -1093,6 +1093,211 @@ class MotionPathMatchingTests(unittest.TestCase):
             )
         )
 
+    def test_line_cross_drawn_path_ignores_legacy_direction_condition(self):
+        """East/west path rules must not fail on stale positive/negative direction fields."""
+        line_shape = {
+            "kind": "line",
+            "id": "line_1",
+            "p1": {"x": 0.5, "y": 0.2},
+            "p2": {"x": 0.5, "y": 0.8},
+        }
+        east_path = [{"x": 0.2, "y": 0.5}, {"x": 0.8, "y": 0.5}]
+        gate = compute_path_direction_gate(east_path, line_shape)
+        rule = {
+            "id": "r_line_east",
+            "enabled": True,
+            "trigger": "line_cross",
+            "shape_id": "line_1",
+            "conditions": {
+                "motion_path": east_path,
+                "motion_path_space": "frame",
+                "path_direction_gate": gate,
+                "direction": "negative",
+                "require_detection": False,
+            },
+        }
+        ctx = build_eval_context(
+            "track_event",
+            "cam1",
+            _track_event_payload(
+                event_type="line_cross",
+                shape_id="line_1",
+                direction="left_to_right",
+                centroid_history=[
+                    {"x": 0.45, "y": 0.5},
+                    {"x": 0.55, "y": 0.5},
+                ],
+                centroid_norm={"x": 0.55, "y": 0.5},
+            ),
+        )
+        ok, details = matches_track_event(rule=rule, ctx=ctx, shape=line_shape)
+        self.assertTrue(ok, details)
+
+    def test_line_cross_east_west_path_discrimination(self):
+        """Opposite east/west paths on the same vertical line should match only one rule."""
+        line_shape = {
+            "kind": "line",
+            "id": "line_1",
+            "p1": {"x": 0.5, "y": 0.2},
+            "p2": {"x": 0.5, "y": 0.8},
+        }
+        east_path = [{"x": 0.2, "y": 0.5}, {"x": 0.8, "y": 0.5}]
+        west_path = [{"x": 0.8, "y": 0.5}, {"x": 0.2, "y": 0.5}]
+        east_rule = {
+            "id": "r_east",
+            "enabled": True,
+            "trigger": "line_cross",
+            "shape_id": "line_1",
+            "conditions": {
+                "motion_path": east_path,
+                "motion_path_space": "frame",
+                "path_direction_gate": compute_path_direction_gate(east_path, line_shape),
+                "require_detection": False,
+            },
+        }
+        west_rule = {
+            "id": "r_west",
+            "enabled": True,
+            "trigger": "line_cross",
+            "shape_id": "line_1",
+            "conditions": {
+                "motion_path": west_path,
+                "motion_path_space": "frame",
+                "path_direction_gate": compute_path_direction_gate(west_path, line_shape),
+                "require_detection": False,
+            },
+        }
+        east_ctx = build_eval_context(
+            "track_event",
+            "cam1",
+            _track_event_payload(
+                event_type="line_cross",
+                shape_id="line_1",
+                direction="left_to_right",
+                centroid_history=[
+                    {"x": 0.45, "y": 0.5},
+                    {"x": 0.55, "y": 0.5},
+                ],
+                centroid_norm={"x": 0.55, "y": 0.5},
+            ),
+        )
+        west_ctx = build_eval_context(
+            "track_event",
+            "cam1",
+            _track_event_payload(
+                event_type="line_cross",
+                shape_id="line_1",
+                direction="right_to_left",
+                centroid_history=[
+                    {"x": 0.55, "y": 0.5},
+                    {"x": 0.45, "y": 0.5},
+                ],
+                centroid_norm={"x": 0.45, "y": 0.5},
+            ),
+        )
+        ok_east, _ = matches_track_event(rule=east_rule, ctx=east_ctx, shape=line_shape)
+        ok_west_on_east, details_we = matches_track_event(rule=west_rule, ctx=east_ctx, shape=line_shape)
+        ok_west, _ = matches_track_event(rule=west_rule, ctx=west_ctx, shape=line_shape)
+        ok_east_on_west, details_ew = matches_track_event(rule=east_rule, ctx=west_ctx, shape=line_shape)
+        self.assertTrue(ok_east)
+        self.assertFalse(ok_west_on_east, details_we)
+        self.assertTrue(ok_west)
+        self.assertFalse(ok_east_on_west, details_ew)
+
+    def test_local_motion_line_counter_respects_direction(self):
+        line_shape = {
+            "kind": "line",
+            "id": "line_1",
+            "p1": {"x": 0.5, "y": 0.2},
+            "p2": {"x": 0.5, "y": 0.8},
+        }
+        east_path = [{"x": 0.2, "y": 0.5}, {"x": 0.8, "y": 0.5}]
+        west_path = [{"x": 0.8, "y": 0.5}, {"x": 0.2, "y": 0.5}]
+        east_cond = {
+            "motion_path": east_path,
+            "path_direction_gate": compute_path_direction_gate(east_path, line_shape),
+            "require_detection": False,
+        }
+        west_cond = {
+            "motion_path": west_path,
+            "path_direction_gate": compute_path_direction_gate(west_path, line_shape),
+            "require_detection": False,
+        }
+        point = {"x": 0.5, "y": 0.5}
+        east_history = [{"x": 0.45, "y": 0.5}, {"x": 0.52, "y": 0.5}]
+        west_history = [{"x": 0.55, "y": 0.5}, {"x": 0.48, "y": 0.5}]
+
+        self.assertTrue(
+            local_motion_matches_counter_rule(
+                point=point,
+                centroid_history=east_history,
+                conditions=east_cond,
+                shape=line_shape,
+                trigger="line_cross",
+            )
+        )
+        self.assertFalse(
+            local_motion_matches_counter_rule(
+                point=point,
+                centroid_history=east_history,
+                conditions=west_cond,
+                shape=line_shape,
+                trigger="line_cross",
+            )
+        )
+        self.assertFalse(
+            local_motion_matches_counter_rule(
+                point=point,
+                centroid_history=[],
+                conditions=east_cond,
+                shape=line_shape,
+                trigger="line_cross",
+            )
+        )
+
+    def test_near_tag_drawn_path_direction(self):
+        tag_shape = {
+            "kind": "tag",
+            "id": "tag_1",
+            "anchor": {"x": 0.5, "y": 0.5},
+        }
+        east_path = [{"x": 0.2, "y": 0.5}, {"x": 0.8, "y": 0.5}]
+        west_path = [{"x": 0.8, "y": 0.5}, {"x": 0.2, "y": 0.5}]
+        east_rule = {
+            "id": "r_tag_east",
+            "enabled": True,
+            "trigger": "near_tag",
+            "shape_id": "tag_1",
+            "conditions": {
+                "motion_path": east_path,
+                "motion_path_space": "frame",
+                "path_direction_gate": compute_path_direction_gate(east_path, tag_shape),
+                "require_detection": False,
+            },
+        }
+        ctx = build_eval_context(
+            "track_event",
+            "cam1",
+            _track_event_payload(
+                event_type="near_tag",
+                shape_id="tag_1",
+                centroid_history=[
+                    {"x": 0.45, "y": 0.5},
+                    {"x": 0.55, "y": 0.5},
+                ],
+                centroid_norm={"x": 0.55, "y": 0.5},
+            ),
+        )
+        ok, details = matches_track_event(rule=east_rule, ctx=ctx, shape=tag_shape)
+        self.assertTrue(ok, details)
+        west_rule = dict(east_rule)
+        west_rule["id"] = "r_tag_west"
+        west_rule["conditions"] = dict(east_rule["conditions"])
+        west_rule["conditions"]["motion_path"] = west_path
+        west_rule["conditions"]["path_direction_gate"] = compute_path_direction_gate(west_path, tag_shape)
+        ok2, details2 = matches_track_event(rule=west_rule, ctx=ctx, shape=tag_shape)
+        self.assertFalse(ok2, details2)
+
     def test_min_confidence_ignored_without_classes(self):
         """Empty class list should not block motion tracks via min_confidence alone."""
         rule = {

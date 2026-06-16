@@ -309,7 +309,8 @@ def derive_trigger_from_path(
         return "zone_enter", "", None
 
     if kind == "line":
-        return "line_cross", derive_line_direction_from_path(shape, path), None
+        # Travel direction is encoded in path_direction_gate when a path is drawn.
+        return "line_cross", "", None
 
     if kind == "tag":
         return "near_tag", "", None
@@ -1999,7 +2000,8 @@ class ShapeTriggerDialog(QDialog):
         }
         if trigger_mode == "any_interaction":
             conditions["any_interaction"] = True
-        if direction:
+        # Direction for drawn paths is enforced via path_direction_gate (zones never set this).
+        if direction and len(path) < 2:
             conditions["direction"] = direction
 
         dwell_min = float(self.dwell_min_spin.value())
