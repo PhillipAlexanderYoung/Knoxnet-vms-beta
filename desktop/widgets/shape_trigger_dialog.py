@@ -117,7 +117,6 @@ PATH_TRIGGER_MODES = [
 ]
 
 DEFAULT_PATH_TOLERANCE = DEFAULT_PATH_MATCH_TOLERANCE
-MIN_PATH_POINT_DIST = 0.012
 
 COLOR_BUCKET_QCOLORS: Dict[str, QColor] = {
     "": QColor("#FFD74A"),
@@ -768,7 +767,7 @@ def _draw_counter_pill(
 
 
 class ShapeTriggerDialog(QDialog):
-    """Compact single-shape trigger editor with mouse-drawn motion path."""
+    """Compact single-shape trigger editor with click-placed motion path."""
 
     def __init__(
         self,
@@ -833,12 +832,6 @@ class ShapeTriggerDialog(QDialog):
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
-        path_col = QVBoxLayout()
-        path_col.setSpacing(4)
-        self.path_summary_label = QLabel("No path drawn")
-        self.path_summary_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        self.path_summary_label.setWordWrap(True)
-        path_col.addWidget(self.path_summary_label)
         path_btns = QHBoxLayout()
         path_btns.setSpacing(4)
         self.draw_path_btn = QPushButton("Draw path on camera")
@@ -849,8 +842,7 @@ class ShapeTriggerDialog(QDialog):
         self.clear_path_btn.setFixedHeight(28)
         self.clear_path_btn.clicked.connect(self._clear_path)
         path_btns.addWidget(self.clear_path_btn)
-        path_col.addLayout(path_btns)
-        top_row.addLayout(path_col)
+        top_row.addLayout(path_btns)
 
         controls_col = QVBoxLayout()
         controls_col.setSpacing(4)
@@ -1198,12 +1190,9 @@ class ShapeTriggerDialog(QDialog):
 
     def _apply_tooltips(self, kind: str) -> None:
         self.draw_path_btn.setToolTip(
-            "Draw the expected motion path directly on the live camera image. "
-            "The path spans the full scene (not clipped to the shape). "
-            "Drag on the video to sketch the route; drag the counter pill on-camera to reposition it."
-        )
-        self.path_summary_label.setToolTip(
-            "Read-only summary of the drawn path: point count and inferred trigger semantics."
+            "Place motion-path waypoints on the live camera overlay. "
+            "Click to add points, drag handles to adjust, then double-click, Enter, "
+            "or right-click to finish. Drag the counter pill on-camera to reposition it."
         )
         self.clear_path_btn.setToolTip(
             "Remove the drawn motion path so you can sketch a new one. "
@@ -1428,7 +1417,9 @@ class ShapeTriggerDialog(QDialog):
             self._on_path_draw_control("start", self.motion_path_norm())
         self._path_draw_active = True
         self.draw_path_btn.setText("Stop drawing")
-        self.status_label.setText("Draw the motion path on the live camera image.")
+        self.status_label.setText(
+            "Click on the camera to place path points. Double-click, Enter, or right-click to finish."
+        )
 
     def _stop_camera_path_draw(self) -> None:
         if not self._path_draw_active:
@@ -1456,18 +1447,6 @@ class ShapeTriggerDialog(QDialog):
             self._on_pill_move_control("stop")
         self._pill_move_active = False
         self.move_pill_btn.setText("Move counter pill")
-
-    def _update_path_summary(self) -> None:
-        path = self.motion_path_norm()
-        if len(path) < 2:
-            self.path_summary_label.setText("No path drawn — use Draw path on camera")
-            return
-        trig_label = TRIGGER_CHIP_LABELS.get(self._derived_trigger, self._derived_trigger.replace("_", " "))
-        dir_label = DIRECTION_LABELS.get(self._derived_direction, "") if self._derived_direction else ""
-        parts = [f"{len(path)} points", trig_label]
-        if dir_label:
-            parts.append(dir_label)
-        self.path_summary_label.setText(" · ".join(parts))
 
     def _rule_slot_for_id(self, rule_id: Optional[str]) -> int:
         sid = str(self.shape.get("id") or "")
@@ -1621,7 +1600,6 @@ class ShapeTriggerDialog(QDialog):
         else:
             parts.append("draw path")
         self.inferred_label.setText(" · ".join(parts))
-        self._update_path_summary()
 
     def _effective_trigger(self) -> str:
         mode = str(self.trigger_combo.currentData() or "auto_path")

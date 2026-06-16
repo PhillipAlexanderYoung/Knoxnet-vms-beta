@@ -535,12 +535,14 @@ class CameraOpenGLWidget(QWidget):
         self.path_draw_mode: bool = False
         self.pill_anchor_move_mode: bool = False
         self._path_draw_points: List[Dict[str, float]] = []
-        self._path_draw_active: bool = False
+        self._path_draw_initial_points: List[Dict[str, float]] = []
+        self._path_draw_vertex_idx: int = -1
         self._path_draw_pill_drag: bool = False
         self._path_draw_callback: Optional[Callable[[List[Dict[str, float]]], None]] = None
         self._path_draw_pill_callback: Optional[Callable[[Dict[str, float]], None]] = None
+        self._path_draw_finished_callback: Optional[Callable[[], None]] = None
         self._pill_move_pill_callback: Optional[Callable[[Dict[str, float]], None]] = None
-        self._path_draw_min_dist: float = 0.012
+        self._path_vertex_hit_radius: float = 0.018
         self.hover_rule_ghost: Optional[List[Dict[str, object]]] = None
         self.armed_rule_ghosts: Dict[str, List[Dict[str, object]]] = {}
         self.armed_overlays_enabled: bool = False
@@ -711,16 +713,21 @@ class CameraOpenGLWidget(QWidget):
         *,
         on_path_changed: Callable[[List[Dict[str, float]]], None],
         on_pill_anchor_changed: Optional[Callable[[Dict[str, float]], None]] = None,
+        on_path_finished: Optional[Callable[[], None]] = None,
         initial_path: Optional[List[Dict[str, float]]] = None,
     ) -> None:
-        """Enable drawing a frame-normalized motion path on the live camera image."""
+        """Enable click-to-place polyline motion path drawing on the live camera image."""
         self.path_draw_mode = True
         self._path_draw_callback = on_path_changed
         self._path_draw_pill_callback = on_pill_anchor_changed
+        self._path_draw_finished_callback = on_path_finished
         self._path_draw_points = [
             {"x": float(p["x"]), "y": float(p["y"])} for p in (initial_path or [])
         ]
-        self._path_draw_active = False
+        self._path_draw_initial_points = [
+            {"x": p["x"], "y": p["y"]} for p in self._path_draw_points
+        ]
+        self._path_draw_vertex_idx = -1
         self._path_draw_pill_drag = False
         self.drag_meta = None
         self.view_pan_drag = None
@@ -732,18 +739,67 @@ class CameraOpenGLWidget(QWidget):
                 break
             parent = parent.parent() if hasattr(parent, "parent") else None
         self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocus()
         self.update()
 
     def stop_path_draw_mode(self) -> None:
         """Disable camera path drawing."""
         self.path_draw_mode = False
-        self._path_draw_active = False
+        self._path_draw_vertex_idx = -1
         self._path_draw_pill_drag = False
         self._path_draw_callback = None
         self._path_draw_pill_callback = None
+        self._path_draw_finished_callback = None
+        self._path_draw_initial_points = []
         if not self.trigger_preview and not self.pill_anchor_move_mode:
             self.setCursor(Qt.CursorShape.ArrowCursor)
         self.update()
+
+    def _path_draw_point_copy(self) -> List[Dict[str, float]]:
+        return [{"x": p["x"], "y": p["y"]} for p in self._path_draw_points]
+
+    def _hit_test_path_vertex(self, norm: Pt) -> int:
+        for idx, pt in enumerate(self._path_draw_points):
+            if math.hypot(norm["x"] - pt["x"], norm["y"] - pt["y"]) <= self._path_vertex_hit_radius:
+                return idx
+        return -1
+
+    def _set_path_draw_vertex(self, idx: int, nx: float, ny: float) -> None:
+        if idx < 0 or idx >= len(self._path_draw_points):
+            return
+        self._path_draw_points[idx] = {
+            "x": clamp01(float(nx)),
+            "y": clamp01(float(ny)),
+        }
+
+    def _emit_path_draw_changed(self) -> None:
+        if self._path_draw_callback:
+            self._path_draw_callback(self._path_draw_point_copy())
+
+    def finish_path_draw_mode(self) -> None:
+        """Commit the polyline and exit path draw mode."""
+        if not self.path_draw_mode:
+            return
+        self._path_draw_vertex_idx = -1
+        self._emit_path_draw_changed()
+        finished = self._path_draw_finished_callback
+        self.stop_path_draw_mode()
+        if finished:
+            finished()
+
+    def cancel_path_draw_mode(self) -> None:
+        """Discard in-progress edits and restore the path from when draw mode started."""
+        if not self.path_draw_mode:
+            return
+        self._path_draw_points = [
+            {"x": p["x"], "y": p["y"]} for p in self._path_draw_initial_points
+        ]
+        self._path_draw_vertex_idx = -1
+        self._emit_path_draw_changed()
+        finished = self._path_draw_finished_callback
+        self.stop_path_draw_mode()
+        if finished:
+            finished()
 
     def start_pill_anchor_move_mode(
         self,
@@ -770,18 +826,48 @@ class CameraOpenGLWidget(QWidget):
             self.setCursor(Qt.CursorShape.CrossCursor)
         self.update()
 
-    def _append_path_draw_point(self, nx: float, ny: float) -> None:
-        if self._path_draw_points:
-            lx = self._path_draw_points[-1]["x"]
-            ly = self._path_draw_points[-1]["y"]
-            if math.hypot(nx - lx, ny - ly) < self._path_draw_min_dist:
-                return
-        self._path_draw_points.append({"x": nx, "y": ny})
+    def _paint_path_draw_overlay(
+        self,
+        painter: QPainter,
+        *,
+        x_offset: float,
+        y_offset: float,
+        view_w: float,
+        view_h: float,
+    ) -> None:
+        """Draw in-progress polyline waypoints while path draw mode is active."""
+        if not self.path_draw_mode or not self._path_draw_points:
+            return
 
-    def _emit_path_draw_changed(self) -> None:
-        if self._path_draw_callback:
-            path = [{"x": p["x"], "y": p["y"]} for p in self._path_draw_points]
-            self._path_draw_callback(path)
+        def _pt(nx: float, ny: float) -> QPointF:
+            return QPointF(x_offset + nx * view_w, y_offset + ny * view_h)
+
+        widget_pts = [_pt(p["x"], p["y"]) for p in self._path_draw_points]
+        accent = QColor("#24D1FF")
+        accent.setAlpha(220)
+        line_pen = QPen(accent, 2)
+        painter.setPen(line_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if len(widget_pts) >= 2:
+            for i in range(len(widget_pts) - 1):
+                painter.drawLine(widget_pts[i], widget_pts[i + 1])
+
+        if self.cursor_norm and widget_pts:
+            ghost_pen = QPen(QColor(148, 163, 184, 180))
+            ghost_pen.setStyle(Qt.PenStyle.DashLine)
+            ghost_pen.setWidth(2)
+            painter.setPen(ghost_pen)
+            cursor_pt = _pt(self.cursor_norm["x"], self.cursor_norm["y"])
+            painter.drawLine(widget_pts[-1], cursor_pt)
+
+        handle_fill = QColor("#0F172A")
+        for idx, wpt in enumerate(widget_pts):
+            is_active = idx == self._path_draw_vertex_idx
+            radius = 6.0 if is_active else 5.0
+            handle_col = QColor("#FFD74A" if is_active else "#4ADE80")
+            painter.setPen(QPen(handle_col, 2))
+            painter.setBrush(handle_fill if not is_active else handle_col)
+            painter.drawEllipse(wpt, radius, radius)
 
     def _hit_test_preview_pill(self, pos: QPointF) -> bool:
         tp = self.trigger_preview
@@ -2888,6 +2974,13 @@ class CameraOpenGLWidget(QWidget):
                                     text_color=str(item.get("text_color") or ""),
                                 )
                         if self.path_draw_mode:
+                            self._paint_path_draw_overlay(
+                                painter,
+                                x_offset=float(x_offset),
+                                y_offset=float(y_offset),
+                                view_w=view_w,
+                                view_h=view_h,
+                            )
                             hint_font = painter.font()
                             hint_font.setPointSize(10)
                             painter.setFont(hint_font)
@@ -2895,7 +2988,7 @@ class CameraOpenGLWidget(QWidget):
                             painter.drawText(
                                 int(x_offset) + 8,
                                 int(y_offset + view_h) - 8,
-                                "Drag on video to draw path · drag pill to reposition · right-click to cancel",
+                                "Click to add points · drag handles · dbl-click/Enter/right-click finish · Esc cancel · Backspace undo",
                             )
 
                 # Armed rule overlays (motion watch active; visible without hover)
@@ -3300,15 +3393,16 @@ class CameraOpenGLWidget(QWidget):
         if self._in_parent_resize_zone(event):
             event.ignore()
             return
-        # Right-click while drawing: cancel and pass through so dragging still works
-        if event.button() == Qt.MouseButton.RightButton and (
-            self.draw_mode != 'idle' or self.path_draw_mode or self.pill_anchor_move_mode
-        ):
-            if self.path_draw_mode:
-                self.stop_path_draw_mode()
-            if self.pill_anchor_move_mode:
-                self.stop_pill_anchor_move_mode()
+        # Right-click while drawing shapes: cancel and pass through so dragging still works
+        if event.button() == Qt.MouseButton.RightButton and self.draw_mode != 'idle':
             self.cancel_draw_mode()
+            return super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.RightButton and self.path_draw_mode:
+            self.finish_path_draw_mode()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton and self.pill_anchor_move_mode:
+            self.stop_pill_anchor_move_mode()
             return super().mousePressEvent(event)
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
@@ -3325,7 +3419,7 @@ class CameraOpenGLWidget(QWidget):
                 return
             event.accept()
             return
-        # Path draw mode (event rule dialog) — full frame, not limited to shape bounds
+        # Path draw mode (event rule dialog) — click-to-place polyline on full frame
         if self.path_draw_mode and norm:
             if self._hit_test_preview_pill(event.position()):
                 self._path_draw_pill_drag = True
@@ -3334,8 +3428,14 @@ class CameraOpenGLWidget(QWidget):
                 return
             self.drag_meta = None
             self.view_pan_drag = None
-            self._path_draw_active = True
-            self._path_draw_points = [{"x": norm["x"], "y": norm["y"]}]
+            vertex_idx = self._hit_test_path_vertex(norm)
+            if vertex_idx >= 0:
+                self._path_draw_vertex_idx = vertex_idx
+            else:
+                self._path_draw_points.append(
+                    {"x": clamp01(norm["x"]), "y": clamp01(norm["y"])}
+                )
+                self._path_draw_vertex_idx = len(self._path_draw_points) - 1
             self._emit_path_draw_changed()
             self.update()
             event.accept()
@@ -3492,6 +3592,16 @@ class CameraOpenGLWidget(QWidget):
         return True
 
     def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.path_draw_mode:
+            if len(self._path_draw_points) >= 2:
+                last = self._path_draw_points[-1]
+                prev = self._path_draw_points[-2]
+                if math.hypot(last["x"] - prev["x"], last["y"] - prev["y"]) < self._path_vertex_hit_radius:
+                    self._path_draw_points.pop()
+                    self._emit_path_draw_changed()
+            self.finish_path_draw_mode()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             sid = self._hit_test_shape(event.position())
             if sid:
@@ -3516,16 +3626,29 @@ class CameraOpenGLWidget(QWidget):
                 self._set_preview_pill_from_widget(pos)
                 event.accept()
                 return
-            if self._path_draw_active and norm:
-                self._append_path_draw_point(norm["x"], norm["y"])
+            if self._path_draw_vertex_idx >= 0 and norm:
+                self._set_path_draw_vertex(
+                    self._path_draw_vertex_idx,
+                    norm["x"],
+                    norm["y"],
+                )
                 self._emit_path_draw_changed()
                 self.update()
                 event.accept()
                 return
-            if self._hit_test_preview_pill(pos):
+            if norm and self._path_draw_points:
+                vertex_idx = self._hit_test_path_vertex(norm)
+                if vertex_idx >= 0:
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                elif self._hit_test_preview_pill(pos):
+                    self.setCursor(Qt.CursorShape.SizeAllCursor)
+                else:
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+            elif self._hit_test_preview_pill(pos):
                 self.setCursor(Qt.CursorShape.SizeAllCursor)
             else:
                 self.setCursor(Qt.CursorShape.CrossCursor)
+            self.update()
             event.accept()
             return
 
@@ -3625,13 +3748,9 @@ class CameraOpenGLWidget(QWidget):
                 event.accept()
                 return
         if self.path_draw_mode:
-            if self._path_draw_active:
-                self._path_draw_active = False
-                norm = self._widget_to_norm(event.position())
-                if norm:
-                    self._append_path_draw_point(norm["x"], norm["y"])
-                self._emit_path_draw_changed()
-                self.update()
+            if self._path_draw_vertex_idx >= 0:
+                self._path_draw_vertex_idx = -1
+                self.setCursor(Qt.CursorShape.CrossCursor)
                 event.accept()
                 return
         if self.view_pan_drag:
@@ -3665,6 +3784,22 @@ class CameraOpenGLWidget(QWidget):
         return super().leaveEvent(event)
 
     def keyPressEvent(self, event):
+        if self.path_draw_mode:
+            if event.key() == Qt.Key.Key_Escape:
+                self.cancel_path_draw_mode()
+                event.accept()
+                return
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.finish_path_draw_mode()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Backspace and self._path_draw_points:
+                self._path_draw_points.pop()
+                self._path_draw_vertex_idx = -1
+                self._emit_path_draw_changed()
+                self.update()
+                event.accept()
+                return
         if event.key() == Qt.Key.Key_Escape:
             if self.view_zoom > self.VIEW_MIN_ZOOM or self.view_pan_x or self.view_pan_y:
                 self.reset_view_zoom()
@@ -9678,6 +9813,7 @@ class CameraWidget(BaseDesktopWidget):
                 self.gl_widget.start_path_draw_mode(
                     on_path_changed=lambda p: dialog.set_motion_path_from_camera(p) if dialog else None,
                     on_pill_anchor_changed=lambda a: dialog.set_pill_anchor_from_camera(a) if dialog else None,
+                    on_path_finished=lambda: dialog._stop_camera_path_draw() if dialog else None,
                     initial_path=path,
                 )
             elif action in ("stop", "clear"):
