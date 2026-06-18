@@ -18,8 +18,6 @@ gradio==4.29.0
 matplotlib
 psutil
 cryptography
-qrcode
-pypng
 
 # PTZ camera control
 pytapo>=3.3.0,<4

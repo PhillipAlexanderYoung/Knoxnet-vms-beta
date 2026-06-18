@@ -330,13 +330,6 @@ def register_routes(app, cm=None, ss=None, ai=None, alerts=None, agent=None, db=
     except Exception as e:
         logger.warning(f"System routes not registered: {e}")
 
-    # Register Remote Access routes (WireGuard VPN)
-    try:
-        from api.remote_access_routes import init_remote_access_routes
-        init_remote_access_routes(app)
-    except Exception as e:
-        logger.warning(f"Remote access routes not registered: {e}")
-
 
 def safe_service_call(service, method_name, default_return=None, *args, **kwargs):
     """Safely call a service method with error handling"""
