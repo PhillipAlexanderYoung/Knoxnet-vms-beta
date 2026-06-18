@@ -11,6 +11,7 @@ import socket
 import socketio
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import re as _re
 import uuid
@@ -1994,17 +1995,8 @@ class CameraOpenGLWidget(QWidget):
             self.motion_hit_pulses = self.motion_hit_pulses[-50:]
         if events and self.camera_id:
             trigger_mono = time.monotonic()
-            trigger_jpg = None
-            try:
-                fr = getattr(self, "_current_frame", None)
-                if fr is not None:
-                    ok, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    if ok:
-                        trigger_jpg = bytes(buf)
-            except Exception:
-                trigger_jpg = None
             self._mw_trigger_mono = trigger_mono
-            self._mw_trigger_jpg = trigger_jpg
+            self._mw_trigger_jpg = None
             self.shape_triggered.emit({
                 'camera_id': self.camera_id,
                 'events': events,
@@ -6735,6 +6727,14 @@ class CameraWidget(BaseDesktopWidget):
     # Global capture throttle: if many cameras trigger at once, cap concurrent capture workers
     # so live rendering stays responsive.
     _motion_watch_capture_sem = threading.Semaphore(4)
+    _motion_watch_capture_executor = ThreadPoolExecutor(
+        max_workers=4,
+        thread_name_prefix="motion-watch-capture",
+    )
+    _motion_watch_ring_executor = ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="motion-watch-ring",
+    )
     """
     Desktop Widget wrapper for the OpenGL Camera view.
     Connects to the shared CameraManager to fetch frames.
@@ -6928,8 +6928,9 @@ class CameraWidget(BaseDesktopWidget):
         # Rolling snapshot buffer for trigger-aligned stills (monotonic_ts, jpg_bytes).
         self._motion_watch_snapshot_ring: deque = deque(maxlen=90)
         self._motion_watch_ring_lock = threading.Lock()
-        self._motion_watch_ring_fps: float = 30.0
+        self._motion_watch_ring_fps: float = 12.0
         self._motion_watch_ring_last_push: float = 0.0
+        self._motion_watch_ring_encode_pending: int = 0
         
         # Setup OpenGL Widget
         self.shapes_by_camera: Dict[str, List[Shape]] = {}
@@ -9673,23 +9674,30 @@ class CameraWidget(BaseDesktopWidget):
         inline = str(payload.get("thumb_b64") or payload.get("image_b64") or "").strip()
         if inline:
             return inline
+        return None
+
+    def _capture_image_uri_from_payload(self, payload: dict) -> Optional[str]:
+        """Return a thumbnail/full-image URI without reading image bytes on the UI thread."""
+        if not isinstance(payload, dict):
+            return None
         candidates: List[str] = []
-        for key in ("thumb_uri", "file_uri", "file_path", "thumb_path"):
+        for key in ("thumb_uri", "thumb_path", "file_uri", "file_path"):
             raw = str(payload.get(key) or "").strip()
             if raw:
                 candidates.append(raw)
         seen: set[str] = set()
         for raw in candidates:
-            path_str = raw[7:] if raw.startswith("file://") else raw
-            if path_str in seen:
+            if raw in seen:
                 continue
-            seen.add(path_str)
-            path = Path(path_str)
-            if path.exists() and path.is_file():
-                try:
-                    return base64.b64encode(path.read_bytes()).decode("utf-8")
-                except Exception:
-                    continue
+            seen.add(raw)
+            if raw.startswith("file://"):
+                return raw
+            try:
+                path = Path(raw)
+                if path.exists() and path.is_file():
+                    return path.resolve().as_uri()
+            except Exception:
+                continue
         return None
 
     def _notify_terminal_event_rule_capture(self, payload: dict, *, source: str = "new_capture") -> None:
@@ -9715,6 +9723,7 @@ class CameraWidget(BaseDesktopWidget):
             from desktop.widgets.terminal import TerminalWidget
 
             thumb_b64 = self._capture_thumb_b64_from_payload(payload)
+            image_uri = self._capture_image_uri_from_payload(payload)
             result = {
                 "file_path": str(payload.get("file_path") or ""),
                 "shape_name": payload.get("shape_name"),
@@ -9732,6 +9741,7 @@ class CameraWidget(BaseDesktopWidget):
                 str(self.camera_id),
                 terminal_kwargs["text"],
                 image_b64=terminal_kwargs.get("image_b64"),
+                image_uri=image_uri,
                 link=terminal_kwargs.get("link"),
                 link_label=terminal_kwargs.get("link_label"),
                 remaining_seconds=remaining,
@@ -10977,7 +10987,12 @@ class CameraWidget(BaseDesktopWidget):
             return 3.0
 
     def _push_motion_watch_snapshot_ring(self, frame: np.ndarray) -> None:
-        """Buffer recent frames for trigger-aligned still captures (encode off UI thread)."""
+        """Buffer recent frames for trigger-aligned still captures.
+
+        The UI thread only rate-limits and snapshots the array reference. Copying
+        and JPEG encoding happen on a bounded executor so armed Motion Watch does
+        not create one short-lived thread per camera frame.
+        """
         if not self.motion_watch_active:
             return
         try:
@@ -10985,22 +11000,45 @@ class CameraWidget(BaseDesktopWidget):
             interval = 1.0 / max(1.0, float(self._motion_watch_ring_fps))
             if (now - float(self._motion_watch_ring_last_push or 0.0)) < interval:
                 return
-            self._motion_watch_ring_last_push = now
-            frame_copy = frame.copy()
+            with self._motion_watch_ring_lock:
+                if self._motion_watch_ring_encode_pending >= 2:
+                    return
+                self._motion_watch_ring_encode_pending += 1
+                self._motion_watch_ring_last_push = now
         except Exception:
             return
 
-        def _encode():
+        def _encode(frame_ref: np.ndarray, ts: float):
             try:
+                frame_copy = frame_ref.copy()
                 ok, buf = cv2.imencode(".jpg", frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 if not ok:
                     return
                 with self._motion_watch_ring_lock:
-                    self._motion_watch_snapshot_ring.append((now, bytes(buf)))
+                    self._motion_watch_snapshot_ring.append((ts, bytes(buf)))
             except Exception:
                 pass
+            finally:
+                try:
+                    with self._motion_watch_ring_lock:
+                        self._motion_watch_ring_encode_pending = max(
+                            0,
+                            int(self._motion_watch_ring_encode_pending or 0) - 1,
+                        )
+                except Exception:
+                    pass
 
-        threading.Thread(target=_encode, daemon=True).start()
+        try:
+            CameraWidget._motion_watch_ring_executor.submit(_encode, frame, now)
+        except Exception:
+            try:
+                with self._motion_watch_ring_lock:
+                    self._motion_watch_ring_encode_pending = max(
+                        0,
+                        int(self._motion_watch_ring_encode_pending or 0) - 1,
+                    )
+            except Exception:
+                pass
 
     def _pick_snapshot_jpg(self, trigger_mono: float, offset_ms: int = 0) -> Optional[bytes]:
         """Return the ring frame closest to trigger_mono + offset_ms."""
@@ -11102,8 +11140,11 @@ class CameraWidget(BaseDesktopWidget):
             label_at_capture = capture_labeling_enabled(capture_label_model)
 
             frame_img: Optional[QImage] = None
-            if pre_encoded_jpg:
-                frame_img = self._qimage_from_jpg_bytes(pre_encoded_jpg)
+            worker_jpg = pre_encoded_jpg
+            if worker_jpg:
+                # Decode in the worker. Decoding here would put the JPEG path
+                # back on the Qt event loop and visibly pause live camera paints.
+                frame_img = None
             elif self.gl_widget.image and not self.gl_widget.image.isNull():
                 frame_img = self.gl_widget.image.copy()
                 if include_overlays and overlay_snapshot is None:
@@ -11123,7 +11164,7 @@ class CameraWidget(BaseDesktopWidget):
                     QTimer.singleShot(0, self._dispatch_next_motion_watch_capture)
                     return
 
-            if not frame_img or frame_img.isNull():
+            if (not worker_jpg) and (not frame_img or frame_img.isNull()):
                 with self._motion_watch_capture_lock:
                     self._motion_watch_capture_inflight = False
                 if acquired_global_capture:
@@ -11161,8 +11202,13 @@ class CameraWidget(BaseDesktopWidget):
                 bx, by, bw, bh = motion_box
                 motion_box_payload = {"x": int(bx), "y": int(by), "w": int(bw), "h": int(bh)}
 
-            def _worker(img: QImage):
+            def _worker(img: Optional[QImage], jpg_bytes_in: Optional[bytes]):
                 try:
+                    if img is None and jpg_bytes_in:
+                        img = self._qimage_from_jpg_bytes(jpg_bytes_in)
+                    if img is None or img.isNull():
+                        return
+
                     # Apply overlays in worker (if requested and we have a snapshot).
                     if include_overlays and isinstance(overlay_snapshot, dict):
                         try:
@@ -11318,7 +11364,10 @@ class CameraWidget(BaseDesktopWidget):
                             except Exception:
                                 pass
 
-                    threading.Thread(target=_enrich_and_ingest, daemon=True).start()
+                    try:
+                        CameraWidget._motion_watch_capture_executor.submit(_enrich_and_ingest)
+                    except Exception:
+                        threading.Thread(target=_enrich_and_ingest, daemon=True).start()
 
                     # Success screenshots are shown only via ``new_capture`` after ingest
                     # (see ``_on_new_capture``). Posting here duplicated server and local
@@ -11333,7 +11382,7 @@ class CameraWidget(BaseDesktopWidget):
                             pass
                     QTimer.singleShot(0, self._dispatch_next_motion_watch_capture)
 
-            threading.Thread(target=_worker, args=(frame_img,), daemon=True).start()
+            CameraWidget._motion_watch_capture_executor.submit(_worker, frame_img, worker_jpg)
         except Exception as e:
             print(f"Motion watch capture error for {self.camera_id}: {e}")
             with self._motion_watch_capture_lock:

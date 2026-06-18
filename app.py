@@ -285,6 +285,46 @@ def _enabled_cameras() -> List[Dict[str, Any]]:
     return [c for c in cameras_db if c.get("enabled", True)]
 
 
+def _stream_has_live_frame(stream_info: Any) -> bool:
+    if isinstance(stream_info, dict):
+        return stream_info.get('last_frame') is not None
+    return False
+
+
+def _camera_runtime_stream_active(camera_id: str) -> bool:
+    """Return True when the local backend stream server has a fresh frame for this camera."""
+    if not camera_id:
+        return False
+    try:
+        ss = globals().get('STREAM_SERVER_GLOBAL')
+        streams = getattr(ss, 'active_streams', None) if ss is not None else None
+        if not isinstance(streams, dict):
+            return False
+        if _stream_has_live_frame(streams.get(camera_id)):
+            return True
+        prefix = f"{camera_id}:"
+        for key, info in streams.items():
+            if str(key).startswith(prefix) and _stream_has_live_frame(info):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _apply_runtime_camera_seen_status(camera: Dict[str, Any]) -> None:
+    """Overlay active-stream status onto a camera snapshot for Post/status consumers."""
+    if not isinstance(camera, dict):
+        return
+    camera_id = str(camera.get('id') or '').strip()
+    if not _camera_runtime_stream_active(camera_id):
+        return
+    seen_at = datetime.now().isoformat()
+    camera['online'] = True
+    camera['ready'] = True
+    camera['status'] = 'live'
+    camera['last_seen'] = seen_at
+
+
 def _sanitize_fs_name(name: str) -> str:
     """Sanitize a string for safe use as a filesystem directory name."""
     import re
@@ -3931,7 +3971,11 @@ def connect_cameras():
 @app.route('/api/cameras', methods=['GET'])
 def get_cameras():
     # Keep list endpoint lightweight: do NOT block on MediaMTX readiness checks.
-    camera_snapshots = [serialize_camera(camera, include_mediamtx=False) for camera in cameras_db]
+    camera_snapshots = []
+    for camera in cameras_db:
+        snapshot = serialize_camera(camera, include_mediamtx=False)
+        _apply_runtime_camera_seen_status(snapshot)
+        camera_snapshots.append(snapshot)
     return jsonify({
         "status": "success",
         "data": camera_snapshots,
@@ -4083,9 +4127,11 @@ def get_devices():
 def get_camera(camera_id):
     camera = next((c for c in cameras_db if c['id'] == camera_id), None)
     if camera:
+        snapshot = serialize_camera(camera, force_mediamtx_check=True)
+        _apply_runtime_camera_seen_status(snapshot)
         return jsonify({
             "status": "success",
-            "data": serialize_camera(camera, force_mediamtx_check=True)
+            "data": snapshot
         })
     return jsonify({
         "status": "error",

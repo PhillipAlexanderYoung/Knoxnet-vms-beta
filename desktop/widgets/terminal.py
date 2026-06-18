@@ -437,6 +437,7 @@ class TerminalWidget(BaseDesktopWidget):
         text: str,
         kind: str = "output",
         image_b64: Optional[str] = None,
+        image_uri: Optional[str] = None,
         link: Optional[str] = None,
         link_label: Optional[str] = None,
         tool: Optional[str] = None,
@@ -452,6 +453,8 @@ class TerminalWidget(BaseDesktopWidget):
         }
         if image_b64:
             entry["img"] = image_b64
+        if image_uri:
+            entry["img_uri"] = image_uri
         if link:
             entry["link"] = link
         if link_label:
@@ -471,6 +474,7 @@ class TerminalWidget(BaseDesktopWidget):
             text=payload.get("text", ""),
             kind=payload.get("kind", "output"),
             image_b64=payload.get("image_b64"),
+            image_uri=payload.get("image_uri"),
             link=payload.get("link"),
             link_label=payload.get("link_label"),
             tool=payload.get("tool"),
@@ -482,6 +486,7 @@ class TerminalWidget(BaseDesktopWidget):
         text: str,
         kind: str = "output",
         image_b64: Optional[str] = None,
+        image_uri: Optional[str] = None,
         link: Optional[str] = None,
         link_label: Optional[str] = None,
         tool: Optional[str] = None,
@@ -493,6 +498,7 @@ class TerminalWidget(BaseDesktopWidget):
                 "text": text,
                 "kind": kind,
                 "image_b64": image_b64,
+                "image_uri": image_uri,
                 "link": link,
                 "link_label": link_label,
                 "tool": tool,
@@ -539,6 +545,12 @@ class TerminalWidget(BaseDesktopWidget):
             img_html = (
                 f'<div style="margin-top:6px;"><a href="image://{key}">'
                 f'<img src="data:image/jpeg;base64,{entry["img"]}" style="max-width:100%;max-height:240px;border:1px solid #374151;border-radius:6px;" /></a></div>'
+            )
+        elif entry.get("img_uri"):
+            src = self._escape(str(entry.get("img_uri") or ""))
+            img_html = (
+                f'<div style="margin-top:6px;"><a href="{src}">'
+                f'<img src="{src}" style="max-width:100%;max-height:240px;border:1px solid #374151;border-radius:6px;" /></a></div>'
             )
 
         link_html = ""
@@ -3396,6 +3408,7 @@ class TerminalWidget(BaseDesktopWidget):
         *,
         countdown: Optional[int] = None,
         image_b64: Optional[str] = None,
+        image_uri: Optional[str] = None,
         link: Optional[str] = None,
         link_label: Optional[str] = None,
         remaining_seconds: Optional[int] = None,
@@ -3413,6 +3426,7 @@ class TerminalWidget(BaseDesktopWidget):
             "text": text,
             "kind": kind or ("info" if countdown is not None else "success"),
             "image_b64": image_b64,
+            "image_uri": image_uri,
             "link": link,
             "link_label": link_label,
             "tool": "motion_watch",

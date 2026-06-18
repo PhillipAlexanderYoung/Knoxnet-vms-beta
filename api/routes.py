@@ -661,6 +661,7 @@ def events_search():
                     "id": eid,
                     "captured_at": h.captured_at,
                     "captured_ts": h.captured_ts,
+                    "camera_id": h.camera_id,
                     "camera_name": h.camera_name,
                     "file_path": file_p,
                     "file_uri": _file_uri(file_p) if file_p else "",
@@ -1509,6 +1510,7 @@ def events_report():
                     "event_id": eid,
                     "captured_ts": int(h.captured_ts or 0),
                     "captured_at": str(h.captured_at or ""),
+                    "camera_id": str(h.camera_id or ""),
                     "camera_name": str(h.camera_name or ""),
                     "caption": str(h.caption or ""),
                     "file_uri": _file_uri(file_p),
@@ -2609,6 +2611,8 @@ def _build_live_report_html() -> str:
         const zoneBadge = e.shape_name ? '<span class="tag zone-tag">' + e.shape_name + '</span>' : '';
         const clipBadge = isClip ? '<span class="tag clip-tag">clip</span>' : '';
         const colorBadge = e.dominant_color ? '<span class="tag" style="background:rgba(148,163,184,0.12);color:var(--muted);border-color:var(--border);">' + e.dominant_color + '</span>' : '';
+        const recCam = String(e.camera_id || e.camera_name || '');
+        const recCamArg = recCam.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         let thumbHtml;
         if (isClip) {
           const previewUrl = e.preview_uri || (e.file_uri.split('?')[0] + '?id=' + encodeURIComponent(e.event_id) + '&kind=preview');
@@ -2625,7 +2629,7 @@ def _build_live_report_html() -> str:
               '<img src="' + (e.thumb_uri || e.file_uri) + '" loading="lazy">' +
             '</div>';
         }
-        const extractBtn = '<button class="extract-clip-btn" onclick="event.stopPropagation();extractClip(\'' + (e.camera_name||'') + '\',' + (e.captured_ts||0) + ')" title="Extract clip from recording">&#9986; Clip</button>';
+        const extractBtn = '<button class="extract-clip-btn" onclick="event.stopPropagation();extractClip(\'' + recCamArg + '\',' + (e.captured_ts||0) + ')" title="Extract clip from recording">&#9986; Clip</button>';
         item.innerHTML = thumbHtml +
           '<div class="item-info">' +
             '<div class="item-header">' +
@@ -2708,11 +2712,12 @@ def _build_live_report_html() -> str:
     }
 
     function loadRecordingForEvent(e) {
-      if (!e || !e.camera_name || !e.captured_ts) return;
+      const recCam = e ? String(e.camera_id || e.camera_name || '') : '';
+      if (!e || !recCam || !e.captured_ts) return;
       const playbackPort = 9996;
       const startDt = new Date(e.captured_ts * 1000);
       const iso = startDt.toISOString();
-      const videoUrl = 'http://localhost:' + playbackPort + '/get?path=' + encodeURIComponent(e.camera_name) + '&start=' + encodeURIComponent(iso) + '&duration=300';
+      const videoUrl = 'http://localhost:' + playbackPort + '/get?path=' + encodeURIComponent(recCam) + '&start=' + encodeURIComponent(iso) + '&duration=300';
       floatImg.style.display = 'none';
       floatVideo.style.display = '';
       floatVideo.src = videoUrl;

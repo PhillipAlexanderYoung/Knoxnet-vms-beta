@@ -140,6 +140,8 @@ class KnoxnetDesktopApp(QApplication):
         self._tray_cam_cache_ts: float = 0.0
         self._tray_cam_cache_lock = threading.Lock()
         self._tray_cam_refresh_inflight = False
+        self._camera_seen_sync_lock = threading.Lock()
+        self._camera_seen_sync_last: dict[str, float] = {}
 
         # ---- Layout scheduler (time-of-day / uptime) ----
         self._scheduler_started_at_ts: float = time.time()
@@ -473,6 +475,56 @@ class KnoxnetDesktopApp(QApplication):
         except Exception:
             return False
 
+    def _mark_camera_seen_from_frame(self, camera_id: str, *, min_interval: float = 15.0) -> None:
+        """Persist local frame receipt so Security Post can show accurate last-seen state."""
+        camera_id = str(camera_id or "").strip()
+        if not camera_id:
+            return
+
+        now_ts = time.time()
+        with self._camera_seen_sync_lock:
+            last_ts = float(self._camera_seen_sync_last.get(camera_id, 0.0) or 0.0)
+            if now_ts - last_ts < min_interval:
+                return
+            self._camera_seen_sync_last[camera_id] = now_ts
+
+        seen_at = datetime.now().isoformat()
+        candidates = [Path("data/cameras.json"), self.cameras_json_path]
+        seen_paths: set[Path] = set()
+
+        for path in candidates:
+            try:
+                path = path.resolve()
+                if path in seen_paths or not path.exists():
+                    continue
+                seen_paths.add(path)
+                with path.open("r", encoding="utf-8") as f:
+                    cameras = json.load(f)
+                if not isinstance(cameras, list):
+                    continue
+
+                changed = False
+                for camera in cameras:
+                    if isinstance(camera, dict) and str(camera.get("id") or "") == camera_id:
+                        camera["last_seen"] = seen_at
+                        camera["status"] = "live"
+                        camera["online"] = True
+                        camera["ready"] = True
+                        camera["updated_at"] = seen_at
+                        changed = True
+                        break
+                if not changed:
+                    continue
+
+                tmp_path = path.with_name(f".{path.name}.seen.tmp")
+                with tmp_path.open("w", encoding="utf-8") as f:
+                    json.dump(cameras, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+            except Exception as exc:
+                logger.debug("Failed to sync camera last_seen for %s via %s: %s", camera_id, path, exc)
+
     def run_camera_manager(self):
         """Run the asyncio loop for CameraManager."""
         import asyncio
@@ -488,6 +540,7 @@ class KnoxnetDesktopApp(QApplication):
         def frame_callback(camera_id, frame):
             if getattr(self, "_shutdown_done", False):
                 return
+            self._mark_camera_seen_from_frame(camera_id)
             try:
                 self.frame_signal.emit(camera_id, frame)
             except RuntimeError:
