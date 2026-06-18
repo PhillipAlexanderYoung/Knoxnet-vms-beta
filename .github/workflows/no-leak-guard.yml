@@ -1,0 +1,26 @@
+name: No-Leak Guard
+
+# Fails the build if private control-plane / fleet / remote-access code or an
+# obvious secret reappears in this PUBLIC repo. Guards against recurrence of
+# Stage 1 finding S1 (leaked WireGuard desktop client + private RA import).
+#
+# The actual pattern list lives in scripts/ci/no_leak_check.sh so it stays
+# maintainable and runnable locally:  bash scripts/ci/no_leak_check.sh
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  no-leak-check:
+    name: Private-leak & secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history not required; tracked files only)
+        uses: actions/checkout@v4
+
+      - name: Run no-leak / secret denylist scan
+        run: bash scripts/ci/no_leak_check.sh
