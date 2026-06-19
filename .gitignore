@@ -78,3 +78,5 @@ release/
 .cursor/
 .vscode/
 .wrangler/
+
+.venv-sp-test/
