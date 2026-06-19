@@ -1828,6 +1828,20 @@ class SystemManagerDialog(QDialog):
         self._sp_pin_edit.setPlaceholderText("Set / change operator PIN")
         form.addRow("Operator PIN:", self._sp_pin_edit)
 
+        # Portal PTZ grant: off by default. Enforced server-side at the portal
+        # proxy, so flipping this is the only way the post user can move cameras.
+        self._sp_ptz_chk = QCheckBox("Allow portal users to control PTZ (pan/tilt/zoom)")
+        self._sp_ptz_chk.setToolTip(
+            "When enabled, customers signed in to the Knoxnet Post portal (8090) "
+            "can pan/tilt/zoom PTZ-capable cameras. Disabled by default; enforced "
+            "on the server, not just by hiding the buttons."
+        )
+        try:
+            self._sp_ptz_chk.setChecked(bool(_security_post_hooks().read_portal_ptz_enabled()))
+        except Exception:
+            self._sp_ptz_chk.setChecked(False)
+        form.addRow("", self._sp_ptz_chk)
+
         btn_row = QHBoxLayout()
         save_btn = QPushButton("Save")
         save_btn.setFixedWidth(70)
@@ -1871,6 +1885,12 @@ class SystemManagerDialog(QDialog):
             except Exception as e:
                 QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to set PIN: {e}")
                 return
+
+        try:
+            _security_post_hooks().set_portal_ptz_enabled(bool(self._sp_ptz_chk.isChecked()))
+        except Exception as e:
+            QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to save portal PTZ setting: {e}")
+            return
 
         QMessageBox.information(self, "Knoxnet Security Post", "Knoxnet Security Post settings saved.")
 
