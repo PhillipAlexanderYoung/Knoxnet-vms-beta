@@ -7285,6 +7285,11 @@ if __name__ == '__main__':
                 def _emit_motion(camera_id: str, payload: Dict[str, Any]) -> None:
                     """Emit motion detection data with ultra-low latency"""
                     try:
+                        try:
+                            from core.ptz_manager import get_ptz_manager
+                            get_ptz_manager().ingest_motion_update(camera_id, payload)
+                        except Exception:
+                            pass
                         if python_script_manager:
                             try:
                                 python_script_manager.handle_event('motion', camera_id, payload)
@@ -7313,6 +7318,11 @@ if __name__ == '__main__':
                 def _emit_tracks(camera_id: str, payload: Dict[str, Any]) -> None:
                     """Emit tracking data with ultra-low latency"""
                     try:
+                        try:
+                            from core.ptz_manager import get_ptz_manager
+                            get_ptz_manager().ingest_tracks_update(camera_id, payload)
+                        except Exception:
+                            pass
                         if automation_engine:
                             try:
                                 automation_engine.submit("tracks", camera_id, payload)
@@ -7347,6 +7357,11 @@ if __name__ == '__main__':
                 def _emit_detections(camera_id: str, payload: Dict[str, Any]) -> None:
                     """Emit object detection data with ultra-low latency"""
                     try:
+                        try:
+                            from core.ptz_manager import get_ptz_manager
+                            get_ptz_manager().ingest_detection_update(camera_id, payload)
+                        except Exception:
+                            pass
                         if python_script_manager:
                             try:
                                 python_script_manager.handle_event('detection', camera_id, payload)
@@ -7398,6 +7413,11 @@ if __name__ == '__main__':
                 def _emit_motion_optimized(camera_id: str, payload: Dict[str, Any]) -> None:
                     """Emit motion detection data from optimized stream server with ultra-low latency"""
                     try:
+                        try:
+                            from core.ptz_manager import get_ptz_manager
+                            get_ptz_manager().ingest_motion_update(camera_id, payload)
+                        except Exception:
+                            pass
                         if python_script_manager:
                             try:
                                 python_script_manager.handle_event('motion', camera_id, payload)
@@ -7427,6 +7447,11 @@ if __name__ == '__main__':
                 def _emit_tracks_optimized(camera_id: str, payload: Dict[str, Any]) -> None:
                     """Emit tracking data from optimized stream server with ultra-low latency"""
                     try:
+                        try:
+                            from core.ptz_manager import get_ptz_manager
+                            get_ptz_manager().ingest_tracks_update(camera_id, payload)
+                        except Exception:
+                            pass
                         if automation_engine:
                             try:
                                 automation_engine.submit("tracks", camera_id, payload)
@@ -7450,6 +7475,11 @@ if __name__ == '__main__':
                 def _emit_detections_optimized(camera_id: str, payload: Dict[str, Any]) -> None:
                     """Emit object detection data from optimized stream server with ultra-low latency"""
                     try:
+                        try:
+                            from core.ptz_manager import get_ptz_manager
+                            get_ptz_manager().ingest_detection_update(camera_id, payload)
+                        except Exception:
+                            pass
                         if python_script_manager:
                             try:
                                 python_script_manager.handle_event('detection', camera_id, payload)

@@ -5368,6 +5368,97 @@ def control_ptz(camera_id):
         }), 500
 
 
+@api_bp.route('/cameras/<camera_id>/ptz/auto-sentry', methods=['GET'])
+def get_ptz_auto_sentry(camera_id):
+    """Return PTZ auto-sentry status and current locked/predicted target state."""
+    try:
+        from core.ptz_manager import get_ptz_manager
+        result = get_ptz_manager()._auto_sentry_status(camera_id)
+        return jsonify({
+            "success": bool(result.get('success', False)),
+            "data": result,
+            "message": "Auto sentry status",
+        })
+    except Exception as e:
+        logger.error(f"PTZ auto-sentry status failed for camera {camera_id}: {e}")
+        return jsonify({"success": False, "message": f"Auto sentry status failed: {str(e)}"}), 500
+
+
+@api_bp.route('/cameras/<camera_id>/ptz/auto-sentry', methods=['POST'])
+def start_ptz_auto_sentry(camera_id):
+    """Start PTZ auto-sentry with optional tuning settings."""
+    try:
+        body = request.json or {}
+        config = _resolve_camera_for_ptz(camera_id)
+        from core.ptz_manager import get_ptz_manager
+        result = _run_coro_safe(
+            get_ptz_manager().execute_command(camera_id, config, 'start_auto_sentry', body)
+        )
+        return jsonify({
+            "success": bool(result.get('success', False)),
+            "data": result,
+            "message": result.get('message') or result.get('error') or 'Auto sentry started',
+        })
+    except Exception as e:
+        logger.error(f"PTZ auto-sentry start failed for camera {camera_id}: {e}")
+        return jsonify({"success": False, "message": f"Auto sentry start failed: {str(e)}"}), 500
+
+
+@api_bp.route('/cameras/<camera_id>/ptz/auto-sentry', methods=['DELETE'])
+def stop_ptz_auto_sentry(camera_id):
+    """Stop PTZ auto-sentry."""
+    try:
+        from core.ptz_manager import get_ptz_manager
+        result = _run_coro_safe(get_ptz_manager()._stop_auto_sentry(camera_id))
+        return jsonify({
+            "success": bool(result.get('success', False)),
+            "data": result,
+            "message": result.get('message') or result.get('error') or 'Auto sentry stopped',
+        })
+    except Exception as e:
+        logger.error(f"PTZ auto-sentry stop failed for camera {camera_id}: {e}")
+        return jsonify({"success": False, "message": f"Auto sentry stop failed: {str(e)}"}), 500
+
+
+@api_bp.route('/cameras/<camera_id>/ptz/auto-sentry/lock', methods=['POST'])
+def lock_ptz_auto_sentry(camera_id):
+    """
+    Lock auto-sentry to a clicked object/bbox. Body may include `target`
+    plus frame dimensions and optional tuning settings.
+    """
+    try:
+        body = request.json or {}
+        config = _resolve_camera_for_ptz(camera_id)
+        from core.ptz_manager import get_ptz_manager
+        result = _run_coro_safe(
+            get_ptz_manager().execute_command(camera_id, config, 'lock_auto_sentry_target', body)
+        )
+        return jsonify({
+            "success": bool(result.get('success', False)),
+            "data": result,
+            "message": result.get('message') or result.get('error') or 'Auto sentry target lock updated',
+        })
+    except Exception as e:
+        logger.error(f"PTZ auto-sentry lock failed for camera {camera_id}: {e}")
+        return jsonify({"success": False, "message": f"Auto sentry lock failed: {str(e)}"}), 500
+
+
+@api_bp.route('/cameras/<camera_id>/ptz/auto-sentry/lock', methods=['DELETE'])
+def unlock_ptz_auto_sentry(camera_id):
+    """Clear the current auto-sentry object lock without stopping scan mode."""
+    try:
+        from core.ptz_manager import get_ptz_manager
+        result = get_ptz_manager()._unlock_auto_sentry_target(camera_id)
+        return jsonify({
+            "success": bool(result.get('success', False)),
+            "data": result,
+            "message": result.get('message') or result.get('error') or 'Auto sentry target unlocked',
+        })
+    except Exception as e:
+        logger.error(f"PTZ auto-sentry unlock failed for camera {camera_id}: {e}")
+        return jsonify({"success": False, "message": f"Auto sentry unlock failed: {str(e)}"}), 500
+
+
 @api_bp.route('/cameras/<camera_id>/ptz/probe', methods=['POST'])
 def probe_ptz(camera_id):
     """

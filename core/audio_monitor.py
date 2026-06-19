@@ -392,6 +392,13 @@ class AudioCameraMonitor:
             except Exception:
                 pass
 
+            # Wake PTZ auto-sentry search when it is enabled for this camera.
+            try:
+                from core.ptz_manager import get_ptz_manager
+                get_ptz_manager().ingest_audio_event(self.camera_id, payload)
+            except Exception:
+                pass
+
             # trigger python automations
             try:
                 if self.python_script_manager is not None and hasattr(self.python_script_manager, "handle_event"):

@@ -21,6 +21,12 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from core import ptz_credentials
+from core.ptz_auto_sentry import (
+    AutoSentryConfig,
+    SmoothTargetTracker,
+    TrackingCommand,
+    observations_from_payload,
+)
 from core.ptz_controllers.generic import GenericPTZController
 from core.ptz_controllers.pytapo_controller import PyTapoController, PYTAPO_AVAILABLE
 
@@ -73,6 +79,10 @@ class PTZManager:
         self.sweep_threads: Dict[str, threading.Thread] = {}
         self.sweep_stop_events: Dict[str, threading.Event] = {}
         self.sweep_state: Dict[str, Dict[str, Any]] = {}
+        self.auto_sentry_threads: Dict[str, threading.Thread] = {}
+        self.auto_sentry_stop_events: Dict[str, threading.Event] = {}
+        self.auto_sentry_state: Dict[str, Dict[str, Any]] = {}
+        self._auto_sentry_lock = threading.RLock()
         self._resolution_cache: Dict[str, Dict[str, Any]] = {}
         # Sticky "stop trying" state so we don't get the camera into a
         # Temporary Suspension lockout after a few bad password retries.
@@ -628,6 +638,7 @@ class PTZManager:
         controller = self.controllers.get(camera_id)
         if not controller:
             return
+        await self._stop_auto_sentry(camera_id, silent=True)
         await self._stop_sweep(camera_id, controller, silent=True)
         try:
             disconnect = getattr(controller, 'disconnect', None)
@@ -655,6 +666,21 @@ class PTZManager:
     async def execute_command(self, camera_id: str, config: Dict[str, Any],
                               command: str, params: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            if command in ('auto_sentry_status', 'get_auto_sentry_status'):
+                return self._auto_sentry_status(camera_id)
+            if command in ('stop_auto_sentry', 'auto_sentry_stop'):
+                return await self._stop_auto_sentry(camera_id)
+            if command in ('unlock_auto_sentry_target', 'auto_sentry_unlock'):
+                return self._unlock_auto_sentry_target(camera_id)
+            if command in ('auto_sentry_update', 'auto_sentry_observe'):
+                return self.ingest_auto_sentry_payload(
+                    camera_id,
+                    params if isinstance(params, dict) else {},
+                    source=str((params or {}).get('source') or 'api'),
+                )
+            if command in ('auto_sentry_audio', 'audio_search'):
+                return self.ingest_audio_event(camera_id, params if isinstance(params, dict) else {})
+
             controller = await self.get_or_create_controller(camera_id, config)
             if not controller:
                 # Re-run a probe so the failure response carries actionable
@@ -692,11 +718,24 @@ class PTZManager:
                 }
 
             if command == 'start_sweep':
+                await self._stop_auto_sentry(camera_id, silent=True)
                 result = await self._start_sweep(camera_id, controller, params)
                 return self._augment_with_sweep_status(camera_id, result)
             if command == 'stop_sweep':
                 result = await self._stop_sweep(camera_id, controller)
                 return self._augment_with_sweep_status(camera_id, result)
+            if command in ('start_auto_sentry', 'auto_sentry_start'):
+                result = await self._start_auto_sentry(camera_id, controller, config, params)
+                return self._augment_with_auto_sentry_status(camera_id, self._augment_with_sweep_status(camera_id, result))
+            if command in ('lock_auto_sentry_target', 'auto_sentry_lock'):
+                if not self._is_auto_sentry_running(camera_id):
+                    start_params = params.get('settings') if isinstance(params.get('settings'), dict) else params
+                    await self._start_auto_sentry(camera_id, controller, config, start_params or {})
+                result = self._lock_auto_sentry_target(camera_id, params if isinstance(params, dict) else {})
+                return self._augment_with_auto_sentry_status(camera_id, self._augment_with_sweep_status(camera_id, result))
+
+            if self._is_manual_ptz_command(command):
+                self._pause_auto_sentry(camera_id, reason='manual')
 
             protocol = self.protocols.get(camera_id, 'generic')
             if protocol == 'tapo':
@@ -719,11 +758,359 @@ class PTZManager:
                 )
                 await self.remove_controller(camera_id)
 
-            return self._augment_with_sweep_status(camera_id, result)
+            return self._augment_with_auto_sentry_status(camera_id, self._augment_with_sweep_status(camera_id, result))
 
         except Exception as err:
             logger.error("PTZ command %s failed for %s: %s", command, camera_id, err)
             return {'success': False, 'error': str(err)}
+
+    # ------------------------------------------------------------------ #
+    # Auto sentry / object tracking
+    # ------------------------------------------------------------------ #
+
+    AUTO_SENTRY_COMMANDS = {
+        'start_auto_sentry', 'auto_sentry_start',
+        'stop_auto_sentry', 'auto_sentry_stop',
+        'auto_sentry_status', 'get_auto_sentry_status',
+        'auto_sentry_update', 'auto_sentry_observe',
+        'auto_sentry_audio', 'audio_search',
+        'lock_auto_sentry_target', 'auto_sentry_lock',
+        'unlock_auto_sentry_target', 'auto_sentry_unlock',
+    }
+
+    def _is_manual_ptz_command(self, command: str) -> bool:
+        return command in {
+            'continuous_move', 'stop', 'go_home', 'goto_preset', 'set_preset',
+            'start_sweep', 'stop_sweep',
+        }
+
+    def _is_auto_sentry_running(self, camera_id: str) -> bool:
+        thread = self.auto_sentry_threads.get(camera_id)
+        return bool(thread and thread.is_alive())
+
+    def _augment_with_auto_sentry_status(self, camera_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(result, dict):
+            return result
+        result['auto_sentry_active'] = self._is_auto_sentry_running(camera_id)
+        state = self.auto_sentry_state.get(camera_id) or {}
+        if result['auto_sentry_active'] or state:
+            result['auto_sentry'] = self._public_auto_sentry_state(camera_id)
+        else:
+            result.setdefault('auto_sentry', None)
+        return result
+
+    async def _start_auto_sentry(self, camera_id: str, controller: Any,
+                                 camera_config: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+        await self._stop_sweep(camera_id, controller, silent=True)
+        await self._stop_auto_sentry(camera_id, silent=True)
+
+        cfg = AutoSentryConfig.from_params(params or {})
+        stop_event = threading.Event()
+        tracker = SmoothTargetTracker()
+        now = time.time()
+        with self._auto_sentry_lock:
+            self.auto_sentry_stop_events[camera_id] = stop_event
+            self.auto_sentry_state[camera_id] = {
+                'active': True,
+                'config': cfg,
+                'tracker': tracker,
+                'controller': controller,
+                'camera_config': dict(camera_config or {}),
+                'started_at': now,
+                'last_command': None,
+                'last_error': None,
+                'last_observation_at': 0.0,
+                'manual_pause_until': 0.0,
+                'manual_pause_reason': None,
+                'audio_wake_until': 0.0,
+                'last_audio_event': None,
+            }
+
+        thread = threading.Thread(
+            target=self._run_auto_sentry_worker,
+            name=f"PTZ-AutoSentry-{camera_id}",
+            args=(camera_id, controller, stop_event),
+            daemon=True,
+        )
+        self.auto_sentry_threads[camera_id] = thread
+        thread.start()
+        logger.info("Started PTZ auto sentry for %s (%s)", camera_id, cfg.to_dict())
+        return {
+            'success': True,
+            'message': 'Auto sentry started',
+            'auto_sentry_active': True,
+            'auto_sentry': self._public_auto_sentry_state(camera_id),
+        }
+
+    async def _stop_auto_sentry(self, camera_id: str, silent: bool = False) -> Dict[str, Any]:
+        stop_event = self.auto_sentry_stop_events.pop(camera_id, None)
+        thread = self.auto_sentry_threads.pop(camera_id, None)
+        if stop_event:
+            stop_event.set()
+        if thread and thread.is_alive():
+            thread.join(timeout=3)
+
+        state = self.auto_sentry_state.get(camera_id)
+        controller = state.get('controller') if isinstance(state, dict) else None
+        if state:
+            state['active'] = False
+            self.auto_sentry_state[camera_id] = state
+        if controller:
+            try:
+                await self._send_auto_stop(controller)
+            except Exception as err:
+                if not silent:
+                    logger.debug("Auto sentry stop command failed for %s: %s", camera_id, err)
+
+        if silent:
+            return {'success': True, 'auto_sentry_active': False}
+        logger.info("Stopped PTZ auto sentry for %s", camera_id)
+        return {
+            'success': True,
+            'message': 'Auto sentry stopped',
+            'auto_sentry_active': False,
+            'auto_sentry': self._public_auto_sentry_state(camera_id),
+        }
+
+    def _pause_auto_sentry(self, camera_id: str, reason: str = 'manual') -> None:
+        state = self.auto_sentry_state.get(camera_id)
+        if not state:
+            return
+        cfg = state.get('config')
+        pause_sec = cfg.manual_pause_seconds if isinstance(cfg, AutoSentryConfig) else 3.0
+        if pause_sec <= 0:
+            return
+        state['manual_pause_until'] = max(float(state.get('manual_pause_until') or 0.0), time.time() + pause_sec)
+        state['manual_pause_reason'] = reason
+
+    def ingest_auto_sentry_payload(self, camera_id: str, payload: Dict[str, Any],
+                                   source: str = 'detections') -> Dict[str, Any]:
+        state = self.auto_sentry_state.get(camera_id)
+        if not state:
+            return {'success': True, 'message': 'Auto sentry inactive', 'accepted': False}
+        cfg = state.get('config')
+        tracker = state.get('tracker')
+        if not isinstance(cfg, AutoSentryConfig) or not isinstance(tracker, SmoothTargetTracker):
+            return {'success': False, 'error': 'Auto sentry state invalid'}
+        observations = observations_from_payload(payload if isinstance(payload, dict) else {}, source=source)
+        selected = tracker.ingest(observations, cfg) if observations else None
+        now = time.time()
+        state['last_observation_at'] = now if observations else state.get('last_observation_at', 0.0)
+        state['last_observation_count'] = len(observations)
+        if selected:
+            state['last_target'] = tracker.target_dict()
+        return {
+            'success': True,
+            'accepted': bool(observations),
+            'selected': bool(selected),
+            'observations': len(observations),
+            'auto_sentry': self._public_auto_sentry_state(camera_id),
+        }
+
+    def ingest_detection_update(self, camera_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.ingest_auto_sentry_payload(camera_id, payload, source='detections')
+
+    def ingest_tracks_update(self, camera_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.ingest_auto_sentry_payload(camera_id, payload, source='tracks')
+
+    def ingest_motion_update(self, camera_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.ingest_auto_sentry_payload(camera_id, payload, source='motion')
+
+    def ingest_audio_event(self, camera_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        state = self.auto_sentry_state.get(camera_id)
+        if not state:
+            return {'success': True, 'message': 'Auto sentry inactive', 'accepted': False}
+        cfg = state.get('config')
+        tracker = state.get('tracker')
+        if isinstance(tracker, SmoothTargetTracker):
+            direction = payload.get('direction') if isinstance(payload, dict) else None
+            dir_int = -1 if str(direction).lower().startswith('l') else (1 if str(direction).lower().startswith('r') else None)
+            tracker.force_scan(dir_int)
+        wake_sec = cfg.audio_search_seconds if isinstance(cfg, AutoSentryConfig) else 8.0
+        state['audio_wake_until'] = time.time() + wake_sec
+        state['last_audio_event'] = payload if isinstance(payload, dict) else {}
+        return {
+            'success': True,
+            'accepted': True,
+            'message': 'Audio search triggered',
+            'auto_sentry': self._public_auto_sentry_state(camera_id),
+        }
+
+    def _lock_auto_sentry_target(self, camera_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        state = self.auto_sentry_state.get(camera_id)
+        if not state:
+            return {'success': False, 'error': 'Auto sentry is not active'}
+        cfg = state.get('config')
+        tracker = state.get('tracker')
+        if not isinstance(cfg, AutoSentryConfig) or not isinstance(tracker, SmoothTargetTracker):
+            return {'success': False, 'error': 'Auto sentry state invalid'}
+        observations = observations_from_payload(params if isinstance(params, dict) else {}, source='lock')
+        if not observations:
+            return {'success': False, 'error': 'No lockable target supplied'}
+        # Prefer an explicit target/clicked object over the surrounding frame list.
+        selected = observations[0]
+        label = str(params.get('label') or params.get('name') or selected.cls or selected.target_id)
+        tracker.lock(selected, cfg, label=label)
+        now = time.time()
+        state['last_observation_at'] = now
+        state['last_observation_count'] = len(observations)
+        state['last_target'] = tracker.target_dict()
+        state['mode'] = 'acquiring'
+        return {
+            'success': True,
+            'message': f'Locked target {label}',
+            'locked': True,
+            'target': tracker.target_dict(),
+            'auto_sentry': self._public_auto_sentry_state(camera_id),
+        }
+
+    def _unlock_auto_sentry_target(self, camera_id: str) -> Dict[str, Any]:
+        state = self.auto_sentry_state.get(camera_id)
+        tracker = state.get('tracker') if isinstance(state, dict) else None
+        if isinstance(tracker, SmoothTargetTracker):
+            tracker.unlock()
+            state['last_target'] = None
+            state['mode'] = 'scan'
+        return {
+            'success': True,
+            'message': 'Auto sentry target unlocked',
+            'locked': False,
+            'auto_sentry': self._public_auto_sentry_state(camera_id),
+        }
+
+    def _auto_sentry_status(self, camera_id: str) -> Dict[str, Any]:
+        return {
+            'success': True,
+            'auto_sentry_active': self._is_auto_sentry_running(camera_id),
+            'auto_sentry': self._public_auto_sentry_state(camera_id),
+        }
+
+    def _public_auto_sentry_state(self, camera_id: str) -> Dict[str, Any]:
+        state = self.auto_sentry_state.get(camera_id) or {}
+        cfg = state.get('config')
+        tracker = state.get('tracker')
+        now = time.time()
+        pause_until = float(state.get('manual_pause_until') or 0.0)
+        audio_until = float(state.get('audio_wake_until') or 0.0)
+        return {
+            'active': self._is_auto_sentry_running(camera_id),
+            'started_at': state.get('started_at'),
+            'mode': state.get('mode') or (getattr(tracker, 'last_mode', 'idle') if tracker else 'idle'),
+            'target': tracker.target_dict() if isinstance(tracker, SmoothTargetTracker) else state.get('last_target'),
+            'last_command': state.get('last_command'),
+            'last_error': state.get('last_error'),
+            'last_observation_at': state.get('last_observation_at'),
+            'last_observation_count': state.get('last_observation_count', 0),
+            'manual_paused': pause_until > now,
+            'manual_pause_seconds': max(0.0, pause_until - now),
+            'manual_pause_reason': state.get('manual_pause_reason'),
+            'audio_search_active': audio_until > now,
+            'audio_search_seconds': max(0.0, audio_until - now),
+            'settings': cfg.to_dict() if isinstance(cfg, AutoSentryConfig) else None,
+        }
+
+    def _run_auto_sentry_worker(self, camera_id: str, controller: Any, stop_event: threading.Event) -> None:
+        sent_stop = False
+        try:
+            while not stop_event.is_set():
+                state = self.auto_sentry_state.get(camera_id)
+                if not state:
+                    break
+                cfg = state.get('config')
+                tracker = state.get('tracker')
+                if not isinstance(cfg, AutoSentryConfig) or not isinstance(tracker, SmoothTargetTracker):
+                    break
+
+                now = time.time()
+                if now < float(state.get('manual_pause_until') or 0.0):
+                    if not sent_stop:
+                        self._run_auto_coro(self._send_auto_stop(controller))
+                        sent_stop = True
+                    state['mode'] = 'manual_pause'
+                    stop_event.wait(min(0.25, cfg.update_interval))
+                    continue
+
+                audio_active = now < float(state.get('audio_wake_until') or 0.0)
+                command = tracker.compute(cfg, now, scanning_allowed=cfg.scan_enabled or audio_active)
+                if audio_active and command.mode == 'scan':
+                    speed = cfg.audio_search_speed or cfg.scan_speed
+                    command.pan_speed = math.copysign(min(cfg.max_speed, speed), command.pan_speed or tracker.scan_direction)
+                    command.reason = 'audio_search'
+
+                state['mode'] = command.mode
+                if not command.should_send:
+                    stop_event.wait(min(0.05, cfg.update_interval))
+                    continue
+
+                if abs(command.pan_speed) < 1e-4 and abs(command.tilt_speed) < 1e-4:
+                    if not sent_stop:
+                        self._run_auto_coro(self._send_auto_stop(controller))
+                        sent_stop = True
+                else:
+                    sent_stop = False
+                    result = self._run_auto_coro(self._send_auto_move(
+                        controller,
+                        command.pan_speed,
+                        command.tilt_speed,
+                        cfg.command_duration,
+                    ))
+                    if isinstance(result, dict) and not result.get('success', True):
+                        state['last_error'] = result.get('error') or result.get('message')
+                    state['last_command'] = {
+                        'pan_speed': command.pan_speed,
+                        'tilt_speed': command.tilt_speed,
+                        'mode': command.mode,
+                        'reason': command.reason,
+                        'ts': now,
+                    }
+                stop_event.wait(cfg.update_interval)
+        except Exception as err:
+            logger.error("Auto sentry worker failed for %s: %s", camera_id, err)
+            state = self.auto_sentry_state.get(camera_id)
+            if state is not None:
+                state['last_error'] = str(err)
+        finally:
+            try:
+                self._run_auto_coro(self._send_auto_stop(controller))
+            except Exception:
+                pass
+            self.auto_sentry_threads.pop(camera_id, None)
+            self.auto_sentry_stop_events.pop(camera_id, None)
+            state = self.auto_sentry_state.get(camera_id)
+            if state:
+                state['active'] = False
+                self.auto_sentry_state[camera_id] = state
+
+    def _run_auto_coro(self, coro):
+        return asyncio.run(coro)
+
+    async def _send_auto_move(self, controller: Any, pan_speed: float,
+                              tilt_speed: float, duration: float) -> Dict[str, Any]:
+        move = getattr(controller, 'continuous_move', None)
+        if asyncio.iscoroutinefunction(move):
+            return await move(pan_speed=pan_speed, tilt_speed=tilt_speed, zoom_speed=0.0, duration=duration)
+        if callable(move):
+            result = move(pan_speed=pan_speed, tilt_speed=tilt_speed, zoom_speed=0.0, duration=duration)
+            return result if isinstance(result, dict) else {'success': bool(result)}
+        if isinstance(controller, GenericPTZController):
+            return await self._execute_generic_command(controller, 'continuous_move', {
+                'pan_speed': pan_speed,
+                'tilt_speed': tilt_speed,
+                'zoom_speed': 0.0,
+                'duration': duration,
+            })
+        return {'success': False, 'error': 'Controller does not support smooth movement'}
+
+    async def _send_auto_stop(self, controller: Any) -> Dict[str, Any]:
+        stop = getattr(controller, 'stop', None)
+        if asyncio.iscoroutinefunction(stop):
+            return await stop()
+        if callable(stop):
+            result = stop()
+            return result if isinstance(result, dict) else {'success': bool(result)}
+        if isinstance(controller, GenericPTZController):
+            return await self._execute_generic_command(controller, 'stop', {})
+        return {'success': True, 'message': 'No stop method'}
 
     # ------------------------------------------------------------------ #
     # Sweep

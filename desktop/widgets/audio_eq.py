@@ -219,6 +219,12 @@ class PCMBufferIODevice(QIODevice):
         if len(self._buf) > self._max:
             drop = len(self._buf) - self._max
             del self._buf[:drop]
+        # QAudioSink is started before the first WebRTC packet arrives. Emit
+        # readyRead so the sink wakes up after an initial underflow.
+        try:
+            self.readyRead.emit()
+        except Exception:
+            pass
 
     def bytesAvailable(self) -> int:  # type: ignore[override]
         return len(self._buf) + super().bytesAvailable()

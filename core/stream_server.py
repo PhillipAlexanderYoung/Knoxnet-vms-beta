@@ -1226,6 +1226,11 @@ class StreamServer:
                                     "timestamp": datetime.now().isoformat(),
                                     "camera_moving": moving_flag,
                                 }
+                                try:
+                                    from core.ptz_manager import get_ptz_manager
+                                    get_ptz_manager().ingest_motion_update(camera_id, motion_payload)
+                                except Exception:
+                                    pass
                                 
                                 # Emit motion data
                                 self.on_motion_update(camera_id, motion_payload)
@@ -1594,6 +1599,11 @@ class StreamServer:
                                 'frame_height': frame_h,
                                 'camera_moving': False,
                             }
+                            try:
+                                from core.ptz_manager import get_ptz_manager
+                                get_ptz_manager().ingest_detection_update(camera_id, detections_payload)
+                            except Exception:
+                                pass
                             if self.on_detection_update:
                                 try:
                                     self.on_detection_update(camera_id, detections_payload)
@@ -1678,6 +1688,11 @@ class StreamServer:
                                     'frame_height': frame_h,
                                     'camera_moving': False,
                                 }
+                                try:
+                                    from core.ptz_manager import get_ptz_manager
+                                    get_ptz_manager().ingest_tracks_update(camera_id, tracks_payload)
+                                except Exception:
+                                    pass
                                 if self.on_tracks_update:
                                     try:
                                         self.on_tracks_update(camera_id, tracks_payload)
