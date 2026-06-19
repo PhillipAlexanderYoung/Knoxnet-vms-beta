@@ -137,6 +137,38 @@ def clear(camera_id: str) -> None:
             _save_disk(disk)
 
 
+def remember_working_auth(camera_id: str, user: str, password: str,
+                          label: str = "", persist: bool = False) -> None:
+    """
+    Persist the Tapo credential set that actually authenticated for a
+    camera so the next session re-uses ONLY that method (deterministic,
+    single login) instead of re-running the camera-account -> admin/cloud
+    discovery chain. Defaults to session-only storage.
+    """
+    if not camera_id or not user or not password:
+        return
+    set(camera_id, 'tapo_auth_user', user, persist=persist)
+    set(camera_id, 'tapo_auth_password', password, persist=persist)
+    if label:
+        set(camera_id, 'tapo_auth_label', label, persist=persist)
+
+
+def get_working_auth(camera_id: str) -> Optional[Dict[str, str]]:
+    """Return the remembered working Tapo auth set, or None."""
+    if not camera_id:
+        return None
+    creds = get(camera_id) or {}
+    user = creds.get('tapo_auth_user')
+    password = creds.get('tapo_auth_password')
+    if user and password:
+        return {
+            'user': user,
+            'password': password,
+            'label': creds.get('tapo_auth_label') or 'remembered method',
+        }
+    return None
+
+
 def has_persisted(camera_id: str, key: Optional[str] = None) -> bool:
     """True if the camera (and optionally a specific key) is on disk."""
     if not camera_id:

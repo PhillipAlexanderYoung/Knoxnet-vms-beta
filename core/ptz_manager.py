@@ -79,7 +79,58 @@ class PTZManager:
         # Cleared by `invalidate_resolution` (called when the user
         # updates credentials via the UI).
         self._stuck_state: Dict[str, Dict[str, Any]] = {}
+        # Hard lockout cooldown: camera_id -> monotonic-ish wall-clock time
+        # (time.time()) until which we refuse ANY login / PTZ to the camera.
+        # Set when Tapo reports a "Temporary Suspension: try again in N
+        # seconds" so we never re-hit (and extend) a suspended camera.
+        self._lockout_until: Dict[str, float] = {}
+        # Per-camera timestamp of the last Tapo move, used to debounce a
+        # flood of rapid control presses into the cached session.
+        self._last_move_ts: Dict[str, float] = {}
         logger.info("PTZ Manager initialised")
+
+    # ------------------------------------------------------------------ #
+    # Lockout cooldown
+    # ------------------------------------------------------------------ #
+
+    MIN_MOVE_INTERVAL_SEC = 0.12
+
+    def _lockout_remaining(self, camera_id: str) -> float:
+        """Seconds remaining on a Tapo Temporary Suspension cooldown (0 if none)."""
+        until = self._lockout_until.get(camera_id)
+        if not until:
+            return 0.0
+        remaining = until - time.time()
+        if remaining <= 0:
+            self._lockout_until.pop(camera_id, None)
+            return 0.0
+        return remaining
+
+    def _set_lockout(self, camera_id: str, seconds: Optional[float]) -> None:
+        """Record a cooldown so we stop touching a suspended camera."""
+        try:
+            secs = float(seconds) if seconds is not None else 0.0
+        except (TypeError, ValueError):
+            secs = 0.0
+        # Tapo's Temporary Suspension is typically a few minutes; if the
+        # camera didn't tell us, assume a conservative 5 minutes.
+        if secs <= 0:
+            secs = 300.0
+        self._lockout_until[camera_id] = time.time() + secs
+        logger.warning("PTZ %s locked out for %.0fs (Temporary Suspension)", camera_id, secs)
+
+    def _locked_out_response(self, camera_id: str, remaining: float) -> Dict[str, Any]:
+        return {
+            'protocol_resolved': 'tapo',
+            'needs_credentials': [],
+            'brand_guess': 'tapo',
+            'error': (
+                "Camera is temporarily locked out by Tapo (Temporary "
+                f"Suspension). Try again in {int(remaining) + 1} seconds."
+            ),
+            'is_locked': True,
+            'lockout_seconds': int(remaining) + 1,
+        }
 
     # ------------------------------------------------------------------ #
     # Resolution / probing
@@ -101,6 +152,9 @@ class PTZManager:
     def invalidate_resolution(self, camera_id: str) -> None:
         self._resolution_cache.pop(camera_id, None)
         self._stuck_state.pop(camera_id, None)
+        # A full reset (user cleared/changed credentials) also lifts the
+        # lockout cooldown so a corrected camera can be retried.
+        self._lockout_until.pop(camera_id, None)
 
     def _mark_stuck(self, camera_id: str, reason: str, *, locked: bool = False,
                     needs: Optional[list] = None) -> None:
@@ -142,6 +196,13 @@ class PTZManager:
                 'error': 'No IP address available for camera',
             }
 
+        # Hard lockout cooldown: never send a login/PTZ to a camera Tapo
+        # has suspended — that only extends the suspension. Fail fast with
+        # the remaining time so the UI can show it.
+        remaining = self._lockout_remaining(camera_id)
+        if remaining > 0:
+            return self._locked_out_response(camera_id, remaining)
+
         # If we previously got the camera into a known-bad state (auth
         # failure or Tapo lockout), short-circuit so we don't hammer it
         # again. The credentials dialog calls `invalidate_resolution`
@@ -173,6 +234,13 @@ class PTZManager:
                 config['username'] = local_user
             if local_pw:
                 config['password'] = local_pw
+
+        # Hand the controller the remembered/working auth set (if any) so a
+        # reconnect uses ONLY that method — a single deterministic login.
+        working_auth = ptz_credentials.get_working_auth(camera_id)
+        if working_auth and not config.get('preferred_auth'):
+            config = dict(config)
+            config['preferred_auth'] = working_auth
 
         wants_tapo = (
             protocol_override == 'tapo'
@@ -210,10 +278,43 @@ class PTZManager:
                     'needs_credentials': ['tapo_cloud_password'],
                     'brand_guess': 'tapo',
                 }
+
+            # Reuse an already-authenticated controller if one is live and
+            # still matches these credentials. This is the crux of the
+            # lockout fix: the "Test connection" success warms this cache,
+            # and a subsequent probe/move must NOT open a second login.
+            existing = self.controllers.get(camera_id)
+            if (
+                existing is not None
+                and self.protocols.get(camera_id) == 'tapo'
+                and getattr(existing, 'connected', False)
+                and isinstance(existing, PyTapoController)
+                and existing.matches_credentials(config, cloud_pw)
+            ):
+                self._store_resolution(camera_id, 'tapo')
+                self._stuck_state.pop(camera_id, None)
+                logger.info("Tapo probe for %s reused live session (no new login)", camera_id)
+                return {
+                    'protocol_resolved': 'tapo',
+                    'needs_credentials': [],
+                    'brand_guess': 'tapo',
+                    'reused_session': True,
+                }
+
             ok, err, info, controller = await self._probe_tapo(config, cloud_pw)
             if ok:
                 self._store_resolution(camera_id, 'tapo')
                 self._stuck_state.pop(camera_id, None)
+                # Remember the winning auth method so the next session skips
+                # discovery and performs a single deterministic login.
+                wa = getattr(controller, 'working_auth', None) if controller is not None else None
+                if wa:
+                    try:
+                        ptz_credentials.remember_working_auth(
+                            camera_id, wa.get('user'), wa.get('password'), wa.get('label') or '',
+                        )
+                    except Exception:
+                        pass
                 # Promote the probe's connected controller into the live
                 # controller cache so the next command reuses the existing
                 # Tapo session and DOES NOT trigger another login. This is
@@ -244,6 +345,10 @@ class PTZManager:
             # gets cameras into Tapo's Temporary Suspension lockout). The
             # stuck state clears the moment the user submits new creds.
             logger.warning("Tapo probe failed for %s: %s", camera_id, err)
+            # On a Temporary Suspension, arm the hard cooldown so we refuse
+            # all further logins/PTZ until the timer expires.
+            if info.get('is_locked'):
+                self._set_lockout(camera_id, info.get('lockout_seconds'))
             self._mark_stuck(
                 camera_id,
                 err or 'Tapo connection failed',
@@ -257,6 +362,7 @@ class PTZManager:
                 'error': err or 'Tapo connection failed',
                 'is_locked': bool(info.get('is_locked')),
                 'is_auth_failure': bool(info.get('is_auth_failure')),
+                'lockout_seconds': info.get('lockout_seconds'),
             }
 
         # 2) ONVIF
@@ -338,6 +444,7 @@ class PTZManager:
                 info = {
                     'is_locked': bool(res.get('is_locked')),
                     'is_auth_failure': bool(res.get('is_auth_failure')),
+                    'lockout_seconds': res.get('lockout_seconds'),
                 }
                 return False, res.get('message') or res.get('error') or 'tapo connect failed', info, None
             except Exception as err:
@@ -378,6 +485,14 @@ class PTZManager:
     async def get_or_create_controller(self, camera_id: str, config: Dict[str, Any]) -> Optional[Any]:
         """Return a connected controller for this camera, creating one if needed."""
 
+        # Respect an active Temporary Suspension cooldown: never build a
+        # controller (which would log in) while the camera is locked out.
+        if self._lockout_remaining(camera_id) > 0:
+            logger.warning(
+                "PTZ %s is in Tapo lockout cooldown; refusing to connect", camera_id,
+            )
+            return None
+
         # Hydrate Tapo extras from the credential store: cloud password + any
         # advanced local-username/password override (some Tapo cameras require
         # `admin` regardless of the RTSP user / a different local password).
@@ -393,6 +508,14 @@ class PTZManager:
                 config['username'] = local_user
             if local_pw:
                 config['password'] = local_pw
+
+        # Use the remembered working auth method (single deterministic login).
+        # allow_auth_fallback stays False here so a control/move action never
+        # rapid-fires the camera-account -> admin/cloud chain.
+        working_auth = ptz_credentials.get_working_auth(camera_id)
+        if working_auth and not config.get('preferred_auth'):
+            config = dict(config)
+            config['preferred_auth'] = working_auth
 
         # Determine target protocol
         cached = self._cached_resolution(camera_id)
@@ -461,6 +584,16 @@ class PTZManager:
             )
             self.invalidate_resolution(camera_id)
             return None
+
+        # Remember the winning Tapo auth so future sessions skip discovery.
+        wa = getattr(controller, 'working_auth', None)
+        if target_protocol == 'tapo' and wa:
+            try:
+                ptz_credentials.remember_working_auth(
+                    camera_id, wa.get('user'), wa.get('password'), wa.get('label') or '',
+                )
+            except Exception:
+                pass
 
         self.controllers[camera_id] = controller
         self.protocols[camera_id] = target_protocol
@@ -567,11 +700,24 @@ class PTZManager:
 
             protocol = self.protocols.get(camera_id, 'generic')
             if protocol == 'tapo':
-                result = await self._execute_pytapo_command(controller, command, params)
+                result = await self._execute_pytapo_command(camera_id, controller, command, params)
             elif protocol == 'onvif':
                 result = await self._execute_onvif_command(controller, command, params)
             else:
                 result = await self._execute_generic_command(controller, command, params)
+
+            # If a Tapo command surfaced a Temporary Suspension, arm the
+            # cooldown and drop the (now-useless) controller so we stop
+            # touching the camera until it recovers.
+            if isinstance(result, dict) and result.get('is_locked'):
+                self._set_lockout(camera_id, result.get('lockout_seconds'))
+                self._mark_stuck(
+                    camera_id,
+                    result.get('error') or 'Camera temporarily locked out by Tapo',
+                    locked=True,
+                    needs=['tapo_cloud_password'],
+                )
+                await self.remove_controller(camera_id)
 
             return self._augment_with_sweep_status(camera_id, result)
 
@@ -816,7 +962,7 @@ class PTZManager:
     # Per-protocol command dispatchers
     # ------------------------------------------------------------------ #
 
-    async def _execute_pytapo_command(self, controller: PyTapoController,
+    async def _execute_pytapo_command(self, camera_id: str, controller: PyTapoController,
                                       command: str, params: Dict[str, Any]) -> Dict[str, Any]:
         if command == 'connect':
             res = await controller.connect()
@@ -827,6 +973,15 @@ class PTZManager:
             return res
 
         if command == 'continuous_move':
+            # Debounce a flood of rapid control presses: Tapo moveMotor is a
+            # discrete relative step, so coalescing sub-interval repeats keeps
+            # the camera responsive without spamming requests on the cached
+            # session. (Sweeps call the controller directly and bypass this.)
+            now = time.time()
+            last = self._last_move_ts.get(camera_id, 0.0)
+            if now - last < self.MIN_MOVE_INTERVAL_SEC:
+                return {'success': True, 'message': 'Move debounced', 'debounced': True}
+            self._last_move_ts[camera_id] = now
             return await controller.continuous_move(
                 pan_speed=params.get('pan_speed', 0.0),
                 tilt_speed=params.get('tilt_speed', 0.0),

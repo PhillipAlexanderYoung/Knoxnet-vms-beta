@@ -5435,23 +5435,21 @@ def test_ptz(camera_id):
             config.pop('tapo_cloud_password', None)
             config['brand_hint'] = 'generic'
 
+        # "Test connection" is an explicit, user-initiated action, so it is
+        # the ONE place allowed to run the camera-account -> admin/cloud
+        # discovery chain (spaced out) to find a working method.
+        config['allow_auth_fallback'] = True
+
         from core.ptz_manager import get_ptz_manager
         ptz_manager = get_ptz_manager()
-        # Test must bypass any sticky 'auth-failed' / lockout state, AND
-        # any cached controller from previous wrong creds — but we don't
-        # touch _resolution_cache (it's just a protocol hint). Each test
-        # is a single login attempt + getBasicInfo.
+        # Clear only the sticky 'auth-failed' hint so a prior failure does not
+        # short-circuit this retry. CRITICAL: we do NOT destroy the cached
+        # authenticated controller here. If a healthy session already matches
+        # these credentials, probe() reuses it (zero new logins) and the
+        # success "warms" the cache for the next control action. We also do
+        # NOT clear the lockout cooldown — never hammer a suspended camera.
         try:
             ptz_manager._stuck_state.pop(camera_id, None)
-            old = ptz_manager.controllers.pop(camera_id, None)
-            ptz_manager.protocols.pop(camera_id, None)
-            if old is not None:
-                try:
-                    disc = getattr(old, 'disconnect', None)
-                    if disc and not asyncio.iscoroutinefunction(disc):
-                        disc()
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -5507,18 +5505,40 @@ def set_ptz_credentials(camera_id):
         from core.ptz_manager import get_ptz_manager
 
         ptz_credentials.set(camera_id, key, value, persist=persist)
-        # Discard any stale Tapo controller / stuck state so the new creds
-        # take effect on the very next command — but DO NOT invalidate
-        # the resolution cache (that would force a fresh probe and
-        # therefore an extra login, eating into Tapo's 5-attempts-per-hour
-        # budget). The cached resolution still says 'tapo'; the next
-        # command will build one fresh controller with the new creds.
+        # Clear the sticky 'auth-failed' hint so the new creds get a chance.
+        # CRITICAL: do NOT tear down a healthy, already-authenticated
+        # controller. The normal flow is: "Test connection" (login #1, warms
+        # the cache) -> "Save" -> first control press. If we dropped the
+        # controller here, that first press would open login #2 immediately
+        # after #1 and trip Tapo's Temporary Suspension. So we keep a live
+        # session that still matches the saved creds and only discard a stale
+        # / disconnected one. We also never invalidate the resolution cache
+        # (that would force a fresh probe + extra login).
         try:
             mgr = get_ptz_manager()
             mgr._stuck_state.pop(camera_id, None)
-            old = mgr.controllers.pop(camera_id, None)
-            mgr.protocols.pop(camera_id, None)
-            if old is not None:
+            old = mgr.controllers.get(camera_id)
+            # Hydrate the comparison config exactly like the manager does
+            # (cloud password + advanced local-user/password overrides) so the
+            # match reflects the credentials a fresh controller would use.
+            config = _resolve_camera_for_ptz(camera_id)
+            stored = ptz_credentials.get(camera_id) or {}
+            if stored.get('tapo_cloud_password'):
+                config['tapo_cloud_password'] = stored['tapo_cloud_password']
+            if stored.get('tapo_local_username'):
+                config['username'] = stored['tapo_local_username']
+            if stored.get('tapo_local_password'):
+                config['password'] = stored['tapo_local_password']
+            keep = False
+            if old is not None and getattr(old, 'connected', False):
+                matches = getattr(old, 'matches_credentials', None)
+                try:
+                    keep = bool(matches and matches(config))
+                except Exception:
+                    keep = False
+            if old is not None and not keep:
+                mgr.controllers.pop(camera_id, None)
+                mgr.protocols.pop(camera_id, None)
                 try:
                     disc = getattr(old, 'disconnect', None)
                     if disc and not asyncio.iscoroutinefunction(disc):

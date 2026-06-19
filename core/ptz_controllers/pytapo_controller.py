@@ -13,10 +13,23 @@ two credential patterns supported by Tapo cameras:
        or rejected by newer firmware):
            Tapo(host, "admin", cloud_pw, cloudPassword=cloud_pw)
 
-We try (1) first and only fall through to (2) on `Invalid authentication
-data` (so a wrong password is still capped at 2 attempts toward Tapo's
-5-attempt-per-hour lockout). The successful pattern is cached so
-subsequent calls don't repeat both attempts.
+Lockout safety (critical):
+  Tapo cameras enter a "Temporary Suspension" lockout after only a
+  handful of logins / failed auth attempts in quick succession. To
+  avoid tripping it:
+    * The Tapo session is created ONCE with ``reuseSession=True`` and
+      reused for every probe / move (pytapo caches ``stok`` on the
+      instance, so reusing the controller performs NO new login).
+    * By default a single ``connect()`` performs exactly ONE login
+      attempt. The rapid camera-account -> admin/cloud fallback chain
+      is only attempted when ``allow_auth_fallback`` is explicitly set
+      (the user-initiated "Test connection" path) and the attempts are
+      spaced out. Control / move actions never rapid-fire a fallback.
+    * The credential set that worked is remembered (``working_auth``)
+      so the manager can persist it and skip re-discovery next time.
+    * "Temporary Suspension: try again in N seconds" is parsed into
+      ``lockout_seconds`` so the manager can refuse to touch the camera
+      until the cooldown elapses.
 
 Pre-requisites the user must satisfy in the Tapo phone app:
   * Me -> Third-Party Services -> Third-Party Compatibility = ON.
@@ -25,6 +38,7 @@ Pre-requisites the user must satisfy in the Tapo phone app:
 """
 import logging
 import asyncio
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional, Tuple
@@ -64,6 +78,19 @@ def _looks_like_lockout(err_msg: str) -> bool:
     )
 
 
+def _parse_lockout_seconds(err_msg: str) -> Optional[int]:
+    """Extract N from "Temporary Suspension: Try again in N seconds"."""
+    if not err_msg:
+        return None
+    match = re.search(r"try again in\s+(\d+)\s*second", err_msg.lower())
+    if match:
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 class PyTapoController:
     """Simple PTZ controller for TP-Link Tapo cameras using pytapo."""
 
@@ -89,6 +116,37 @@ class PyTapoController:
         if not self.tapo_cloud_password:
             raise ValueError("Tapo PTZ controller requires tapo_cloud_password in configuration.")
 
+        # Remember the ORIGINAL requested credentials so the manager can tell
+        # whether a later config still matches this live session (and thus
+        # reuse it instead of opening a new login). self.username/password get
+        # overwritten with the *working* values after a successful connect.
+        self._req_username = self.username
+        self._req_password = self.password
+        self._req_cloud_password = self.tapo_cloud_password
+
+        # Optional control port override (pytapo defaults to 443).
+        self.control_port = (
+            camera_config.get('control_port')
+            or camera_config.get('controlPort')
+            or None
+        )
+
+        # Single-attempt auth by default. Only the explicit, user-initiated
+        # "Test connection" path passes allow_auth_fallback=True so the
+        # camera-account -> admin/cloud discovery chain can run (spaced out).
+        self.allow_fallback = bool(camera_config.get('allow_auth_fallback', False))
+
+        # A remembered/working credential set to try FIRST (and, when
+        # fallback is disabled, the ONLY set tried). Shape: {user,password,label}.
+        pref = camera_config.get('preferred_auth')
+        self.preferred_auth: Optional[Dict[str, str]] = pref if isinstance(pref, dict) else None
+
+        # Populated after a successful connect so the manager can persist the
+        # winning method and avoid re-discovering it next session.
+        self.working_auth: Optional[Dict[str, str]] = None
+        # Set when Tapo reports a Temporary Suspension; seconds remaining.
+        self.lockout_seconds: Optional[int] = None
+
         self.tapo = None
         self.connected = False
         self.current_position = {'pan': 0.0, 'tilt': 0.0, 'zoom': 1.0}
@@ -101,22 +159,50 @@ class PyTapoController:
 
         logger.info("PyTapo controller created for %s", self.ip_address)
 
+    def matches_credentials(self, config: Dict[str, Any],
+                            cloud_pw: Optional[str] = None) -> bool:
+        """
+        True if `config` carries the same credentials this controller was
+        constructed with. Used by the manager to decide whether a live
+        (already-authenticated) session can be reused for a probe / move
+        without opening a brand-new login.
+        """
+        cfg_user = (config.get('username') or DEFAULT_ADMIN_USERNAME).strip() or DEFAULT_ADMIN_USERNAME
+        cfg_pw = str(config.get('password') or '').strip()
+        cfg_cloud = str(
+            cloud_pw if cloud_pw is not None else (
+                config.get('tapo_cloud_password')
+                or config.get('cloud_password')
+                or config.get('tapoCloudPassword')
+                or ''
+            )
+        ).strip()
+        return (
+            cfg_user == self._req_username
+            and cfg_pw == self._req_password
+            and cfg_cloud == self._req_cloud_password
+        )
+
     # ------------------------------------------------------------------ #
     # Connection
     # ------------------------------------------------------------------ #
 
     def _candidate_attempts(self) -> List[Tuple[str, str, str]]:
         """
-        Build the (label, user, password) attempt list. Per pytapo's
-        authentication guidance:
-          1) Camera Account credentials first (as configured in the
-             Tapo app). Cap auth failures by trying the same user/pass
-             only once; on auth failure we move to (2).
-          2) Admin fallback: ("admin", cloud_password). Required for
-             newer firmware where the Camera Account hash isn't loaded
-             until the camera is removed/re-added in the phone app.
-        Both attempts pass `cloudPassword=cloud_pw` so SD-card recording
-        APIs work after we connect.
+        Build the (label, user, password) attempt list.
+
+        Order:
+          0) The remembered/preferred working method, if known. When a
+             method has already been proven for this camera we use ONLY
+             it (deterministic, single login).
+          1) Camera Account credentials (as configured in the Tapo app).
+          2) Admin fallback: ("admin", cloud_password). Required for some
+             firmware where the Camera Account hash isn't loaded.
+
+        IMPORTANT: unless ``self.allow_fallback`` is True, the list is
+        truncated to a SINGLE attempt. Rapid camera-account -> admin/cloud
+        retries are the #1 trigger for Tapo's Temporary Suspension lockout,
+        so control/move paths must never auto-fire the chain.
         """
         attempts: List[Tuple[str, str, str]] = []
         seen = set()
@@ -130,6 +216,14 @@ class PyTapoController:
             seen.add(key)
             attempts.append((label, user, password))
 
+        # 0) Remembered/working method first (deterministic re-auth).
+        if self.preferred_auth:
+            _add(
+                self.preferred_auth.get('label') or 'remembered method',
+                self.preferred_auth.get('user') or '',
+                self.preferred_auth.get('password') or '',
+            )
+
         # 1) Camera-account method (user-supplied local creds)
         _add("camera account", self.username, self.password)
 
@@ -137,9 +231,10 @@ class PyTapoController:
         #    second attempt). Only meaningful when we have a cloud password.
         _add("admin / cloud password", DEFAULT_ADMIN_USERNAME, self.tapo_cloud_password)
 
-        # 3) Edge case: some users typed `admin` as the camera account
-        #    user but with the camera local password rather than cloud
-        #    password — covered by (1) already, so nothing extra here.
+        # Single login unless an explicit discovery (test-connection) asked
+        # for the full chain. Never rapid-fire on control/move paths.
+        if not self.allow_fallback and attempts:
+            attempts = attempts[:1]
         return attempts
 
     def _connect_sync(self) -> Dict[str, Any]:
@@ -171,11 +266,23 @@ class PyTapoController:
             self.last_connection_result = dict(result)
             return result
 
+        # pytapo kwargs shared by every attempt. reuseSession=True keeps a
+        # single requests.Session (and the cached stok) alive on the instance
+        # so reusing this controller performs NO additional login.
+        tapo_kwargs: Dict[str, Any] = {'cloudPassword': self.tapo_cloud_password, 'reuseSession': True}
+        if self.control_port:
+            try:
+                tapo_kwargs['controlPort'] = int(self.control_port)
+            except (TypeError, ValueError):
+                pass
+
         last_error: str = ""
         last_label: str = ""
         for idx, (label, user, password) in enumerate(attempts):
             # Small delay before any attempt after the first to avoid
             # looking like a brute-force flood to Tapo's rate limiter.
+            # (Only reachable in explicit discovery mode; single-attempt
+            # connects never hit this.)
             if idx > 0:
                 time.sleep(1.5)
             logger.info(
@@ -183,12 +290,7 @@ class PyTapoController:
                 self.ip_address, label, user,
             )
             try:
-                self.tapo = Tapo(
-                    self.ip_address,
-                    user,
-                    password,
-                    cloudPassword=self.tapo_cloud_password,
-                )
+                self.tapo = Tapo(self.ip_address, user, password, **tapo_kwargs)
                 info = self.tapo.getBasicInfo() or {}
                 model = (
                     info.get('device_model')
@@ -197,10 +299,13 @@ class PyTapoController:
                     or 'Tapo camera'
                 )
                 self.connected = True
+                self.lockout_seconds = None
                 # Cache the working credentials on the instance so
-                # subsequent reconnects skip the failing attempt.
+                # subsequent reconnects skip the failing attempt, and expose
+                # them so the manager can persist the winning method.
                 self.username = user
                 self.password = password
+                self.working_auth = {'user': user, 'password': password, 'label': label}
                 result = {
                     'success': True,
                     'connected': True,
@@ -208,6 +313,7 @@ class PyTapoController:
                     'model': model,
                     'ip_address': self.ip_address,
                     'auth_method': label,
+                    'working_auth': dict(self.working_auth),
                 }
                 self.last_connection_result = dict(result)
                 return result
@@ -219,15 +325,24 @@ class PyTapoController:
                     label, self.ip_address, last_error[:200],
                 )
                 # On a hard lockout, do NOT try the next pattern (would
-                # extend the lockout). Surface immediately.
+                # extend the lockout). Surface immediately with the parsed
+                # cooldown so the manager can refuse further logins.
                 if _looks_like_lockout(last_error):
                     self.connected = False
                     self.tapo = None
-                    message = (
-                        "Camera is temporarily locked out by Tapo "
-                        "(Temporary Suspension). Reboot the camera or "
-                        "wait ~30 minutes before retrying."
-                    )
+                    secs = _parse_lockout_seconds(last_error)
+                    self.lockout_seconds = secs
+                    if secs:
+                        message = (
+                            "Camera is temporarily locked out by Tapo "
+                            f"(Temporary Suspension). Try again in {secs} seconds."
+                        )
+                    else:
+                        message = (
+                            "Camera is temporarily locked out by Tapo "
+                            "(Temporary Suspension). Reboot the camera or "
+                            "wait ~30 minutes before retrying."
+                        )
                     result.update({
                         'success': False,
                         'message': message,
@@ -235,10 +350,11 @@ class PyTapoController:
                         'is_locked': True,
                         'is_auth_failure': False,
                         'auth_method': label,
+                        'lockout_seconds': secs,
                     })
                     self.last_connection_result = dict(result)
                     return result
-                # Otherwise continue to the next attempt.
+                # Otherwise continue to the next attempt (discovery only).
 
         # All attempts exhausted.
         self.connected = False
@@ -246,12 +362,14 @@ class PyTapoController:
         is_auth = _looks_like_auth_failure(last_error)
         if is_auth:
             message = (
-                "All Tapo authentication attempts failed. Check that the "
-                "Camera Account in the Tapo app matches the username/password "
-                "stored here, AND that the TP-Link cloud password is the one "
-                "you use to log in to the Tapo phone app. Make sure "
-                "Me -> Third-Party Services -> Third-Party Compatibility "
-                "is enabled in the app."
+                "Tapo authentication failed. Check that the Camera Account "
+                "in the Tapo app matches the username/password stored here, "
+                "AND that the TP-Link cloud password is the one you use to "
+                "log in to the Tapo phone app. Make sure Me -> Third-Party "
+                "Services -> Third-Party Compatibility is enabled in the app. "
+                "(No second login was attempted automatically — that would "
+                "risk a Temporary Suspension lockout; use 'Test connection' "
+                "to try the admin/cloud method.)"
             )
         else:
             message = f"PyTapo connection failed via {last_label}: {last_error[:200]}"
@@ -294,7 +412,17 @@ class PyTapoController:
             }
         except Exception as err:
             logger.error("Move error: %s", err)
-            return {'success': False, 'error': str(err)}
+            err_msg = str(err)
+            out = {'success': False, 'error': err_msg}
+            # A move that triggers an internal stok refresh can surface a
+            # lockout; bubble it up so the manager sets the cooldown.
+            if _looks_like_lockout(err_msg):
+                secs = _parse_lockout_seconds(err_msg)
+                self.connected = False
+                self.lockout_seconds = secs
+                out['is_locked'] = True
+                out['lockout_seconds'] = secs
+            return out
 
     async def continuous_move(self, pan_speed: float = 0.0, tilt_speed: float = 0.0,
                               zoom_speed: float = 0.0, duration: float = 0.5) -> Dict[str, Any]:
