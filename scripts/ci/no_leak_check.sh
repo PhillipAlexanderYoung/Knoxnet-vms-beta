@@ -11,10 +11,8 @@
 #   * Scans only git-TRACKED text files via `git ls-files`, so venv/, .venv*/,
 #     node_modules/, portal/dist/, data/, models/, captures/ etc. are excluded
 #     automatically (they are gitignored / not tracked).
-#   * The Knoxnet Post planning docs under docs/knoxnet-post/ intentionally
-#     DESCRIBE the private architecture (audit + split plan); they are excluded,
-#     as are this script and its workflow (they necessarily contain the
-#     patterns we search for).
+#   * This script and its workflow are excluded because they necessarily contain
+#     the patterns we search for.
 #   * Patterns target SPECIFIC leaked-code constructs, not generic words. e.g.
 #     README.md may legitimately mention "WireGuard" as general security advice,
 #     so we match the private *endpoint contract* and *client symbols*, never the
@@ -35,7 +33,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # Tracked paths intentionally excluded from scanning.
-EXCLUDE_REGEX='^(docs/knoxnet-post/|scripts/ci/no_leak_check\.sh$|\.github/workflows/no-leak-guard\.yml$)'
+EXCLUDE_REGEX='^(scripts/ci/no_leak_check\.sh$|\.github/workflows/no-leak-guard\.yml$)'
 
 mapfile -t FILES < <(git ls-files | grep -vE "$EXCLUDE_REGEX" || true)
 
@@ -84,7 +82,7 @@ These patterns must not live in the PUBLIC repo. If a match is a legitimate
 public reference (e.g. generic documentation), refine the specific pattern in
 scripts/ci/no_leak_check.sh. Otherwise, move the offending code to the private
 knoxnet-vms-post (Post agent / WireGuard orchestration) or knoxnet-control
-(control plane) repo. See docs/knoxnet-post/STAGE2_SPLIT.md.
+(control plane) repo.
 MSG
   exit 1
 fi

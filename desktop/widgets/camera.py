@@ -562,7 +562,7 @@ class CameraOpenGLWidget(QWidget):
         self.detection_hit_pulses: List[Dict[str, object]] = []  # recent detection hit boxes for visual feedback
         self._detection_last_emit_ts: float = 0.0
 
-        # Scroll-wheel view zoom/pan (matches Security Post portal: 1x–4x).
+        # Scroll-wheel view zoom/pan.
         self.view_zoom: float = 1.0
         self.view_pan_x: float = 0.0
         self.view_pan_y: float = 0.0

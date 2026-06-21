@@ -351,16 +351,6 @@ class KnoxnetDesktopApp(QApplication):
         else:
             logger.info("MediaMTX not running (auto-start disabled).")
 
-        sp_prefs = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
-        sp_up = self.is_security_post_running()
-        if sp_prefs.get("autostart") and sp_prefs.get("enabled") and not sp_up:
-            logger.info("Auto-starting Knoxnet Security Post (pref enabled)…")
-            threading.Thread(target=self._autostart_security_post, daemon=True).start()
-        elif sp_up:
-            logger.info("Knoxnet Security Post already running.")
-        elif sp_prefs.get("autostart") and not sp_prefs.get("enabled"):
-            logger.info("Security Post auto-start skipped (portal disabled in settings).")
-
         # Show system manager if both core services are down and no auto-start is configured
         if not backend_up and not mediamtx_up and not prefs.get("autostart_backend") and not prefs.get("autostart_mediamtx"):
             QTimer.singleShot(2000, self._prompt_services_down)
@@ -437,22 +427,6 @@ class KnoxnetDesktopApp(QApplication):
         except Exception as e:
             logger.warning("Auto-start %s failed: %s", name, e)
 
-    def _autostart_security_post(self):
-        """Start Security Post in the background when autostart pref is enabled."""
-        try:
-            from desktop.widgets.system_manager import start_security_post_silent
-            start_security_post_silent(self)
-            logger.info("Knoxnet Security Post auto-start requested.")
-        except Exception as e:
-            logger.warning("Security Post auto-start failed: %s", e)
-
-    def is_security_post_running(self) -> bool:
-        try:
-            from desktop.widgets.system_manager import is_security_post_running
-            return bool(is_security_post_running())
-        except Exception:
-            return False
-
     def is_backend_running(self, host="127.0.0.1", port=5000):
         """Check if the backend API is accessible."""
         import socket
@@ -476,7 +450,7 @@ class KnoxnetDesktopApp(QApplication):
             return False
 
     def _mark_camera_seen_from_frame(self, camera_id: str, *, min_interval: float = 15.0) -> None:
-        """Persist local frame receipt so Security Post can show accurate last-seen state."""
+        """Persist local frame receipt so camera status stays accurate."""
         camera_id = str(camera_id or "").strip()
         if not camera_id:
             return
@@ -4199,49 +4173,6 @@ class KnoxnetDesktopApp(QApplication):
         leave_backend_cb.setChecked(quit_prefs.get("leave_backend", True))
         layout.addWidget(leave_backend_cb)
 
-        sp_prefs = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
-        sp_running = self.is_security_post_running()
-        sp_remembered = bool(sp_prefs.get("remember_exit_choice"))
-        keep_sp_running = bool(sp_prefs.get("keep_running_on_exit", True))
-        leave_sp_cb = None
-        remember_sp_cb = None
-
-        if sp_running:
-            sep_sp = QFrame()
-            sep_sp.setFrameShape(QFrame.Shape.HLine)
-            sep_sp.setStyleSheet("color: #334155;")
-            layout.addWidget(sep_sp)
-
-            sp_label = QLabel("Knoxnet Security Post")
-            sp_label.setStyleSheet("font-weight: bold; font-size: 12px; color: #94a3b8;")
-            sp_label.setToolTip(
-                "Customer Events portal sidecar — lets customers review events "
-                "while the operator desktop is closed."
-            )
-            layout.addWidget(sp_label)
-
-            if sp_remembered:
-                sp_hint = QLabel(
-                    "Keep Security Post running in the background"
-                    if keep_sp_running
-                    else "Stop Security Post when the desktop closes"
-                )
-                sp_hint.setStyleSheet("font-size: 11px; color: #64748b;")
-                sp_hint.setWordWrap(True)
-                layout.addWidget(sp_hint)
-            else:
-                leave_sp_cb = QCheckBox("Keep Security Post running in the background")
-                leave_sp_cb.setToolTip(
-                    "Leave the customer Events portal sidecar running after you close "
-                    "the desktop app so customers can still access events."
-                )
-                leave_sp_cb.setChecked(keep_sp_running)
-                layout.addWidget(leave_sp_cb)
-
-                remember_sp_cb = QCheckBox("Remember my choice")
-                remember_sp_cb.setChecked(False)
-                layout.addWidget(remember_sp_cb)
-
         # Auto-logic: recording requires backend
         def _sync_toggles():
             if continue_rec_cb.isChecked():
@@ -4263,15 +4194,8 @@ class KnoxnetDesktopApp(QApplication):
                 hint.setText("Desktop closes. Backend stays up (API, streaming). No active recordings.")
             else:
                 hint.setText("Everything shuts down: desktop, backend, MediaMTX, and recordings.")
-            if sp_running and leave_sp_cb is not None:
-                if leave_sp_cb.isChecked():
-                    hint.setText(hint.text() + " Security Post keeps serving the customer portal.")
-                else:
-                    hint.setText(hint.text() + " Security Post will stop.")
         continue_rec_cb.toggled.connect(lambda: _update_hint())
         leave_backend_cb.toggled.connect(lambda: _update_hint())
-        if leave_sp_cb is not None:
-            leave_sp_cb.toggled.connect(lambda: _update_hint())
         _update_hint()
         layout.addWidget(hint)
 
@@ -4297,16 +4221,6 @@ class KnoxnetDesktopApp(QApplication):
         quit_prefs["continue_recording"] = continue_rec_cb.isChecked()
         quit_prefs["leave_backend"] = leave_backend_cb.isChecked()
         prefs["quit_options"] = quit_prefs
-
-        if sp_running:
-            if leave_sp_cb is not None:
-                keep_sp_running = leave_sp_cb.isChecked()
-            if remember_sp_cb is not None and remember_sp_cb.isChecked():
-                sp_prefs["remember_exit_choice"] = True
-                sp_prefs["keep_running_on_exit"] = keep_sp_running
-            elif not sp_remembered and remember_sp_cb is None:
-                pass
-            prefs["security_post"] = sp_prefs
 
         self._save_prefs(prefs)
 
@@ -4366,14 +4280,6 @@ class KnoxnetDesktopApp(QApplication):
                 self.server_manager.stop_servers()
             # Kill Flask and MediaMTX if we started them
             self._kill_backend_services()
-
-        if sp_running and not keep_sp_running:
-            logger.info("Stopping Knoxnet Security Post before quit…")
-            try:
-                from desktop.widgets.system_manager import stop_security_post_silent
-                stop_security_post_silent(self)
-            except Exception as exc:
-                logger.warning("Security Post stop on quit failed: %s", exc)
 
         self.quit()
 
@@ -5190,18 +5096,6 @@ class KnoxnetDesktopApp(QApplication):
                 "exit_on_emergency_after_sec": 60,
                 "show_overlay": True,
             },
-            # Knoxnet Security Post customer portal
-            "security_post": {
-                "enabled": False,
-                "autostart": False,
-                "keep_running_on_exit": True,
-                "remember_exit_choice": False,
-                "wifi_enabled": False,
-                "wifi_ssid": "KNOXNET_SECURITY_POST",
-                "portal_host": "post.knoxnetvms.com",
-                "portal_domain": "knoxnetvms.com",
-                "system_name": "",
-            },
         }
 
         # Best-effort migrate legacy prefsX if desktop_prefs.json doesn't exist yet.
@@ -5260,13 +5154,6 @@ class KnoxnetDesktopApp(QApplication):
             for k, v in ap_defaults.items():
                 ap.setdefault(k, v)
             merged["auto_protect"] = ap
-            sp = merged.get("security_post")
-            if not isinstance(sp, dict):
-                sp = {}
-            sp_defaults = defaults.get("security_post", {}) if isinstance(defaults.get("security_post"), dict) else {}
-            for k, v in sp_defaults.items():
-                sp.setdefault(k, v)
-            merged["security_post"] = sp
             return merged
         except Exception as e:
             logger.warning(f"Failed to load desktop prefs: {e}")

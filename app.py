@@ -7609,7 +7609,7 @@ if __name__ == '__main__':
                 pass
             return False
 
-        # MJPEG fallback for Knoxnet Security Post portal when the full API blueprint is unavailable.
+        # MJPEG fallback when the full API blueprint is unavailable.
         if not _has_rule('/api/cameras/<camera_id>/stream/mjpeg'):
             @app.route('/api/cameras/<camera_id>/stream/mjpeg', methods=['GET'])
             def _basic_mjpeg_stream(camera_id):

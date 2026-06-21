@@ -125,10 +125,6 @@ def main():
             from services.llm_local.__main__ import main as _llm_main
             _llm_main()
             return
-        if "--run-security-post" in args:
-            from extensions.security_post.server.__main__ import main as _security_post_main
-            _security_post_main()
-            return
         if "--run-backend" in args:
             # Execute `app.py` under __main__ so its existing startup block runs.
             import runpy

@@ -327,125 +327,6 @@ def _llm_entrypoint() -> str:
     return "services/llm_local/start_service.sh"
 
 
-def _security_post_hooks():
-    from extensions.security_post.integration import beta_hooks
-
-    return beta_hooks
-
-
-def _security_post_entrypoint() -> str:
-    return _security_post_hooks().optional_service_entrypoint()
-
-
-def _security_post_health_url() -> str:
-    env = dict(os.environ)
-    try:
-        _security_post_hooks().configure_service_env(env)
-    except Exception:
-        pass
-    return _security_post_hooks().health_url(env)
-
-
-def is_security_post_running() -> bool:
-    """Return True when the Security Post health endpoint reports ok."""
-    try:
-        res = requests.get(_security_post_health_url(), timeout=2.0)
-        payload = res.json() if res.status_code == 200 else {}
-        return (
-            res.status_code == 200
-            and str(payload.get("service") or "") == "security_post"
-            and str(payload.get("status") or "").lower() == "ok"
-        )
-    except Exception:
-        return False
-
-
-def _service_python_for_sidecar(repo_root: Path) -> str:
-    override = str(os.environ.get("KNOXNET_SERVICE_PYTHON") or "").strip()
-    if override and ".venv-sp-test" not in override.replace("\\", "/"):
-        return override
-    for rel in ("venv/bin/python", ".venv/bin/python"):
-        candidate = repo_root / rel
-        if candidate.is_file():
-            return str(candidate)
-    py3 = shutil.which("python3") or shutil.which("python") or sys.executable
-    if ".venv-sp-test" in str(py3).replace("\\", "/"):
-        py3 = shutil.which("python3") or shutil.which("python") or sys.executable
-    return py3
-
-
-def start_security_post_silent(app) -> None:
-    """Best-effort background start for desktop autostart (no UI prompts)."""
-    if is_security_post_running():
-        return
-    hooks = _security_post_hooks()
-    try:
-        repo_root = Path(app._repo_root() if app and hasattr(app, "_repo_root") else ".").resolve()
-    except Exception:
-        repo_root = Path(__file__).resolve().parents[2]
-    ep = repo_root / hooks.script_entrypoint()
-    if not ep.is_file():
-        return
-    py = _service_python_for_sidecar(repo_root)
-    if ".venv-sp-test" in py.replace("\\", "/"):
-        return
-    runtime_err = hooks.verify_runtime(py)
-    if runtime_err:
-        return
-    env = dict(os.environ)
-    env["KNOXNET_SERVICE_PYTHON"] = py
-    hooks.configure_service_env(env)
-    log_dir = _writable_log_dir(repo_root=repo_root)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / hooks.service_log_name()
-    popen_kwargs: Dict[str, Any] = {}
-    if os.name != "nt":
-        popen_kwargs["start_new_session"] = True
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(f"\n--- Auto-starting Knoxnet Security Post at {time.ctime()} ---\n")
-        f.flush()
-        if ep.suffix == ".sh":
-            cmd = ["bash", str(ep), "start"]
-        else:
-            cmd = [str(ep), "start"]
-        subprocess.Popen(
-            cmd,
-            cwd=str(repo_root),
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            **popen_kwargs,
-        )
-
-
-def stop_security_post_silent(app) -> None:
-    """Best-effort stop on desktop quit (no UI prompts)."""
-    hooks = _security_post_hooks()
-    try:
-        repo_root = Path(app._repo_root() if app and hasattr(app, "_repo_root") else ".").resolve()
-    except Exception:
-        repo_root = Path(__file__).resolve().parents[2]
-    ep = repo_root / hooks.script_entrypoint()
-    if not ep.is_file():
-        return
-    env = dict(os.environ)
-    hooks.configure_service_env(env)
-    try:
-        if ep.suffix == ".sh":
-            stop_cmd = ["bash", str(ep), "stop"]
-        else:
-            stop_cmd = [str(ep), "stop"]
-        subprocess.run(
-            stop_cmd,
-            cwd=str(repo_root),
-            env=env,
-            timeout=20,
-            check=False,
-        )
-    except Exception:
-        pass
-
-
 def _default_state_dir() -> Path:
     """
     Per-user writable state directory.
@@ -541,7 +422,6 @@ class SystemManagerDialog(QDialog):
             pass
 
         self._processes: Dict[str, Any] = {}
-        self._service_crash_notified: set[str] = set()
         self._backend_origin = (os.environ.get("KNOXNET_BACKEND_ORIGIN") or "http://localhost:5000").rstrip("/")
 
         prefs = self._load_prefs()
@@ -813,9 +693,7 @@ class SystemManagerDialog(QDialog):
         self._disk_protect_chk.toggled.connect(self._on_disk_protect_toggled)
         self._on_disk_protect_toggled(self._disk_protect_chk.isChecked())
 
-        # ── Knoxnet Security Post portal ──
         self._build_events_index_panel(root)
-        self._build_security_post_panel(root)
 
         # ── Optional Services (collapsed by default) ──
         opt_box = QGroupBox("Optional Services")
@@ -825,7 +703,6 @@ class SystemManagerDialog(QDialog):
         optional_services = [
             ("Local Vision", "http://localhost:8101/health", _vision_entrypoint()),
             ("Local LLM",    "http://localhost:8102/health", _llm_entrypoint()),
-            ("Knoxnet Security Post", _security_post_health_url(), _security_post_entrypoint()),
         ]
 
         for row, (name, health_url, entry_point) in enumerate(optional_services):
@@ -1759,156 +1636,6 @@ class SystemManagerDialog(QDialog):
             self._relabel_status_lbl.setText(f"Relabel error: {e}")
 
     # ----------------------------------------------------------------
-    # Knoxnet Security Post panel
-    # ----------------------------------------------------------------
-
-    def _build_security_post_panel(self, root):
-        box = QGroupBox("Knoxnet Security Post")
-        box.setToolTip(
-            "Knoxnet Security Post is the customer Events portal sidecar (default port 8090). "
-            "Customers can review events while operators use the desktop app or after it closes. "
-            "If 8090 is in use, the service auto-falls back to the next free port (8091, …). "
-            "Configure portal access and operator PIN here; start/stop the process under Optional Services."
-        )
-        form = QFormLayout(box)
-
-        prefs = self._load_prefs()
-        sp = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
-
-        self._sp_enabled_chk = QCheckBox("Enable Knoxnet Security Post portal")
-        self._sp_enabled_chk.setToolTip(
-            "Allow the customer Events portal sidecar to run on this machine."
-        )
-        self._sp_enabled_chk.setChecked(bool(sp.get("enabled", False)))
-        form.addRow("", self._sp_enabled_chk)
-
-        try:
-            default_system_name = _security_post_hooks().effective_system_name(sp)
-        except Exception:
-            default_system_name = "Knoxnet VMS"
-        self._sp_system_name_edit = QLineEdit(str(sp.get("system_name") or ""))
-        self._sp_system_name_edit.setPlaceholderText(default_system_name)
-        self._sp_system_name_edit.setToolTip(
-            "Customer-visible name shown on the Security Post login page and portal header. "
-            "Leave blank to use the machine hostname or Knoxnet VMS."
-        )
-        form.addRow("System name:", self._sp_system_name_edit)
-
-        self._sp_autostart_chk = QCheckBox("Start Security Post when Knoxnet VMS launches")
-        self._sp_autostart_chk.setToolTip(
-            "Automatically start the Knoxnet Security Post customer Events portal "
-            "when the desktop app opens (same as Optional Services → Start)."
-        )
-        self._sp_autostart_chk.setChecked(bool(sp.get("autostart", False)))
-        self._sp_autostart_chk.toggled.connect(self._save_security_post_autostart_pref)
-        form.addRow("", self._sp_autostart_chk)
-
-        self._sp_wifi_enabled_chk = QCheckBox("Customer WiFi/AP configured on this box")
-        self._sp_wifi_enabled_chk.setChecked(bool(sp.get("wifi_enabled", False)))
-        form.addRow("", self._sp_wifi_enabled_chk)
-
-        self._sp_wifi_ssid_edit = QLineEdit(str(sp.get("wifi_ssid") or "KNOXNET_SECURITY_POST"))
-        self._sp_wifi_ssid_edit.setPlaceholderText("Customer WiFi SSID")
-        form.addRow("WiFi SSID:", self._sp_wifi_ssid_edit)
-
-        self._sp_portal_host_edit = QLineEdit(str(sp.get("portal_host") or "post.knoxnetvms.com"))
-        self._sp_portal_host_edit.setPlaceholderText("post.knoxnetvms.com")
-        form.addRow("Portal host:", self._sp_portal_host_edit)
-
-        self._sp_portal_domain_edit = QLineEdit(str(sp.get("portal_domain") or "knoxnetvms.com"))
-        self._sp_portal_domain_edit.setPlaceholderText("knoxnetvms.com")
-        form.addRow("Portal domain:", self._sp_portal_domain_edit)
-
-        wifi_note = QLabel("WPA passphrase and firewall rules are applied from the WiFi templates on the AP host; they are not exposed to customer devices.")
-        wifi_note.setWordWrap(True)
-        form.addRow("", wifi_note)
-
-        self._sp_pin_edit = QLineEdit()
-        self._sp_pin_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self._sp_pin_edit.setPlaceholderText("Set / change operator PIN")
-        form.addRow("Operator PIN:", self._sp_pin_edit)
-
-        # Portal PTZ grant: off by default. Enforced server-side at the portal
-        # proxy, so flipping this is the only way the post user can move cameras.
-        self._sp_ptz_chk = QCheckBox("Allow portal users to control PTZ (pan/tilt/zoom)")
-        self._sp_ptz_chk.setToolTip(
-            "When enabled, customers signed in to the Knoxnet Post portal (8090) "
-            "can pan/tilt/zoom PTZ-capable cameras. Disabled by default; enforced "
-            "on the server, not just by hiding the buttons."
-        )
-        try:
-            self._sp_ptz_chk.setChecked(bool(_security_post_hooks().read_portal_ptz_enabled()))
-        except Exception:
-            self._sp_ptz_chk.setChecked(False)
-        form.addRow("", self._sp_ptz_chk)
-
-        btn_row = QHBoxLayout()
-        save_btn = QPushButton("Save")
-        save_btn.setFixedWidth(70)
-        save_btn.clicked.connect(self._save_security_post_settings)
-        btn_row.addStretch()
-        btn_row.addWidget(save_btn)
-        form.addRow("", btn_row)
-
-        root.addWidget(box)
-
-    def _save_security_post_settings(self):
-        prefs = self._load_prefs()
-        if not isinstance(prefs, dict):
-            prefs = {}
-        sp = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
-        sp["enabled"] = bool(self._sp_enabled_chk.isChecked())
-        sp["wifi_enabled"] = bool(self._sp_wifi_enabled_chk.isChecked())
-        sp["wifi_ssid"] = self._sp_wifi_ssid_edit.text().strip() or "KNOXNET_SECURITY_POST"
-        sp["portal_host"] = self._sp_portal_host_edit.text().strip().lower() or "post.knoxnetvms.com"
-        sp["portal_domain"] = self._sp_portal_domain_edit.text().strip().lower() or "knoxnetvms.com"
-        sp["system_name"] = self._sp_system_name_edit.text().strip()
-        prefs["security_post"] = sp
-        try:
-            if self._app:
-                self._app._save_prefs(prefs)
-        except Exception as e:
-            QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to save prefs: {e}")
-            return
-
-        try:
-            _security_post_hooks().sync_system_name(sp["system_name"])
-        except Exception as e:
-            QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to sync system name: {e}")
-            return
-
-        pin = self._sp_pin_edit.text().strip()
-        if pin:
-            try:
-                _security_post_hooks().set_operator_pin(pin)
-                self._sp_pin_edit.clear()
-            except Exception as e:
-                QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to set PIN: {e}")
-                return
-
-        try:
-            _security_post_hooks().set_portal_ptz_enabled(bool(self._sp_ptz_chk.isChecked()))
-        except Exception as e:
-            QMessageBox.warning(self, "Knoxnet Security Post", f"Failed to save portal PTZ setting: {e}")
-            return
-
-        QMessageBox.information(self, "Knoxnet Security Post", "Knoxnet Security Post settings saved.")
-
-    def _save_security_post_autostart_pref(self, checked: bool):
-        if not self._app:
-            return
-        try:
-            prefs = self._app._load_prefs()
-            if not isinstance(prefs, dict):
-                prefs = {}
-            sp = prefs.get("security_post") if isinstance(prefs.get("security_post"), dict) else {}
-            sp["autostart"] = bool(checked)
-            prefs["security_post"] = sp
-            self._app._save_prefs(prefs)
-        except Exception:
-            pass
-
-    # ----------------------------------------------------------------
     # Auto Protection panel
     # ----------------------------------------------------------------
 
@@ -2391,36 +2118,6 @@ class SystemManagerDialog(QDialog):
             except Exception:
                 pass
 
-    def _security_post_port(self) -> int:
-        try:
-            return int(_security_post_hooks().effective_port())
-        except Exception:
-            return 8090
-
-    def _security_post_port_notice(self) -> str:
-        try:
-            state = _security_post_hooks().read_runtime_state()
-        except Exception:
-            return ""
-        port = state.get("port")
-        fallback = state.get("fallback_from")
-        message = str(state.get("message") or "").strip()
-        if port and fallback and int(port) != int(fallback):
-            base = f"Running on port {port} (default {fallback} blocked)."
-            return f"{base} {message}".strip()
-        if message:
-            return message
-        return ""
-
-    def _refresh_security_post_health_url(self) -> None:
-        widgets = self.service_widgets.get("Knoxnet Security Post")
-        if not widgets:
-            return
-        try:
-            widgets["health_url"] = _security_post_health_url()
-        except Exception:
-            pass
-
     def _prime_psutil(self) -> None:
         if PSUTIL_AVAILABLE:
             try:
@@ -2464,16 +2161,6 @@ class SystemManagerDialog(QDialog):
                     # Recording depends on the Control API, not just an open TCP port.
                     # A 404 or socket-only response means MediaMTX is not usable yet.
                     healthy = res.status_code in (200, 401, 403)
-                elif name == "Knoxnet Security Post":
-                    try:
-                        payload = res.json() if res.status_code == 200 else {}
-                    except Exception:
-                        payload = {}
-                    healthy = (
-                        res.status_code == 200
-                        and str(payload.get("service") or "") == "security_post"
-                        and str(payload.get("status") or "").lower() == "ok"
-                    )
                 else:
                     # Consider backend alive if it returns any non-5xx response.
                     healthy = res.status_code < 500
@@ -2482,7 +2169,7 @@ class SystemManagerDialog(QDialog):
                     break
             except:
                 # Fallback to simple socket check if HTTP fails but server might be booting
-                if "MediaMTX" in name or name == "Knoxnet Security Post":
+                if "MediaMTX" in name:
                     # A listener without the expected HTTP API is not usable by Knoxnet.
                     continue
                 try:
@@ -2507,14 +2194,7 @@ class SystemManagerDialog(QDialog):
                 status_str = "STARTING"
             else:
                 self._processes.pop(name, None)
-                if name == "Knoxnet Security Post" and name not in self._service_crash_notified:
-                    self._service_crash_notified.add(name)
-                    log_path = str((self.service_widgets.get(name) or {}).get("log_file") or "")
-                    detail = self._read_service_log_tail(log_path)
-                    msg = f"{name} exited immediately (code {exit_code})."
-                    if detail:
-                        msg += f"\n\nRecent log output:\n{detail}"
-                    self._show_service_error(name, msg)
+                self._processes.pop(name, None)
         
         # Emit signal to update UI safely
         self.status_updated.emit(name, status_str)
@@ -2681,10 +2361,10 @@ class SystemManagerDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Service entry point not found: {entry_path}")
             return
 
-        # Pre-cleanup: ensure ports are clear before starting (Security Post handles its own fallback)
+        # Pre-cleanup: ensure ports are clear before starting.
         try:
             widgets = self.service_widgets.get(name)
-            if widgets and name != "Knoxnet Security Post":
+            if widgets:
                 from urllib.parse import urlparse
                 port = urlparse(widgets["health_url"]).port
                 if port:
@@ -2703,25 +2383,6 @@ class SystemManagerDialog(QDialog):
                 env["KNOXNET_SIMPLE_SERVER"] = "1"
                 if hasattr(self, "web_ui_toggle") and not self.web_ui_toggle.isChecked():
                     env["KNOXNET_WEB_UI_DISABLED"] = "1"
-            if name == "Knoxnet Security Post":
-                _security_post_hooks().configure_service_env(env)
-                py_cmd = self._service_python_cmd()
-                if py_cmd:
-                    env["KNOXNET_SERVICE_PYTHON"] = py_cmd[0]
-                if ".venv-sp-test" in str(env.get("KNOXNET_SERVICE_PYTHON", "")).replace("\\", "/"):
-                    QMessageBox.critical(
-                        self,
-                        "Knoxnet Security Post",
-                        "Refusing to start with an unsupported test Python environment.\n"
-                        "Use System Manager, start_service.sh, or set KNOXNET_SERVICE_PYTHON to the project venv.",
-                    )
-                    return
-                runtime_err = _security_post_hooks().verify_runtime(py_cmd[0] if py_cmd else sys.executable)
-                if runtime_err:
-                    QMessageBox.critical(self, "Knoxnet Security Post", runtime_err)
-                    return
-                self._service_crash_notified.discard(name)
-
             cmd = []
             # Never default to a read-only mount (AppImage). Use a per-user writable dir for cwd.
             cwd = str(_default_state_dir() if frozen else repo_root)
@@ -2819,10 +2480,7 @@ class SystemManagerDialog(QDialog):
             # Log output to a file so we can debug failures
             log_dir = _writable_log_dir(repo_root=repo_root)
             log_dir.mkdir(parents=True, exist_ok=True)
-            if name == "Knoxnet Security Post":
-                log_file = log_dir / _security_post_hooks().service_log_name()
-            else:
-                log_file = log_dir / f"service_{name.lower().replace(' ', '_').replace('(', '').replace(')', '')}.log"
+            log_file = log_dir / f"service_{name.lower().replace(' ', '_').replace('(', '').replace(')', '')}.log"
             
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(f"\n--- Starting {name} at {time.ctime()} ---\n")
@@ -2847,31 +2505,6 @@ class SystemManagerDialog(QDialog):
             if widgets is not None:
                 widgets["log_file"] = str(log_file)
             start_msg = f"Attempting to start {name}...\nLogs: {log_file}"
-            if name == "Knoxnet Security Post":
-                start_msg += (
-                    "\n\nIf port 8090 is in use, the service will auto-start on the next free port (8091, …)."
-                )
-
-                def _refresh_sp_port_after_start():
-                    for _ in range(30):
-                        time.sleep(0.5)
-                        try:
-                            self._refresh_security_post_health_url()
-                            notice = self._security_post_port_notice()
-                            port = self._security_post_port()
-                            if notice or port != 8090:
-                                break
-                            res = requests.get(
-                                _security_post_health_url(),
-                                timeout=1.5,
-                            )
-                            if res.status_code == 200:
-                                break
-                        except Exception:
-                            pass
-
-                threading.Thread(target=_refresh_sp_port_after_start, daemon=True).start()
-
             QMessageBox.information(self, "Service Started", start_msg)
 
             # If the user wants the Web UI, bring up the Vite server as part of "Backend".
@@ -2907,15 +2540,11 @@ class SystemManagerDialog(QDialog):
             proc = self._processes.pop(name)
             try:
                 self._terminate_tracked_process(proc)
-                if name == "Knoxnet Security Post":
-                    self._cleanup_port(self._security_post_port())
                 QMessageBox.information(self, "Service Stopped", f"Stopped {name}.")
                 return
             except Exception:
                 try:
                     proc.kill()
-                    if name == "Knoxnet Security Post":
-                        self._cleanup_port(self._security_post_port())
                     QMessageBox.information(self, "Service Stopped", f"Stopped {name} (forced).")
                     return
                 except Exception:
@@ -2936,8 +2565,6 @@ class SystemManagerDialog(QDialog):
                     ep_path = repo_root / ep
                 if ep_path.exists():
                     stop_env = dict(os.environ)
-                    if name == "Knoxnet Security Post":
-                        _security_post_hooks().configure_service_env(stop_env)
                     stop_cmd = (
                         ["bash", str(ep_path), "stop"]
                         if ep.endswith(".sh")
@@ -2981,9 +2608,6 @@ class SystemManagerDialog(QDialog):
             elif "MediaMTX" in name:
                 _terminate_existing_mediamtx()
                 target_ports.extend([8554, 8888, 8889, 9996])
-            elif name == "Knoxnet Security Post":
-                target_ports = [self._security_post_port()]
-
             results: List[_PortCleanupResult] = []
             for p in target_ports:
                 results.append(self._cleanup_port(p))
@@ -3013,7 +2637,7 @@ class SystemManagerDialog(QDialog):
                     if label and label not in {"unconfined", ""}:
                         lines.append(
                             f"PID {pid} is a protected process ({label}). "
-                            "Stop it from its owning session, reboot, or start Security Post on a fallback port (8091+)."
+                            "Stop it from its owning session or reboot."
                         )
                         break
                 QMessageBox.warning(self, "Stop incomplete", "\n".join(lines))
@@ -3161,7 +2785,6 @@ class SystemManagerDialog(QDialog):
             )
 
     def refresh(self):
-        self._refresh_security_post_health_url()
         for name in self.service_widgets:
             threading.Thread(target=self._check_service_health, args=(name,), daemon=True).start()
 
