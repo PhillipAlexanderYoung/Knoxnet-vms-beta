@@ -27,11 +27,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QLabel,
-    QSizeGrip,
     QMenu,
     QDialog,
     QFormLayout,
-    QComboBox,
     QDialogButtonBox,
     QCheckBox,
 )
@@ -190,6 +188,7 @@ class AudioEQSettings:
     accent_color: str = "#00ff8c"
     bg_color: str = "#0b1220"
     visual_mode: str = "spectrum_bars"  # spectrum_bars|spectrum_line|waveform|radial|vu
+    playback_gain: float = 2.0
     borderless: bool = False
     # overlay HUD size + position
     pos_norm: Tuple[float, float] = (0.15, 0.85)  # bottom-left-ish
@@ -229,6 +228,9 @@ class PCMBufferIODevice(QIODevice):
     def bytesAvailable(self) -> int:  # type: ignore[override]
         return len(self._buf) + super().bytesAvailable()
 
+    def isSequential(self) -> bool:  # type: ignore[override]
+        return True
+
     def readData(self, maxlen: int) -> bytes:  # type: ignore[override]
         if maxlen <= 0 or not self._buf:
             return b""
@@ -243,7 +245,9 @@ class PCMBufferIODevice(QIODevice):
 
 
 class AudioPlayback(QObject):
-    """QtMultimedia-backed audio playback for s16le PCM."""
+    """
+    PCM audio playback via pull-mode QAudioSink + PCMBufferIODevice.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -251,31 +255,25 @@ class AudioPlayback(QObject):
         self._sink = None
         self._device = None
         self._format = None
+
         self._volume = 0.8
         self._muted = False
+        self._gain = 2.0
         self._target_rate = 48000
         self._target_channels = 2
-
-    @property
-    def target_format(self) -> Tuple[int, int]:
-        return self._target_rate, self._target_channels
 
     def start(self) -> None:
         if not self.enabled:
             return
         if self._sink is not None:
             return
-
         fmt = QAudioFormat()
         fmt.setSampleRate(self._target_rate)
         fmt.setChannelCount(self._target_channels)
         fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
-
         dev = QMediaDevices.defaultAudioOutput()
         if not dev.isFormatSupported(fmt):
-            # best effort: still attempt to start, Qt will do its best or fail gracefully
             pass
-
         self._format = fmt
         self._device = PCMBufferIODevice()
         self._sink = QAudioSink(dev, fmt)
@@ -312,12 +310,11 @@ class AudioPlayback(QObject):
         except Exception:
             pass
 
+    def set_gain(self, gain: float) -> None:
+        self._gain = max(0.0, min(8.0, float(gain)))
+
     def push_pcm(self, pcm_s16le: bytes, gain: float = 1.0) -> None:
-        """
-        Append PCM to the internal QIODevice. Must be called in GUI thread.
-        gain is applied in int16 domain (best-effort).
-        """
-        if not pcm_s16le:
+        if not pcm_s16le or self._muted:
             return
         if not self.enabled:
             return
@@ -325,19 +322,17 @@ class AudioPlayback(QObject):
             self.start()
         if self._device is None:
             return
-        if self._muted:
-            return
 
-        g = max(0.0, min(2.0, float(gain)))
+        g = max(0.0, min(8.0, float(gain) * float(self._gain)))
         if abs(g - 1.0) < 1e-3:
             self._device.append_pcm(pcm_s16le)
             return
 
-        # scale int16 samples (prefer numpy; fallback to stdlib audioop)
         if np is not None:
             try:
-                a = np.frombuffer(pcm_s16le, dtype=np.int16).astype(np.float32) * g
-                a = np.clip(a, -32768, 32767).astype(np.int16)
+                x = np.frombuffer(pcm_s16le, dtype=np.int16).astype(np.float32) / 32768.0
+                x = np.tanh(x * g)
+                a = np.clip(x * 32767.0, -32768, 32767).astype(np.int16)
                 self._device.append_pcm(a.tobytes())
                 return
             except Exception:
@@ -349,6 +344,7 @@ class AudioPlayback(QObject):
                 self._device.append_pcm(pcm_s16le)
         except Exception:
             self._device.append_pcm(pcm_s16le)
+
 
 
 class AudioWHEPReceiver(QObject):
@@ -871,6 +867,7 @@ class AudioEQHUD(QWidget):
     play_clicked = Signal()
     mute_toggled = Signal(bool)
     volume_changed = Signal(float)  # 0..1
+    gain_changed = Signal(float)    # linear multiplier
     close_clicked = Signal()
     record_clicked = Signal()
     monitor_menu_requested = Signal()
@@ -881,6 +878,7 @@ class AudioEQHUD(QWidget):
         self._playing = False
         self._muted = False
         self._volume = 0.80
+        self._gain = max(0.25, min(8.0, float(getattr(self.settings, "playback_gain", 2.0))))
 
         self.setObjectName("AudioEQHUD")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -1011,6 +1009,11 @@ class AudioEQHUD(QWidget):
     def _set_volume(self, v01: float) -> None:
         self._volume = max(0.0, min(1.0, float(v01)))
         self.volume_changed.emit(self._volume)
+
+    def _set_gain(self, gain: float) -> None:
+        self._gain = max(0.25, min(8.0, float(gain)))
+        self.settings.playback_gain = self._gain
+        self.gain_changed.emit(self._gain)
 
     def set_spectrum(self, values: List[float]) -> None:
         try:
@@ -1147,6 +1150,16 @@ class AudioEQHUD(QWidget):
             vol.setValue(int(self._volume * 100))
             form.addRow("Volume", vol)
 
+            gain = QSlider(Qt.Orientation.Horizontal)
+            gain.setRange(25, 800)  # 0.25x .. 8.00x
+            gain.setValue(int(max(0.25, min(8.0, float(self._gain))) * 100))
+            gain_lbl = QLabel(f"{self._gain:.2f}x")
+            gain.valueChanged.connect(lambda v: gain_lbl.setText(f"{v/100.0:.2f}x"))
+            gain_row = QHBoxLayout()
+            gain_row.addWidget(gain, 1)
+            gain_row.addWidget(gain_lbl)
+            form.addRow("Amplify", gain_row)
+
             mute = QCheckBox("Mute")
             mute.setChecked(bool(self._muted))
             form.addRow("", mute)
@@ -1164,6 +1177,7 @@ class AudioEQHUD(QWidget):
 
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self._set_volume(vol.value() / 100.0)
+                self._set_gain(gain.value() / 100.0)
                 if bool(mute.isChecked()) != bool(self._muted):
                     self._toggle_mute()
                 self.settings.opacity = float(opacity.value() / 100.0)
