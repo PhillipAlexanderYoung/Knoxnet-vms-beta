@@ -6975,10 +6975,18 @@ class CameraWidget(BaseDesktopWidget):
         # Simple recording support (stores into data/audio_clips/)
         self._audio_ring: List[bytes] = []
         self._audio_ring_bytes: int = 0
+        # Chime trigger engine (lazy-init, import-safe)
+        self._chime_engine = None
+        try:
+            from core.chime_manager import get_chime_trigger_engine
+            self._chime_engine = get_chime_trigger_engine(camera_id)
+        except Exception:
+            pass
         self._audio_ring_max_bytes: int = 48000 * 2 * 2 * 12  # ~12s at 48k stereo int16
         self._audio_recording: bool = False
         self._audio_record_deadline: float = 0.0
         self._audio_record_buf: List[bytes] = []
+        self._audio_last_diag_ts: float = 0.0
 
         # Continuous recording state (MediaMTX passthrough, zero CPU)
         self._continuous_recording: bool = False
@@ -7255,6 +7263,10 @@ class CameraWidget(BaseDesktopWidget):
             self._audio_receiver.waveform_ready.connect(self._on_audio_waveform)
         if self._audio_playback is None:
             self._audio_playback = AudioPlayback(self)
+            try:
+                self._audio_playback.set_gain(float(getattr(self.audio_eq_settings, "playback_gain", 2.0)))
+            except Exception:
+                pass
 
     def _audio_api_base(self) -> str:
         # Keep in sync with the rest of the desktop widgets (ObjectDetectionSettingsDialog.API_BASE)
@@ -7300,6 +7312,52 @@ class CameraWidget(BaseDesktopWidget):
             self.stop_audio_monitor()
         else:
             self.start_audio_monitor()
+
+    # ------------------------------------------------------------------
+    # Chime handlers
+    # ------------------------------------------------------------------
+
+    def _open_chime_manager(self) -> None:
+        try:
+            from desktop.widgets.chime_dialog import ChimeManagerDialog
+            dlg = ChimeManagerDialog(parent=self)
+            dlg.exec()
+        except Exception as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Chime Manager", f"Could not open Chime Manager:\n{exc}")
+
+    def _open_chime_trigger_dialog(self) -> None:
+        try:
+            from desktop.widgets.chime_dialog import (
+                ChimeShapePickerDialog,
+                ChimeTriggerConfigDialog,
+            )
+            from core.chime_manager import get_chime_store
+
+            shapes = list(getattr(self.gl_widget, "shapes", None) or [])
+            picker = ChimeShapePickerDialog(shapes, parent=self)
+            if picker.exec() != QDialog.DialogCode.Accepted:
+                return
+            shape = picker.selected_shape()
+            if shape is None:
+                return
+            store = get_chime_store()
+            config_dlg = ChimeTriggerConfigDialog(
+                shape, self.camera_id, store=store, parent=self
+            )
+            config_dlg.exec()
+        except Exception as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Chime Triggers", f"Could not open Chime Trigger dialog:\n{exc}")
+
+    def _open_test_chime_dialog(self) -> None:
+        try:
+            from desktop.widgets.chime_dialog import TestChimeDialog
+            dlg = TestChimeDialog(parent=self)
+            dlg.exec()
+        except Exception as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Test Chime", f"Could not open Test Chime dialog:\n{exc}")
 
     def _sync_audio_ui_state(self):
         try:
@@ -7403,6 +7461,21 @@ class CameraWidget(BaseDesktopWidget):
         try:
             if self._audio_playback is not None:
                 self._audio_playback.push_pcm(pcm, gain=1.0)
+                now = time.time()
+                if now - float(getattr(self, "_audio_last_diag_ts", 0.0)) >= 3.0:
+                    self._audio_last_diag_ts = now
+                    rms = 0.0
+                    try:
+                        if pcm and np is not None:
+                            a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                            if a.size:
+                                rms = float(np.sqrt(np.mean(a * a)))
+                    except Exception:
+                        rms = 0.0
+                    try:
+                        print(f"[{self.camera_id}] Audio PCM len={len(pcm or b'')} rms={rms:.5f}")
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -7559,6 +7632,7 @@ class CameraWidget(BaseDesktopWidget):
                 self.audio_eq_overlay.hud.play_clicked.connect(self._toggle_audio_play)
                 self.audio_eq_overlay.hud.mute_toggled.connect(lambda m: self._audio_playback.set_muted(m) if self._audio_playback else None)
                 self.audio_eq_overlay.hud.volume_changed.connect(lambda v: self._audio_playback.set_volume(v) if self._audio_playback else None)
+                self.audio_eq_overlay.hud.gain_changed.connect(lambda g: self._audio_playback.set_gain(g) if self._audio_playback else None)
                 self.audio_eq_overlay.hud.record_clicked.connect(lambda: self._start_audio_recording())
                 self.audio_eq_overlay.hud.monitor_menu_requested.connect(self._open_audio_monitor_menu)
                 # Auto-start audio when overlay is shown
@@ -7604,6 +7678,7 @@ class CameraWidget(BaseDesktopWidget):
                 self.audio_eq_window.hud.play_clicked.connect(self._toggle_audio_play)
                 self.audio_eq_window.hud.mute_toggled.connect(lambda m: self._audio_playback.set_muted(m) if self._audio_playback else None)
                 self.audio_eq_window.hud.volume_changed.connect(lambda v: self._audio_playback.set_volume(v) if self._audio_playback else None)
+                self.audio_eq_window.hud.gain_changed.connect(lambda g: self._audio_playback.set_gain(g) if self._audio_playback else None)
                 self.audio_eq_window.hud.record_clicked.connect(lambda: self._start_audio_recording())
                 self.audio_eq_window.hud.monitor_menu_requested.connect(self._open_audio_monitor_menu)
                 self.audio_eq_window.show()
@@ -10270,6 +10345,17 @@ class CameraWidget(BaseDesktopWidget):
                         )
                     except Exception:
                         pass
+        # Chime trigger engine: fire any matching chime triggers for these events
+        try:
+            if self._chime_engine is not None and events:
+                for ev in events:
+                    etype = str(ev.get("shape_type") or ev.get("event_type") or "").lower()
+                    sid = str(ev.get("shape_id") or "")
+                    if etype:
+                        self._chime_engine.on_event(etype, sid, self.camera_id)
+        except Exception:
+            pass
+
         try:
             print(f"[{self.camera_id}] shape interaction: {payload}")
         except Exception:
@@ -13133,6 +13219,21 @@ class CameraWidget(BaseDesktopWidget):
             audio_play_action = QAction("▶/⏸ Toggle Audio Monitor", self)
             audio_play_action.triggered.connect(self._toggle_audio_play)
             audio_menu.addAction(audio_play_action)
+
+            # ── Chime ──
+            chime_menu = menu.addMenu("🔔 Chime")
+
+            manage_chimes_action = QAction("Manage Chimes…", self)
+            manage_chimes_action.triggered.connect(self._open_chime_manager)
+            chime_menu.addAction(manage_chimes_action)
+
+            add_chime_trigger_action = QAction("Add Chime Trigger…", self)
+            add_chime_trigger_action.triggered.connect(self._open_chime_trigger_dialog)
+            chime_menu.addAction(add_chime_trigger_action)
+
+            test_chime_action = QAction("Test Chime…", self)
+            test_chime_action.triggered.connect(self._open_test_chime_dialog)
+            chime_menu.addAction(test_chime_action)
 
             # ── Zones / Lines / Tags ──
             shapes_menu = menu.addMenu("📐 Zones / Lines / Tags")

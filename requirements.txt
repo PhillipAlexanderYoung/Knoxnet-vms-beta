@@ -19,6 +19,9 @@ matplotlib
 psutil
 cryptography
 
+# Audio chime playback
+sounddevice
+
 # PTZ camera control
 pytapo>=3.3.0,<4
 onvif-zeep>=0.2.12
